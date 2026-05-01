@@ -1,0 +1,31 @@
+# Keil uVision user-specific files
+*.uvguix.*
+*.uvoptx
+
+# Keil build outputs and intermediate files
+*.axf
+*.bin
+*.hex
+*.map
+*.lst
+*.o
+*.obj
+*.crf
+*.d
+*.dep
+*.iex
+*.lnp
+*.plg
+*.sct
+*.scvd
+
+# Common generated directories
+MDK-ARM/DebugConfig/
+MDK-ARM/RTE/
+MDK-ARM/autoControl/
+
+# Local notes
+AGENT.md
+DOING.md
+FINISH.md
+TODO.md
