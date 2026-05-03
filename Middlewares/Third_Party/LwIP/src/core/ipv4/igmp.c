@@ -107,6 +107,18 @@ static void   igmp_send(struct netif *netif, struct igmp_group *group, u8_t type
 static ip4_addr_t     allsystems;
 static ip4_addr_t     allrouters;
 
+static void
+igmp_addr_copy_aligned_from_unaligned_bytes(ip4_addr_t *dst, const void *src)
+{
+  volatile u8_t *dst_bytes = (volatile u8_t *)&dst->addr;
+  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
+
+  dst_bytes[0] = src_bytes[0];
+  dst_bytes[1] = src_bytes[1];
+  dst_bytes[2] = src_bytes[2];
+  dst_bytes[3] = src_bytes[3];
+}
+
 /**
  * Initialize the IGMP module
  */
@@ -325,6 +337,7 @@ igmp_input(struct pbuf *p, struct netif *inp, const ip4_addr_t *dest)
   struct igmp_msg   *igmp;
   struct igmp_group *group;
   struct igmp_group *groupref;
+  ip4_addr_t igmp_group_address_aligned;
 
   IGMP_STATS_INC(igmp.recv);
 
@@ -351,6 +364,11 @@ igmp_input(struct pbuf *p, struct netif *inp, const ip4_addr_t *dest)
     return;
   }
 
+  /* The IGMP group address field sits at offset 4 in a packed 8-byte header.
+     On Ethernet/IPv4 it is typically only 2-byte aligned, so force a byte-wise
+     copy before any 32-bit ip4_addr accessors touch it. */
+  igmp_addr_copy_aligned_from_unaligned_bytes(&igmp_group_address_aligned, &igmp->igmp_group_address);
+
   /* Packet is ok so find an existing group */
   group = igmp_lookfor_group(inp, dest); /* use the destination IP address of incoming packet */
 
@@ -366,7 +384,7 @@ igmp_input(struct pbuf *p, struct netif *inp, const ip4_addr_t *dest)
   switch (igmp->igmp_msgtype) {
     case IGMP_MEMB_QUERY:
       /* IGMP_MEMB_QUERY to the "all systems" address ? */
-      if ((ip4_addr_cmp(dest, &allsystems)) && ip4_addr_isany(&igmp->igmp_group_address)) {
+      if ((ip4_addr_cmp(dest, &allsystems)) && ip4_addr_isany(&igmp_group_address_aligned)) {
         /* THIS IS THE GENERAL QUERY */
         LWIP_DEBUGF(IGMP_DEBUG, ("igmp_input: General IGMP_MEMB_QUERY on \"ALL SYSTEMS\" address (224.0.0.1) [igmp_maxresp=%i]\n", (int)(igmp->igmp_maxresp)));
 
@@ -392,14 +410,14 @@ igmp_input(struct pbuf *p, struct netif *inp, const ip4_addr_t *dest)
         }
       } else {
         /* IGMP_MEMB_QUERY to a specific group ? */
-        if (!ip4_addr_isany(&igmp->igmp_group_address)) {
+        if (!ip4_addr_isany(&igmp_group_address_aligned)) {
           LWIP_DEBUGF(IGMP_DEBUG, ("igmp_input: IGMP_MEMB_QUERY to a specific group "));
-          ip4_addr_debug_print_val(IGMP_DEBUG, igmp->igmp_group_address);
+          ip4_addr_debug_print_val(IGMP_DEBUG, igmp_group_address_aligned);
           if (ip4_addr_cmp(dest, &allsystems)) {
             ip4_addr_t groupaddr;
             LWIP_DEBUGF(IGMP_DEBUG, (" using \"ALL SYSTEMS\" address (224.0.0.1) [igmp_maxresp=%i]\n", (int)(igmp->igmp_maxresp)));
             /* we first need to re-look for the group since we used dest last time */
-            ip4_addr_copy(groupaddr, igmp->igmp_group_address);
+            ip4_addr_copy(groupaddr, igmp_group_address_aligned);
             group = igmp_lookfor_group(inp, &groupaddr);
           } else {
             LWIP_DEBUGF(IGMP_DEBUG, (" with the group address as destination [igmp_maxresp=%i]\n", (int)(igmp->igmp_maxresp)));

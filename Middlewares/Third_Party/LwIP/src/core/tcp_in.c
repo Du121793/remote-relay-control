@@ -96,6 +96,10 @@ static void tcp_listen_input(struct tcp_pcb_listen *pcb);
 static void tcp_timewait_input(struct tcp_pcb *pcb);
 
 static int tcp_input_delayed_close(struct tcp_pcb *pcb);
+__attribute__((noinline, optnone)) static u16_t tcp_read_u16_unaligned_host(const void *src);
+__attribute__((noinline, optnone)) static u32_t tcp_read_u32_unaligned_host(const void *src);
+__attribute__((noinline, optnone)) static void tcp_write_u16_unaligned_host(void *dst, u16_t value);
+__attribute__((noinline, optnone)) static void tcp_write_u32_unaligned_host(void *dst, u32_t value);
 
 #if LWIP_TCP_SACK_OUT
 static void tcp_add_sack(struct tcp_pcb *pcb, u32_t left, u32_t right);
@@ -104,6 +108,37 @@ static void tcp_remove_sacks_lt(struct tcp_pcb *pcb, u32_t seq);
 static void tcp_remove_sacks_gt(struct tcp_pcb *pcb, u32_t seq);
 #endif /* TCP_OOSEQ_BYTES_LIMIT || TCP_OOSEQ_PBUFS_LIMIT */
 #endif /* LWIP_TCP_SACK_OUT */
+
+__attribute__((noinline, optnone)) static u16_t tcp_read_u16_unaligned_host(const void *src)
+{
+  const volatile u8_t *bytes = (const volatile u8_t *)src;
+  return (u16_t)((u16_t)bytes[0] | (u16_t)((u16_t)bytes[1] << 8));
+}
+
+__attribute__((noinline, optnone)) static u32_t tcp_read_u32_unaligned_host(const void *src)
+{
+  const volatile u8_t *bytes = (const volatile u8_t *)src;
+  return ((u32_t)bytes[0]) |
+         ((u32_t)bytes[1] << 8) |
+         ((u32_t)bytes[2] << 16) |
+         ((u32_t)bytes[3] << 24);
+}
+
+__attribute__((noinline, optnone)) static void tcp_write_u16_unaligned_host(void *dst, u16_t value)
+{
+  volatile u8_t *bytes = (volatile u8_t *)dst;
+  bytes[0] = (u8_t)(value & 0xFFU);
+  bytes[1] = (u8_t)((value >> 8) & 0xFFU);
+}
+
+__attribute__((noinline, optnone)) static void tcp_write_u32_unaligned_host(void *dst, u32_t value)
+{
+  volatile u8_t *bytes = (volatile u8_t *)dst;
+  bytes[0] = (u8_t)(value & 0xFFU);
+  bytes[1] = (u8_t)((value >> 8) & 0xFFU);
+  bytes[2] = (u8_t)((value >> 16) & 0xFFU);
+  bytes[3] = (u8_t)((value >> 24) & 0xFFU);
+}
 
 /**
  * The initial input processing of TCP. It verifies the TCP header, demultiplexes
@@ -225,11 +260,22 @@ tcp_input(struct pbuf *p, struct netif *inp)
   }
 
   /* Convert fields in TCP header to host byte order. */
-  tcphdr->src = lwip_ntohs(tcphdr->src);
-  tcphdr->dest = lwip_ntohs(tcphdr->dest);
-  seqno = tcphdr->seqno = lwip_ntohl(tcphdr->seqno);
-  ackno = tcphdr->ackno = lwip_ntohl(tcphdr->ackno);
-  tcphdr->wnd = lwip_ntohs(tcphdr->wnd);
+  {
+    u16_t tcp_src = lwip_ntohs(tcp_read_u16_unaligned_host(&tcphdr->src));
+    u16_t tcp_dest = lwip_ntohs(tcp_read_u16_unaligned_host(&tcphdr->dest));
+    u32_t tcp_seqno = lwip_ntohl(tcp_read_u32_unaligned_host(&tcphdr->seqno));
+    u32_t tcp_ackno = lwip_ntohl(tcp_read_u32_unaligned_host(&tcphdr->ackno));
+    u16_t tcp_wnd = lwip_ntohs(tcp_read_u16_unaligned_host(&tcphdr->wnd));
+
+    tcp_write_u16_unaligned_host(&tcphdr->src, tcp_src);
+    tcp_write_u16_unaligned_host(&tcphdr->dest, tcp_dest);
+    tcp_write_u32_unaligned_host(&tcphdr->seqno, tcp_seqno);
+    tcp_write_u32_unaligned_host(&tcphdr->ackno, tcp_ackno);
+    tcp_write_u16_unaligned_host(&tcphdr->wnd, tcp_wnd);
+
+    seqno = tcp_seqno;
+    ackno = tcp_ackno;
+  }
 
   flags = TCPH_FLAGS(tcphdr);
   tcplen = p->tot_len;

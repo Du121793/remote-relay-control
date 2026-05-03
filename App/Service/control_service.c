@@ -1,0 +1,283 @@
+#include "control_service.h"
+
+#include "control_queue.h"
+#include "control_proto.h"
+
+#include "cmsis_os.h"
+
+#include "lwip/ip4_addr.h"
+#include "lwip/tcp.h"
+#include "lwip/tcpip.h"
+#include "lwip/netif.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#define CONTROL_TCP_PORT 41000U
+
+extern struct netif gnetif;
+
+typedef struct
+{
+  struct tcp_pcb *pcb;
+} control_tcp_client_t;
+
+static struct tcp_pcb *g_control_listener_pcb = NULL;
+static control_service_stats_t g_control_stats;
+static uint8_t g_control_service_started = 0U;
+static uint8_t g_control_last_link_up = 0U;
+static osThreadId g_control_task_handle = NULL;
+
+static void control_service_tcpip_step(void *arg);
+static void control_service_task(void const *argument);
+
+static void control_service_close(struct tcp_pcb *tpcb)
+{
+  if (tpcb == NULL)
+  {
+    return;
+  }
+
+  tcp_arg(tpcb, NULL);
+  tcp_recv(tpcb, NULL);
+  tcp_err(tpcb, NULL);
+  tcp_poll(tpcb, NULL, 0);
+  (void)tcp_close(tpcb);
+}
+
+static void control_service_close_listener(void)
+{
+  if (g_control_listener_pcb == NULL)
+  {
+    return;
+  }
+
+  tcp_arg(g_control_listener_pcb, NULL);
+  tcp_accept(g_control_listener_pcb, NULL);
+  (void)tcp_close(g_control_listener_pcb);
+  g_control_listener_pcb = NULL;
+}
+
+static err_t control_service_send_response(struct tcp_pcb *tpcb, const char *response)
+{
+  size_t len = strlen(response);
+  err_t err;
+
+  err = tcp_write(tpcb, response, (u16_t)len, TCP_WRITE_FLAG_COPY);
+  if (err != ERR_OK)
+  {
+    g_control_stats.errors++;
+    return err;
+  }
+
+  err = tcp_output(tpcb);
+  if (err != ERR_OK)
+  {
+    g_control_stats.errors++;
+  }
+
+  return err;
+}
+
+static void control_service_execute(const control_proto_command_t *command, char *response, size_t response_size)
+{
+  char ip_text[16];
+  relay_domain_result_t result;
+
+  if (command == NULL)
+  {
+    (void)control_proto_format_error(response, response_size, CONTROL_PROTO_ERR_BAD_COMMAND);
+    return;
+  }
+
+  if (control_queue_submit(command, &result) != HAL_OK)
+  {
+    g_control_stats.errors++;
+    (void)control_proto_format_error(response, response_size, CONTROL_PROTO_ERR_BAD_COMMAND);
+    return;
+  }
+
+  switch (command->type)
+  {
+    case CONTROL_PROTO_CMD_PING:
+      ip4addr_ntoa_r(netif_ip4_addr(&gnetif), ip_text, sizeof(ip_text));
+      if (result.error == CONTROL_PROTO_ERR_NONE)
+      {
+        (void)control_proto_format_pong(response, response_size, ip_text, result.relay_mask);
+      }
+      else
+      {
+        g_control_stats.errors++;
+        (void)control_proto_format_error(response, response_size, result.error);
+      }
+      break;
+
+    case CONTROL_PROTO_CMD_GET_RELAY:
+    case CONTROL_PROTO_CMD_SET_RELAY:
+    case CONTROL_PROTO_CMD_SET_RELAY_MASK:
+    case CONTROL_PROTO_CMD_SET_RELAY_ALL:
+      if (result.error == CONTROL_PROTO_ERR_NONE)
+      {
+        (void)control_proto_format_relay_state(response, response_size, result.relay_mask);
+      }
+      else
+      {
+        g_control_stats.errors++;
+        (void)control_proto_format_error(response, response_size, result.error);
+      }
+      break;
+
+    case CONTROL_PROTO_CMD_INVALID:
+    default:
+      g_control_stats.errors++;
+      (void)control_proto_format_error(response, response_size, command->error);
+      break;
+  }
+}
+
+static err_t control_service_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
+{
+  control_tcp_client_t *client = (control_tcp_client_t *)arg;
+  char request[96];
+  char response[160];
+  control_proto_command_t command;
+  u16_t copy_len;
+
+  LWIP_UNUSED_ARG(client);
+
+  if ((err != ERR_OK) || (p == NULL))
+  {
+    if (p != NULL)
+    {
+      pbuf_free(p);
+    }
+    control_service_close(tpcb);
+    return ERR_OK;
+  }
+
+  tcp_recved(tpcb, p->tot_len);
+  copy_len = (p->tot_len < (sizeof(request) - 1U)) ? p->tot_len : (u16_t)(sizeof(request) - 1U);
+  pbuf_copy_partial(p, request, copy_len, 0U);
+  request[copy_len] = '\0';
+  pbuf_free(p);
+
+  g_control_stats.commands++;
+  control_proto_parse(request, &command);
+  control_service_execute(&command, response, sizeof(response));
+  (void)control_service_send_response(tpcb, response);
+  control_service_close(tpcb);
+  return ERR_OK;
+}
+
+static void control_service_error(void *arg, err_t err)
+{
+  LWIP_UNUSED_ARG(arg);
+  LWIP_UNUSED_ARG(err);
+  g_control_stats.errors++;
+}
+
+static err_t control_service_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
+{
+  static control_tcp_client_t client_ctx;
+
+  LWIP_UNUSED_ARG(arg);
+
+  if ((err != ERR_OK) || (newpcb == NULL))
+  {
+    g_control_stats.errors++;
+    return ERR_VAL;
+  }
+
+  client_ctx.pcb = newpcb;
+  g_control_stats.connections++;
+  tcp_arg(newpcb, &client_ctx);
+  tcp_recv(newpcb, control_service_recv);
+  tcp_err(newpcb, control_service_error);
+  tcp_poll(newpcb, NULL, 0);
+  return ERR_OK;
+}
+
+static void control_service_tcpip_step(void *arg)
+{
+  uint8_t link_up;
+
+  LWIP_UNUSED_ARG(arg);
+  link_up = netif_is_link_up(&gnetif) ? 1U : 0U;
+
+  if (!link_up)
+  {
+    if (g_control_last_link_up != 0U)
+    {
+      control_service_close_listener();
+    }
+    g_control_last_link_up = 0U;
+    return;
+  }
+
+  if (g_control_listener_pcb == NULL)
+  {
+    struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+
+    if (pcb != NULL)
+    {
+      if (tcp_bind(pcb, IP_ANY_TYPE, CONTROL_TCP_PORT) == ERR_OK)
+      {
+        g_control_listener_pcb = tcp_listen_with_backlog(pcb, 2);
+        if (g_control_listener_pcb != NULL)
+        {
+          tcp_accept(g_control_listener_pcb, control_service_accept);
+          g_control_last_link_up = 1U;
+        }
+        else
+        {
+          g_control_stats.errors++;
+        }
+      }
+      else
+      {
+        g_control_stats.errors++;
+        (void)tcp_close(pcb);
+      }
+    }
+    else
+    {
+      g_control_stats.errors++;
+    }
+  }
+}
+
+void control_service_init(void)
+{
+  control_queue_init();
+
+  if (g_control_service_started == 0U)
+  {
+    g_control_service_started = 1U;
+    osThreadDef(ControlService, control_service_task, osPriorityBelowNormal, 0, 256);
+    g_control_task_handle = osThreadCreate(osThread(ControlService), NULL);
+  }
+}
+
+void control_service_poll(void)
+{
+  control_service_init();
+}
+
+void control_service_get_stats(control_service_stats_t *stats)
+{
+  if (stats != NULL)
+  {
+    *stats = g_control_stats;
+  }
+}
+
+static void control_service_task(void const *argument)
+{
+  (void)argument;
+
+  for (;;)
+  {
+    (void)tcpip_callback(control_service_tcpip_step, NULL);
+    osDelay(500U);
+  }
+}

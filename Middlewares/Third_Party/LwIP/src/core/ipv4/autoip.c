@@ -70,6 +70,24 @@
 
 #include <string.h>
 
+#if defined(__clang__)
+#define AUTOIP_NOINLINE_UNOPTIMIZED __attribute__((noinline, optnone))
+#else
+#define AUTOIP_NOINLINE_UNOPTIMIZED
+#endif
+
+static AUTOIP_NOINLINE_UNOPTIMIZED void
+autoip_copy_ip4_addr_from_packed(ip4_addr_t *dst, const void *src)
+{
+  volatile u8_t *dst_bytes = (volatile u8_t *)&dst->addr;
+  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
+
+  dst_bytes[0] = src_bytes[0];
+  dst_bytes[1] = src_bytes[1];
+  dst_bytes[2] = src_bytes[2];
+  dst_bytes[3] = src_bytes[3];
+}
+
 /** Pseudo random macro based on netif informations.
  * You could use "rand()" from the C Library if you define LWIP_AUTOIP_RAND in lwipopts.h */
 #ifndef LWIP_AUTOIP_RAND
@@ -468,8 +486,8 @@ autoip_arp_reply(struct netif *netif, struct etharp_hdr *hdr)
     /* Copy struct ip4_addr_wordaligned to aligned ip4_addr, to support compilers without
      * structure packing (not using structure copy which breaks strict-aliasing rules).
      */
-    IPADDR_WORDALIGNED_COPY_TO_IP4_ADDR_T(&sipaddr, &hdr->sipaddr);
-    IPADDR_WORDALIGNED_COPY_TO_IP4_ADDR_T(&dipaddr, &hdr->dipaddr);
+    autoip_copy_ip4_addr_from_packed(&sipaddr, &hdr->sipaddr);
+    autoip_copy_ip4_addr_from_packed(&dipaddr, &hdr->dipaddr);
 
     if (autoip->state == AUTOIP_STATE_PROBING) {
       /* RFC 3927 Section 2.2.1:

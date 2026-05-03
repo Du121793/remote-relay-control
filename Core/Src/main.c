@@ -18,14 +18,18 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 #include "lwip.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include "board_relay.h"
 #include "lwip/dhcp.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/prot/dhcp.h"
+#include "stm32f7xx_hal_eth.h"
 
 /* USER CODE END Includes */
 
@@ -49,10 +53,26 @@ ADC_HandleTypeDef hadc1;
 
 UART_HandleTypeDef huart3;
 
+osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
 extern struct netif gnetif;
+extern ETH_HandleTypeDef heth;
+extern volatile uint32_t g_eth_irq_count;
+extern volatile uint32_t g_eth_rx_cplt_count;
+extern volatile uint32_t g_eth_link_thread_started;
+extern volatile uint32_t g_eth_link_thread_loops;
+extern volatile int32_t g_eth_last_phy_link_state;
+extern volatile uint32_t g_eth_link_up_events;
+extern volatile uint32_t g_eth_link_down_events;
 
-static uint32_t next_heartbeat_ms = 0U;
+static char g_uart_message[384];
+static char g_ip_text[16];
+static char g_mask_text[16];
+static char g_gw_text[16];
+static uint32_t next_dhcp_report_ms = 0U;
+static uint8_t g_last_link_up = 0xFFU;
+static uint8_t g_last_dhcp_bound = 0xFFU;
+static uint8_t g_last_dhcp_state = 0xFFU;
 
 /* USER CODE END PV */
 
@@ -62,15 +82,93 @@ static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_USART3_UART_Init(void);
+void StartDefaultTask(void const * argument);
+
 /* USER CODE BEGIN PFP */
 static void uart3_write(const char *text);
 static void log_startup_banner(void);
-static void log_network_heartbeat(void);
+static const char *dhcp_state_to_string(uint8_t state);
+static void log_link_state(uint8_t link_up);
+static void log_dhcp_state(uint8_t force_progress);
+static void disable_unaligned_trap_for_lwip(void);
+__attribute__((noinline, optnone, used)) static void aeabi_copy_bytes_forward(void *dst, const void *src, size_t len);
+__attribute__((noinline, optnone, used)) static void aeabi_move_bytes_safe(void *dst, const void *src, size_t len);
+void __aeabi_memcpy(void *dest, const void *src, size_t n);
+void __aeabi_memcpy4(void *dest, const void *src, size_t n);
+void __aeabi_memcpy8(void *dest, const void *src, size_t n);
+void __aeabi_memmove(void *dest, const void *src, size_t n);
+void __aeabi_memmove4(void *dest, const void *src, size_t n);
+void __aeabi_memmove8(void *dest, const void *src, size_t n);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+__attribute__((noinline, optnone, used)) static void aeabi_copy_bytes_forward(void *dst, const void *src, size_t len)
+{
+  volatile uint8_t *dst_bytes = (volatile uint8_t *)dst;
+  const volatile uint8_t *src_bytes = (const volatile uint8_t *)src;
+  size_t i;
+
+  for (i = 0U; i < len; ++i)
+  {
+    dst_bytes[i] = src_bytes[i];
+  }
+}
+
+__attribute__((noinline, optnone, used)) static void aeabi_move_bytes_safe(void *dst, const void *src, size_t len)
+{
+  volatile uint8_t *dst_bytes = (volatile uint8_t *)dst;
+  const volatile uint8_t *src_bytes = (const volatile uint8_t *)src;
+  size_t i;
+
+  if ((dst_bytes == src_bytes) || (len == 0U))
+  {
+    return;
+  }
+
+  if (dst_bytes < src_bytes)
+  {
+    aeabi_copy_bytes_forward((void *)dst_bytes, (const void *)src_bytes, len);
+    return;
+  }
+
+  for (i = len; i > 0U; --i)
+  {
+    dst_bytes[i - 1U] = src_bytes[i - 1U];
+  }
+}
+
+void __aeabi_memcpy(void *dest, const void *src, size_t n)
+{
+  aeabi_copy_bytes_forward(dest, src, n);
+}
+
+void __aeabi_memcpy4(void *dest, const void *src, size_t n)
+{
+  aeabi_copy_bytes_forward(dest, src, n);
+}
+
+void __aeabi_memcpy8(void *dest, const void *src, size_t n)
+{
+  aeabi_copy_bytes_forward(dest, src, n);
+}
+
+void __aeabi_memmove(void *dest, const void *src, size_t n)
+{
+  aeabi_move_bytes_safe(dest, src, n);
+}
+
+void __aeabi_memmove4(void *dest, const void *src, size_t n)
+{
+  aeabi_move_bytes_safe(dest, src, n);
+}
+
+void __aeabi_memmove8(void *dest, const void *src, size_t n)
+{
+  aeabi_move_bytes_safe(dest, src, n);
+}
+
 static void uart3_write(const char *text)
 {
   size_t len = strlen(text);
@@ -86,34 +184,78 @@ static void log_startup_banner(void)
   uart3_write("\r\n[boot] autoControl startup complete\r\n");
 }
 
-static void log_network_heartbeat(void)
+static const char *dhcp_state_to_string(uint8_t state)
 {
-  char ip_text[16];
-  char disc_src_ip_text[16];
-  char message[160];
-  const char *link_text;
-  const char *dhcp_text;
+  switch (state)
+  {
+    case DHCP_STATE_OFF: return "off";
+    case DHCP_STATE_REQUESTING: return "requesting";
+    case DHCP_STATE_INIT: return "init";
+    case DHCP_STATE_REBOOTING: return "rebooting";
+    case DHCP_STATE_REBINDING: return "rebinding";
+    case DHCP_STATE_RENEWING: return "renewing";
+    case DHCP_STATE_SELECTING: return "selecting";
+    case DHCP_STATE_INFORMING: return "informing";
+    case DHCP_STATE_CHECKING: return "checking";
+    case DHCP_STATE_BOUND: return "bound";
+    case DHCP_STATE_RELEASING: return "releasing";
+    case DHCP_STATE_BACKING_OFF: return "backing_off";
+    default: return "unknown";
+  }
+}
 
-  ip4addr_ntoa_r(netif_ip4_addr(&gnetif), ip_text, sizeof(ip_text));
-  link_text = netif_is_link_up(&gnetif) ? "up" : "down";
-  dhcp_text = dhcp_supplied_address(&gnetif) ? "bound" : "pending";
+static void log_link_state(uint8_t link_up)
+{
+  (void)snprintf(g_uart_message, sizeof(g_uart_message),
+                 "[net] link %s phy=%ld\r\n",
+                 (link_up != 0U) ? "up" : "down",
+                 (long)g_eth_last_phy_link_state);
+  uart3_write(g_uart_message);
+}
 
-  (void)snprintf(disc_src_ip_text, sizeof(disc_src_ip_text), "%lu.%lu.%lu.%lu",
-                 (unsigned long)(g_udp_discovery_last_src_ip & 0xFFU),
-                 (unsigned long)((g_udp_discovery_last_src_ip >> 8) & 0xFFU),
-                 (unsigned long)((g_udp_discovery_last_src_ip >> 16) & 0xFFU),
-                 (unsigned long)((g_udp_discovery_last_src_ip >> 24) & 0xFFU));
+static void log_dhcp_state(uint8_t force_progress)
+{
+  struct dhcp *dhcp = netif_dhcp_data(&gnetif);
+  uint8_t bound = dhcp_supplied_address(&gnetif);
+  uint8_t state = (dhcp != NULL) ? dhcp->state : DHCP_STATE_OFF;
 
-  (void)snprintf(message, sizeof(message),
-                 "[net] tick=%lu link=%s dhcp=%s ip=%s ann=%lu discover=%lu last=%s:%lu tx=%lu rx=%lu\r\n",
-                 (unsigned long)HAL_GetTick(), link_text, dhcp_text, ip_text,
-                 (unsigned long)g_udp_discovery_announce_packets,
-                 (unsigned long)g_udp_discovery_discover_packets,
-                 disc_src_ip_text,
-                 (unsigned long)g_udp_discovery_last_src_port,
-                 (unsigned long)g_eth_tx_packets,
-                 (unsigned long)g_eth_rx_packets);
-  uart3_write(message);
+  if (bound != 0U)
+  {
+    (void)ip4addr_ntoa_r(netif_ip4_addr(&gnetif), g_ip_text, sizeof(g_ip_text));
+    (void)ip4addr_ntoa_r(netif_ip4_netmask(&gnetif), g_mask_text, sizeof(g_mask_text));
+    (void)ip4addr_ntoa_r(netif_ip4_gw(&gnetif), g_gw_text, sizeof(g_gw_text));
+    (void)snprintf(g_uart_message, sizeof(g_uart_message),
+                   "[net] dhcp bound ip=%s mask=%s gw=%s\r\n",
+                   g_ip_text, g_mask_text, g_gw_text);
+  }
+  else if (force_progress != 0U)
+  {
+    (void)snprintf(g_uart_message, sizeof(g_uart_message),
+                   "[net] dhcp %s tx=%lu rx=%lu irq=%lu\r\n",
+                   dhcp_state_to_string(state),
+                   (unsigned long)g_eth_tx_packets,
+                   (unsigned long)g_eth_rx_packets,
+                   (unsigned long)g_eth_irq_count);
+  }
+  else
+  {
+    (void)snprintf(g_uart_message, sizeof(g_uart_message),
+                   "[net] dhcp %s\r\n",
+                   dhcp_state_to_string(state));
+  }
+  uart3_write(g_uart_message);
+}
+
+static void disable_unaligned_trap_for_lwip(void)
+{
+  /*
+   * armclang still emits word-sized accesses for some packed lwIP paths.
+   * Keep UNALIGN_TRP cleared so a missed packed-field site does not turn
+   * normal network traffic into a UsageFault during bring-up.
+   */
+  SCB->CCR &= ~SCB_CCR_UNALIGN_TRP_Msk;
+  __DSB();
+  __ISB();
 }
 
 /* USER CODE END 0 */
@@ -138,7 +280,7 @@ int main(void)
   SCB_EnableICache();
 
   /* Enable D-Cache---------------------------------------------------------*/
-  /* Temporary: keep D-Cache disabled while validating ETH DMA path. */
+  /* Keep D-Cache disabled while validating the ETH DMA RX path. */
   /* SCB_EnableDCache(); */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -147,6 +289,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+  disable_unaligned_trap_for_lwip();
 
   /* USER CODE END Init */
 
@@ -161,13 +304,42 @@ int main(void)
   MX_GPIO_Init();
   MX_ADC1_Init();
   MX_USART3_UART_Init();
-  MX_LWIP_Init();
   /* USER CODE BEGIN 2 */
   log_startup_banner();
-  log_network_heartbeat();
-  next_heartbeat_ms = HAL_GetTick() + 1000U;
 
   /* USER CODE END 2 */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* definition and creation of defaultTask */
+  /* CMSIS-RTOS V1 in this repo forwards stacksz directly to FreeRTOS xTaskCreate(),
+     so the effective unit here behaves like StackType_t words, not bytes. */
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 1024);
+  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -176,16 +348,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    uint32_t now = HAL_GetTick();
-
-    MX_LWIP_Process();
-    HAL_ETH_ReleaseTxPacket(&heth);
-
-    if ((int32_t)(now - next_heartbeat_ms) >= 0)
-    {
-      log_network_heartbeat();
-      next_heartbeat_ms = now + 1000U;
-    }
   }
   /* USER CODE END 3 */
 }
@@ -373,6 +535,55 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE END 4 */
 
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void const * argument)
+{
+  /* init code for LWIP */
+  MX_LWIP_Init();
+  uart3_write("[boot] lwip initialized\r\n");
+  next_dhcp_report_ms = HAL_GetTick() + 5000U;
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    uint32_t now = HAL_GetTick();
+    struct dhcp *dhcp = netif_dhcp_data(&gnetif);
+    uint8_t link_up = netif_is_link_up(&gnetif) ? 1U : 0U;
+    uint8_t dhcp_bound = dhcp_supplied_address(&gnetif) ? 1U : 0U;
+    uint8_t dhcp_state = (dhcp != NULL) ? dhcp->state : DHCP_STATE_OFF;
+
+    HAL_ETH_ReleaseTxPacket(&heth);
+
+    if (link_up != g_last_link_up)
+    {
+      g_last_link_up = link_up;
+      log_link_state(link_up);
+    }
+
+    if ((dhcp_bound != g_last_dhcp_bound) || (dhcp_state != g_last_dhcp_state))
+    {
+      g_last_dhcp_bound = dhcp_bound;
+      g_last_dhcp_state = dhcp_state;
+      log_dhcp_state(0U);
+      next_dhcp_report_ms = now + 5000U;
+    }
+    else if ((link_up != 0U) && (dhcp_bound == 0U) && ((int32_t)(now - next_dhcp_report_ms) >= 0))
+    {
+      log_dhcp_state(1U);
+      next_dhcp_report_ms = now + 5000U;
+    }
+
+    osDelay(100);
+  }
+  /* USER CODE END 5 */
+}
+
  /* MPU Configuration */
 
 void MPU_Config(void)
@@ -395,6 +606,21 @@ void MPU_Config(void)
   MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
   MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
   MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+
+  HAL_MPU_ConfigRegion(&MPU_InitStruct);
+
+  /* Keep ETH DMA descriptors and TX staging buffers outside D-Cache. */
+  MPU_InitStruct.Enable = MPU_REGION_ENABLE;
+  MPU_InitStruct.Number = MPU_REGION_NUMBER1;
+  MPU_InitStruct.BaseAddress = 0x2007C000U;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_16KB;
+  MPU_InitStruct.SubRegionDisable = 0x00;
+  MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
+  MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
+  MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+  MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_BUFFERABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
   /* Enables the MPU */

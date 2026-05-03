@@ -106,6 +106,18 @@
 /** The IP header ID of the next outgoing IP packet */
 static u16_t ip_id;
 
+static void
+ip4_addr_copy_aligned_from_unaligned_bytes(ip4_addr_t *dst, const void *src)
+{
+  volatile u8_t *dst_bytes = (volatile u8_t *)&dst->addr;
+  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
+
+  dst_bytes[0] = src_bytes[0];
+  dst_bytes[1] = src_bytes[1];
+  dst_bytes[2] = src_bytes[2];
+  dst_bytes[3] = src_bytes[3];
+}
+
 #if LWIP_MULTICAST_TX_OPTIONS
 /** The default netif used for multicast */
 static struct netif *ip4_default_multicast_netif;
@@ -429,6 +441,8 @@ ip4_input(struct pbuf *p, struct netif *inp)
   struct netif *netif;
   u16_t iphdr_hlen;
   u16_t iphdr_len;
+  ip4_addr_t current_dest_aligned;
+  ip4_addr_t current_src_aligned;
 #if IP_ACCEPT_LINK_LAYER_ADDRESSING || LWIP_IGMP
   int check_ip_src = 1;
 #endif /* IP_ACCEPT_LINK_LAYER_ADDRESSING || LWIP_IGMP */
@@ -511,9 +525,15 @@ ip4_input(struct pbuf *p, struct netif *inp)
   }
 #endif
 
-  /* copy IP addresses to aligned ip_addr_t */
-  ip_addr_copy_from_ip4(ip_data.current_iphdr_dest, iphdr->dest);
-  ip_addr_copy_from_ip4(ip_data.current_iphdr_src, iphdr->src);
+  /*
+   * armclang may emit word loads for packed IPv4 src/dest fields even though
+   * the incoming IP header is not guaranteed to be 4-byte aligned after the
+   * Ethernet header. Copy them through aligned locals first.
+   */
+  ip4_addr_copy_aligned_from_unaligned_bytes(&current_dest_aligned, &iphdr->dest);
+  ip4_addr_copy_aligned_from_unaligned_bytes(&current_src_aligned, &iphdr->src);
+  ip_addr_copy_from_ip4(ip_data.current_iphdr_dest, current_dest_aligned);
+  ip_addr_copy_from_ip4(ip_data.current_iphdr_src, current_src_aligned);
 
   /* match packet against an interface, i.e. is this packet for us? */
   if (ip4_addr_ismulticast(ip4_current_dest_addr())) {

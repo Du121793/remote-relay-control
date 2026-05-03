@@ -184,6 +184,34 @@ static u8_t xid_initialised;
 #define dhcp_get_option_value(dhcp, idx)      (dhcp_rx_options_val[idx])
 #define dhcp_set_option_value(dhcp, idx, val) (dhcp_rx_options_val[idx] = (val))
 
+static u32_t
+dhcp_read_u32_aligned_from_unaligned_bytes(const void *src)
+{
+  volatile u8_t *dst_bytes;
+  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
+  u32_t value = 0;
+
+  dst_bytes = (volatile u8_t *)&value;
+  dst_bytes[0] = src_bytes[0];
+  dst_bytes[1] = src_bytes[1];
+  dst_bytes[2] = src_bytes[2];
+  dst_bytes[3] = src_bytes[3];
+
+  return value;
+}
+
+static void
+dhcp_ip4_addr_copy_aligned_from_unaligned_bytes(ip4_addr_t *dst, const void *src)
+{
+  volatile u8_t *dst_bytes = (volatile u8_t *)&dst->addr;
+  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
+
+  dst_bytes[0] = src_bytes[0];
+  dst_bytes[1] = src_bytes[1];
+  dst_bytes[2] = src_bytes[2];
+  dst_bytes[3] = src_bytes[3];
+}
+
 static struct udp_pcb *dhcp_pcb;
 static u8_t dhcp_pcb_refcount;
 
@@ -215,7 +243,6 @@ static u16_t dhcp_option(u16_t options_out_len, u8_t *options, u8_t option_type,
 static u16_t dhcp_option_byte(u16_t options_out_len, u8_t *options, u8_t value);
 static u16_t dhcp_option_short(u16_t options_out_len, u8_t *options, u16_t value);
 static u16_t dhcp_option_long(u16_t options_out_len, u8_t *options, u32_t value);
-static u16_t dhcp_option_client_id(u16_t options_out_len, u8_t *options, struct netif *netif);
 #if LWIP_NETIF_HOSTNAME
 static u16_t dhcp_option_hostname(u16_t options_out_len, u8_t *options, struct netif *netif);
 #endif /* LWIP_NETIF_HOSTNAME */
@@ -333,6 +360,7 @@ static void
 dhcp_handle_offer(struct netif *netif, struct dhcp_msg *msg_in)
 {
   struct dhcp *dhcp = netif_dhcp_data(netif);
+  ip4_addr_t offered_ip_addr_aligned;
 
   LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE, ("dhcp_handle_offer(netif=%p) %c%c%"U16_F"\n",
               (void *)netif, netif->name[0], netif->name[1], (u16_t)netif->num));
@@ -344,7 +372,8 @@ dhcp_handle_offer(struct netif *netif, struct dhcp_msg *msg_in)
     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_STATE, ("dhcp_handle_offer(): server 0x%08"X32_F"\n",
                 ip4_addr_get_u32(ip_2_ip4(&dhcp->server_ip_addr))));
     /* remember offered address */
-    ip4_addr_copy(dhcp->offered_ip_addr, msg_in->yiaddr);
+    dhcp_ip4_addr_copy_aligned_from_unaligned_bytes(&offered_ip_addr_aligned, &msg_in->yiaddr);
+    ip4_addr_copy(dhcp->offered_ip_addr, offered_ip_addr_aligned);
     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_STATE, ("dhcp_handle_offer(): offer for 0x%08"X32_F"\n",
                 ip4_addr_get_u32(&dhcp->offered_ip_addr)));
 
@@ -386,7 +415,6 @@ dhcp_select(struct netif *netif)
     struct dhcp_msg *msg_out = (struct dhcp_msg *)p_out->payload;
     options_out_len = dhcp_option(options_out_len, msg_out->options, DHCP_OPTION_MAX_MSG_SIZE, DHCP_OPTION_MAX_MSG_SIZE_LEN);
     options_out_len = dhcp_option_short(options_out_len, msg_out->options, DHCP_MAX_MSG_LEN(netif));
-    options_out_len = dhcp_option_client_id(options_out_len, msg_out->options, netif);
 
     /* MUST request the offered IP address */
     options_out_len = dhcp_option(options_out_len, msg_out->options, DHCP_OPTION_REQUESTED_IP, 4);
@@ -601,12 +629,16 @@ static void
 dhcp_handle_ack(struct netif *netif, struct dhcp_msg *msg_in)
 {
   struct dhcp *dhcp = netif_dhcp_data(netif);
+  ip4_addr_t offered_ip_addr_aligned;
 
 #if LWIP_DHCP_PROVIDE_DNS_SERVERS || LWIP_DHCP_GET_NTP_SRV
   u8_t n;
 #endif /* LWIP_DHCP_PROVIDE_DNS_SERVERS || LWIP_DHCP_GET_NTP_SRV */
 #if LWIP_DHCP_GET_NTP_SRV
   ip4_addr_t ntp_server_addrs[LWIP_DHCP_MAX_NTP_SERVERS];
+#endif
+#if LWIP_DHCP_BOOTP_FILE
+  ip4_addr_t offered_si_addr_aligned;
 #endif
 
   /* clear options we might not get from the ACK */
@@ -640,12 +672,14 @@ dhcp_handle_ack(struct netif *netif, struct dhcp_msg *msg_in)
   }
 
   /* (y)our internet address */
-  ip4_addr_copy(dhcp->offered_ip_addr, msg_in->yiaddr);
+  dhcp_ip4_addr_copy_aligned_from_unaligned_bytes(&offered_ip_addr_aligned, &msg_in->yiaddr);
+  ip4_addr_copy(dhcp->offered_ip_addr, offered_ip_addr_aligned);
 
 #if LWIP_DHCP_BOOTP_FILE
   /* copy boot server address,
      boot file name copied in dhcp_parse_reply if not overloaded */
-  ip4_addr_copy(dhcp->offered_si_addr, msg_in->siaddr);
+  dhcp_ip4_addr_copy_aligned_from_unaligned_bytes(&offered_si_addr_aligned, &msg_in->siaddr);
+  ip4_addr_copy(dhcp->offered_si_addr, offered_si_addr_aligned);
 #endif /* LWIP_DHCP_BOOTP_FILE */
 
   /* subnet mask given? */
@@ -1001,7 +1035,6 @@ dhcp_discover(struct netif *netif)
 
     options_out_len = dhcp_option(options_out_len, msg_out->options, DHCP_OPTION_MAX_MSG_SIZE, DHCP_OPTION_MAX_MSG_SIZE_LEN);
     options_out_len = dhcp_option_short(options_out_len, msg_out->options, DHCP_MAX_MSG_LEN(netif));
-    options_out_len = dhcp_option_client_id(options_out_len, msg_out->options, netif);
 
     options_out_len = dhcp_option(options_out_len, msg_out->options, DHCP_OPTION_PARAMETER_REQUEST_LIST, LWIP_ARRAYSIZE(dhcp_discover_request_options));
     for (i = 0; i < LWIP_ARRAYSIZE(dhcp_discover_request_options); i++) {
@@ -1471,21 +1504,6 @@ dhcp_option_long(u16_t options_out_len, u8_t *options, u32_t value)
   return options_out_len;
 }
 
-static u16_t
-dhcp_option_client_id(u16_t options_out_len, u8_t *options, struct netif *netif)
-{
-  u8_t i;
-  u8_t hwaddr_len = (u8_t)LWIP_MIN(netif->hwaddr_len, NETIF_MAX_HWADDR_LEN);
-
-  LWIP_ASSERT("dhcp_option_client_id: option fits", options_out_len + 2U + 1U + hwaddr_len <= DHCP_OPTIONS_LEN);
-  options_out_len = dhcp_option(options_out_len, options, DHCP_OPTION_CLIENT_ID, (u8_t)(1U + hwaddr_len));
-  options[options_out_len++] = LWIP_IANA_HWTYPE_ETHERNET;
-  for (i = 0; i < hwaddr_len; i++) {
-    options[options_out_len++] = netif->hwaddr[i];
-  }
-  return options_out_len;
-}
-
 #if LWIP_NETIF_HOSTNAME
 static u16_t
 dhcp_option_hostname(u16_t options_out_len, u8_t *options, struct netif *netif)
@@ -1776,6 +1794,7 @@ dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr,
   struct dhcp_msg *reply_msg = (struct dhcp_msg *)p->payload;
   u8_t msg_type;
   u8_t i;
+  u32_t reply_xid_network_order;
   struct dhcp_msg *msg_in;
 
   LWIP_UNUSED_ARG(arg);
@@ -1815,9 +1834,10 @@ dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr,
     }
   }
   /* match transaction ID against what we expected */
-  if (lwip_ntohl(reply_msg->xid) != dhcp->xid) {
+  reply_xid_network_order = dhcp_read_u32_aligned_from_unaligned_bytes(&reply_msg->xid);
+  if (lwip_ntohl(reply_xid_network_order) != dhcp->xid) {
     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_WARNING,
-                ("transaction id mismatch reply_msg->xid(%"X32_F")!=dhcp->xid(%"X32_F")\n", lwip_ntohl(reply_msg->xid), dhcp->xid));
+                ("transaction id mismatch reply_msg->xid(%"X32_F")!=dhcp->xid(%"X32_F")\n", lwip_ntohl(reply_xid_network_order), dhcp->xid));
     goto free_pbuf_and_return;
   }
   /* option fields could be unfold? */
@@ -1946,12 +1966,9 @@ dhcp_create_msg(struct netif *netif, struct dhcp *dhcp, u8_t message_type, u16_t
   msg_out->htype = LWIP_IANA_HWTYPE_ETHERNET;
   msg_out->hlen = netif->hwaddr_len;
   msg_out->xid = lwip_htonl(dhcp->xid);
-  /* Force broadcast replies during early DHCP bring-up to maximize server compatibility. */
-  if ((message_type == DHCP_DISCOVER) ||
-      ((message_type == DHCP_REQUEST) &&
-       ((dhcp->state == DHCP_STATE_SELECTING) || (dhcp->state == DHCP_STATE_REQUESTING)))) {
-    msg_out->flags = PP_HTONS(0x8000U);
-  }
+  /* Prefer broadcast replies during bring-up. This avoids dependencies on
+     pre-IP unicast reception behaviour across switches / DHCP servers. */
+  msg_out->flags = PP_HTONS(0x8000U);
   /* set ciaddr to netif->ip_addr based on message_type and state */
   if ((message_type == DHCP_INFORM) || (message_type == DHCP_DECLINE) || (message_type == DHCP_RELEASE) ||
       ((message_type == DHCP_REQUEST) && /* DHCP_STATE_BOUND not used for sending! */

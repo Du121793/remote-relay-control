@@ -29,3 +29,10 @@ AGENT.md
 DOING.md
 FINISH.md
 TODO.md
+
+# Local Python tooling
+.VENV/
+tools/build/
+tools/dist/
+tools/__pycache__/
+tools/*.spec

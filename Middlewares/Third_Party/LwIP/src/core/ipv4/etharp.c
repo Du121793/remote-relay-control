@@ -61,6 +61,50 @@
 #include LWIP_HOOK_FILENAME
 #endif
 
+#if defined(__clang__)
+#define ETHARP_NOINLINE_UNOPTIMIZED __attribute__((noinline, optnone))
+#else
+#define ETHARP_NOINLINE_UNOPTIMIZED
+#endif
+
+static ETHARP_NOINLINE_UNOPTIMIZED void
+etharp_copy_ip4_addr_from_packed(ip4_addr_t *dst, const void *src)
+{
+  volatile u8_t *dst_bytes = (volatile u8_t *)&dst->addr;
+  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
+
+  dst_bytes[0] = src_bytes[0];
+  dst_bytes[1] = src_bytes[1];
+  dst_bytes[2] = src_bytes[2];
+  dst_bytes[3] = src_bytes[3];
+}
+
+static ETHARP_NOINLINE_UNOPTIMIZED void
+etharp_copy_ip4_addr_to_packed(void *dst, const ip4_addr_t *src)
+{
+  volatile u8_t *dst_bytes = (volatile u8_t *)dst;
+  const volatile u8_t *src_bytes = (const volatile u8_t *)&src->addr;
+
+  dst_bytes[0] = src_bytes[0];
+  dst_bytes[1] = src_bytes[1];
+  dst_bytes[2] = src_bytes[2];
+  dst_bytes[3] = src_bytes[3];
+}
+
+static ETHARP_NOINLINE_UNOPTIMIZED void
+etharp_copy_eth_addr_bytes(void *dst, const void *src)
+{
+  volatile u8_t *dst_bytes = (volatile u8_t *)dst;
+  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
+
+  dst_bytes[0] = src_bytes[0];
+  dst_bytes[1] = src_bytes[1];
+  dst_bytes[2] = src_bytes[2];
+  dst_bytes[3] = src_bytes[3];
+  dst_bytes[4] = src_bytes[4];
+  dst_bytes[5] = src_bytes[5];
+}
+
 /** Re-request a used ARP entry 1 minute before it would expire to prevent
  *  breaking a steadily used connection because the ARP entry timed out. */
 #define ARP_AGE_REREQUEST_USED_UNICAST   (ARP_MAXAGE - 30)
@@ -418,7 +462,7 @@ etharp_find_entry(const ip4_addr_t *ipaddr, u8_t flags, struct netif *netif)
  *
  * @see pbuf_free()
  */
-static err_t
+static ETHARP_NOINLINE_UNOPTIMIZED err_t
 etharp_update_arp_entry(struct netif *netif, const ip4_addr_t *ipaddr, struct eth_addr *ethaddr, u8_t flags)
 {
   s16_t i;
@@ -462,7 +506,7 @@ etharp_update_arp_entry(struct netif *netif, const ip4_addr_t *ipaddr, struct et
 
   LWIP_DEBUGF(ETHARP_DEBUG | LWIP_DBG_TRACE, ("etharp_update_arp_entry: updating stable entry %"S16_F"\n", i));
   /* update address */
-  SMEMCPY(&arp_table[i].ethaddr, ethaddr, ETH_HWADDR_LEN);
+  etharp_copy_eth_addr_bytes(&arp_table[i].ethaddr, ethaddr);
   /* reset time stamp */
   arp_table[i].ctime = 0;
   /* this is where we will send out queued packets! */
@@ -675,8 +719,8 @@ etharp_input(struct pbuf *p, struct netif *netif)
 
   /* Copy struct ip4_addr_wordaligned to aligned ip4_addr, to support compilers without
    * structure packing (not using structure copy which breaks strict-aliasing rules). */
-  IPADDR_WORDALIGNED_COPY_TO_IP4_ADDR_T(&sipaddr, &hdr->sipaddr);
-  IPADDR_WORDALIGNED_COPY_TO_IP4_ADDR_T(&dipaddr, &hdr->dipaddr);
+  etharp_copy_ip4_addr_from_packed(&sipaddr, &hdr->sipaddr);
+  etharp_copy_ip4_addr_from_packed(&dipaddr, &hdr->dipaddr);
 
   /* this interface is not configured? */
   if (ip4_addr_isany_val(*netif_ip4_addr(netif))) {
@@ -1097,7 +1141,7 @@ etharp_query(struct netif *netif, const ip4_addr_t *ipaddr, struct pbuf *q)
  *         ERR_MEM if the ARP packet couldn't be allocated
  *         any other err_t on failure
  */
-static err_t
+static ETHARP_NOINLINE_UNOPTIMIZED err_t
 etharp_raw(struct netif *netif, const struct eth_addr *ethsrc_addr,
            const struct eth_addr *ethdst_addr,
            const struct eth_addr *hwsrc_addr, const ip4_addr_t *ipsrc_addr,
@@ -1130,12 +1174,12 @@ etharp_raw(struct netif *netif, const struct eth_addr *ethsrc_addr,
               (netif->hwaddr_len == ETH_HWADDR_LEN));
 
   /* Write the ARP MAC-Addresses */
-  SMEMCPY(&hdr->shwaddr, hwsrc_addr, ETH_HWADDR_LEN);
-  SMEMCPY(&hdr->dhwaddr, hwdst_addr, ETH_HWADDR_LEN);
+  etharp_copy_eth_addr_bytes(&hdr->shwaddr, hwsrc_addr);
+  etharp_copy_eth_addr_bytes(&hdr->dhwaddr, hwdst_addr);
   /* Copy struct ip4_addr_wordaligned to aligned ip4_addr, to support compilers without
    * structure packing. */
-  IPADDR_WORDALIGNED_COPY_FROM_IP4_ADDR_T(&hdr->sipaddr, ipsrc_addr);
-  IPADDR_WORDALIGNED_COPY_FROM_IP4_ADDR_T(&hdr->dipaddr, ipdst_addr);
+  etharp_copy_ip4_addr_to_packed(&hdr->sipaddr, ipsrc_addr);
+  etharp_copy_ip4_addr_to_packed(&hdr->dipaddr, ipdst_addr);
 
   hdr->hwtype = PP_HTONS(LWIP_IANA_HWTYPE_ETHERNET);
   hdr->proto = PP_HTONS(ETHTYPE_IP);

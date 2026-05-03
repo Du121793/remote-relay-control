@@ -66,11 +66,9 @@ extern volatile uint32_t g_eth_last_tx_ip_dst;
 extern volatile uint32_t g_eth_last_tx_dst_mac_0_1;
 extern volatile uint32_t g_eth_last_tx_dst_mac_2_5;
 extern volatile uint32_t g_eth_tx_free_packets;
-extern volatile uint32_t g_udp_discovery_rx_packets;
-extern volatile uint32_t g_udp_discovery_announce_packets;
-extern volatile uint32_t g_udp_discovery_discover_packets;
-extern volatile uint32_t g_udp_discovery_last_src_ip;
-extern volatile uint32_t g_udp_discovery_last_src_port;
+extern volatile uint32_t g_eth_last_tx_hal_status;
+extern volatile uint32_t g_eth_last_tx_hal_error;
+extern volatile uint32_t g_eth_last_tx_dma_error;
 
 /* USER CODE END 0 */
 

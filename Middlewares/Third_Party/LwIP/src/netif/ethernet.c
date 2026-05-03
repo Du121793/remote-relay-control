@@ -60,6 +60,26 @@
 #include LWIP_HOOK_FILENAME
 #endif
 
+#if defined(__clang__)
+#define ETHERNET_NOINLINE_UNOPTIMIZED __attribute__((noinline, optnone))
+#else
+#define ETHERNET_NOINLINE_UNOPTIMIZED
+#endif
+
+static ETHERNET_NOINLINE_UNOPTIMIZED void
+ethernet_copy_eth_addr_bytes(void *dst, const void *src)
+{
+  volatile u8_t *dst_bytes = (volatile u8_t *)dst;
+  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
+
+  dst_bytes[0] = src_bytes[0];
+  dst_bytes[1] = src_bytes[1];
+  dst_bytes[2] = src_bytes[2];
+  dst_bytes[3] = src_bytes[3];
+  dst_bytes[4] = src_bytes[4];
+  dst_bytes[5] = src_bytes[5];
+}
+
 const struct eth_addr ethbroadcast = {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
 const struct eth_addr ethzero = {{0, 0, 0, 0, 0, 0}};
 
@@ -266,7 +286,7 @@ free_and_return:
  * @param eth_type ethernet type (@ref lwip_ieee_eth_type)
  * @return ERR_OK if the packet was sent, any other err_t on failure
  */
-err_t
+ETHERNET_NOINLINE_UNOPTIMIZED err_t
 ethernet_output(struct netif * netif, struct pbuf * p,
                 const struct eth_addr * src, const struct eth_addr * dst,
                 u16_t eth_type) {
@@ -300,8 +320,8 @@ ethernet_output(struct netif * netif, struct pbuf * p,
 
   ethhdr = (struct eth_hdr *)p->payload;
   ethhdr->type = eth_type_be;
-  SMEMCPY(&ethhdr->dest, dst, ETH_HWADDR_LEN);
-  SMEMCPY(&ethhdr->src,  src, ETH_HWADDR_LEN);
+  ethernet_copy_eth_addr_bytes(&ethhdr->dest, dst);
+  ethernet_copy_eth_addr_bytes(&ethhdr->src, src);
 
   LWIP_ASSERT("netif->hwaddr_len must be 6 for ethernet_output!",
               (netif->hwaddr_len == ETH_HWADDR_LEN));
