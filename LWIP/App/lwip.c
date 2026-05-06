@@ -22,14 +22,15 @@
 #include "lwip.h"
 #include "lwip/init.h"
 #include "lwip/netif.h"
-#if defined ( __CC_ARM ) || defined ( __ARMCC_VERSION )  /* MDK ARM Compiler */
+#if defined(__CC_ARM) || defined(__ARMCC_VERSION)  /* MDK/Arm Compiler */
 #include "lwip/sio.h"
-#endif /* MDK ARM Compiler */
+#endif /* MDK/Arm Compiler */
 #include "ethernetif.h"
-#include "control_service.h"
-#include "discovery_service.h"
 
 /* USER CODE BEGIN 0 */
+#include "control_service.h"
+#include "discovery_service.h"
+#include "http_service.h"
 extern struct netif gnetif;
 /* USER CODE END 0 */
 /* Private function prototypes -----------------------------------------------*/
@@ -81,12 +82,10 @@ void MX_LWIP_Init(void)
   osThreadCreate (osThread(EthLink), &gnetif);
 /* USER CODE END H7_OS_THREAD_DEF_CREATE_CMSIS_RTOS_V1 */
 
-  /* Start DHCP negotiation for a network interface (IPv4) */
-  dhcp_start(&gnetif);
-
 /* USER CODE BEGIN 3 */
   control_service_init();
   discovery_service_init();
+  http_service_init();
 /* USER CODE END 3 */
 }
 
@@ -116,7 +115,7 @@ static void ethernet_link_status_updated(struct netif *netif)
   }
 }
 
-#if defined ( __CC_ARM ) || defined ( __ARMCC_VERSION )  /* MDK ARM Compiler */
+#if defined(__CC_ARM) || defined(__ARMCC_VERSION)  /* MDK/Arm Compiler */
 /**
  * Opens a serial device for communication.
  *
@@ -187,5 +186,5 @@ u32_t sio_tryread(sio_fd_t fd, u8_t *data, u32_t len)
 /* USER CODE END 10 */
   return recved_bytes;
 }
-#endif /* MDK ARM Compiler */
+#endif /* MDK/Arm Compiler */
 

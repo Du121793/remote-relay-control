@@ -40,7 +40,7 @@
 /* Parameters set in STM32CubeMX LwIP Configuration GUI -*/
 /*----- WITH_RTOS enabled (Since FREERTOS is set) -----*/
 #define WITH_RTOS 1
-/*----- Keep checksum handling in software while validating DHCP RX -----*/
+/*----- Keep checksum handling in software while validating ETH/DHCP RX/TX -----*/
 #define CHECKSUM_BY_HARDWARE 0
 /*-----------------------------------------------------------------------------*/
 
@@ -48,10 +48,14 @@
 /* Parameters set in STM32CubeMX LwIP Configuration GUI -*/
 /*----- Value in opt.h for LWIP_DHCP: 0 -----*/
 #define LWIP_DHCP 1
-/*----- Value in opt.h for LWIP_IGMP: 0 -----*/
-#define LWIP_IGMP 1
 /*----- Value in opt.h for MEMP_NUM_IGMP_GROUP: 8 -----*/
 #define MEMP_NUM_IGMP_GROUP 8
+/*----- Raise lwIP heap and TCP resource pools for concurrent browser/API traffic -----*/
+#define MEM_SIZE (12U * 1024U)
+#define MEMP_NUM_TCP_PCB 12
+#define MEMP_NUM_TCP_PCB_LISTEN 8
+#define MEMP_NUM_TCP_SEG 48
+#define PBUF_POOL_SIZE 32
 /*----- Value in opt.h for MEM_ALIGNMENT: 1 -----*/
 #define MEM_ALIGNMENT 4
 /*----- Default Value for F7 devices: 0x20048000 -----*/
@@ -72,12 +76,14 @@
 #define TCP_WND_UPDATE_THRESHOLD 536
 /*----- Value in opt.h for LWIP_NETIF_LINK_CALLBACK: 0 -----*/
 #define LWIP_NETIF_LINK_CALLBACK 1
+/*----- Value in opt.h for LWIP_IGMP: 0 -----*/
+#define LWIP_IGMP 1
 /*----- Value in opt.h for TCPIP_THREAD_STACKSIZE: 0 -----*/
 #define TCPIP_THREAD_STACKSIZE 1024
 /*----- Value in opt.h for TCPIP_THREAD_PRIO: 1 -----*/
 #define TCPIP_THREAD_PRIO osPriorityNormal
 /*----- Value in opt.h for TCPIP_MBOX_SIZE: 0 -----*/
-#define TCPIP_MBOX_SIZE 6
+#define TCPIP_MBOX_SIZE 32
 /*----- Value in opt.h for SLIPIF_THREAD_STACKSIZE: 0 -----*/
 #define SLIPIF_THREAD_STACKSIZE 1024
 /*----- Value in opt.h for SLIPIF_THREAD_PRIO: 1 -----*/
@@ -87,15 +93,17 @@
 /*----- Value in opt.h for DEFAULT_THREAD_PRIO: 1 -----*/
 #define DEFAULT_THREAD_PRIO 3
 /*----- Value in opt.h for DEFAULT_UDP_RECVMBOX_SIZE: 0 -----*/
-#define DEFAULT_UDP_RECVMBOX_SIZE 6
+#define DEFAULT_UDP_RECVMBOX_SIZE 12
 /*----- Value in opt.h for DEFAULT_TCP_RECVMBOX_SIZE: 0 -----*/
-#define DEFAULT_TCP_RECVMBOX_SIZE 6
+#define DEFAULT_TCP_RECVMBOX_SIZE 12
 /*----- Value in opt.h for DEFAULT_ACCEPTMBOX_SIZE: 0 -----*/
-#define DEFAULT_ACCEPTMBOX_SIZE 6
+#define DEFAULT_ACCEPTMBOX_SIZE 12
 /*----- Value in opt.h for RECV_BUFSIZE_DEFAULT: INT_MAX -----*/
 #define RECV_BUFSIZE_DEFAULT 2000000000
 /*----- Value in opt.h for LWIP_STATS: 1 -----*/
-#define LWIP_STATS 0
+#define LWIP_STATS 1
+#define MEM_STATS 1
+#define MEMP_STATS 1
 /*----- Value in opt.h for CHECKSUM_GEN_IP: 1 -----*/
 #define CHECKSUM_GEN_IP 1
 /*----- Value in opt.h for CHECKSUM_GEN_UDP: 1 -----*/

@@ -1,7 +1,7 @@
 #include "control_service.h"
 
-#include "control_queue.h"
 #include "control_proto.h"
+#include "relay_domain.h"
 
 #include "cmsis_os.h"
 
@@ -17,19 +17,14 @@
 
 extern struct netif gnetif;
 
-typedef struct
-{
-  struct tcp_pcb *pcb;
-} control_tcp_client_t;
-
 static struct tcp_pcb *g_control_listener_pcb = NULL;
 static control_service_stats_t g_control_stats;
 static uint8_t g_control_service_started = 0U;
 static uint8_t g_control_last_link_up = 0U;
-static osThreadId g_control_task_handle = NULL;
 
 static void control_service_tcpip_step(void *arg);
-static void control_service_task(void const *argument);
+static err_t control_service_sent_close(void *arg, struct tcp_pcb *tpcb, u16_t len);
+static err_t control_service_poll_close(void *arg, struct tcp_pcb *tpcb);
 
 static void control_service_close(struct tcp_pcb *tpcb)
 {
@@ -90,12 +85,7 @@ static void control_service_execute(const control_proto_command_t *command, char
     return;
   }
 
-  if (control_queue_submit(command, &result) != HAL_OK)
-  {
-    g_control_stats.errors++;
-    (void)control_proto_format_error(response, response_size, CONTROL_PROTO_ERR_BAD_COMMAND);
-    return;
-  }
+  relay_domain_execute(command, &result);
 
   switch (command->type)
   {
@@ -137,13 +127,13 @@ static void control_service_execute(const control_proto_command_t *command, char
 
 static err_t control_service_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
 {
-  control_tcp_client_t *client = (control_tcp_client_t *)arg;
   char request[96];
-  char response[160];
+  char response[320];
   control_proto_command_t command;
   u16_t copy_len;
+  err_t send_err;
 
-  LWIP_UNUSED_ARG(client);
+  LWIP_UNUSED_ARG(arg);
 
   if ((err != ERR_OK) || (p == NULL))
   {
@@ -164,8 +154,19 @@ static err_t control_service_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *
   g_control_stats.commands++;
   control_proto_parse(request, &command);
   control_service_execute(&command, response, sizeof(response));
-  (void)control_service_send_response(tpcb, response);
-  control_service_close(tpcb);
+  send_err = control_service_send_response(tpcb, response);
+  tcp_recv(tpcb, NULL);
+  tcp_sent(tpcb, control_service_sent_close);
+  tcp_poll(tpcb, control_service_poll_close, 1);
+  if (send_err != ERR_OK)
+  {
+    control_service_close(tpcb);
+    return ERR_OK;
+  }
+  if ((tcp_sndbuf(tpcb) == TCP_SND_BUF) && (tcp_sndqueuelen(tpcb) == 0U))
+  {
+    control_service_close(tpcb);
+  }
   return ERR_OK;
 }
 
@@ -178,8 +179,6 @@ static void control_service_error(void *arg, err_t err)
 
 static err_t control_service_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
-  static control_tcp_client_t client_ctx;
-
   LWIP_UNUSED_ARG(arg);
 
   if ((err != ERR_OK) || (newpcb == NULL))
@@ -188,12 +187,34 @@ static err_t control_service_accept(void *arg, struct tcp_pcb *newpcb, err_t err
     return ERR_VAL;
   }
 
-  client_ctx.pcb = newpcb;
   g_control_stats.connections++;
-  tcp_arg(newpcb, &client_ctx);
+  tcp_arg(newpcb, NULL);
   tcp_recv(newpcb, control_service_recv);
   tcp_err(newpcb, control_service_error);
   tcp_poll(newpcb, NULL, 0);
+  return ERR_OK;
+}
+
+static err_t control_service_sent_close(void *arg, struct tcp_pcb *tpcb, u16_t len)
+{
+  LWIP_UNUSED_ARG(arg);
+  LWIP_UNUSED_ARG(len);
+
+  if ((tcp_sndbuf(tpcb) == TCP_SND_BUF) && (tcp_sndqueuelen(tpcb) == 0U))
+  {
+    control_service_close(tpcb);
+  }
+  return ERR_OK;
+}
+
+static err_t control_service_poll_close(void *arg, struct tcp_pcb *tpcb)
+{
+  LWIP_UNUSED_ARG(arg);
+
+  if ((tcp_sndbuf(tpcb) == TCP_SND_BUF) && (tcp_sndqueuelen(tpcb) == 0U))
+  {
+    control_service_close(tpcb);
+  }
   return ERR_OK;
 }
 
@@ -248,19 +269,18 @@ static void control_service_tcpip_step(void *arg)
 
 void control_service_init(void)
 {
-  control_queue_init();
-
-  if (g_control_service_started == 0U)
+  if (g_control_service_started != 0U)
   {
-    g_control_service_started = 1U;
-    osThreadDef(ControlService, control_service_task, osPriorityBelowNormal, 0, 256);
-    g_control_task_handle = osThreadCreate(osThread(ControlService), NULL);
+    return;
   }
+
+  g_control_service_started = 1U;
 }
 
 void control_service_poll(void)
 {
   control_service_init();
+  (void)tcpip_callback(control_service_tcpip_step, NULL);
 }
 
 void control_service_get_stats(control_service_stats_t *stats)
@@ -268,16 +288,6 @@ void control_service_get_stats(control_service_stats_t *stats)
   if (stats != NULL)
   {
     *stats = g_control_stats;
-  }
-}
-
-static void control_service_task(void const *argument)
-{
-  (void)argument;
-
-  for (;;)
-  {
-    (void)tcpip_callback(control_service_tcpip_step, NULL);
-    osDelay(500U);
+    stats->listener_up = (g_control_listener_pcb != NULL) ? 1U : 0U;
   }
 }

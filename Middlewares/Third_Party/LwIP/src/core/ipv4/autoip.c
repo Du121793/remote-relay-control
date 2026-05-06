@@ -68,25 +68,8 @@
 #include "lwip/etharp.h"
 #include "lwip/prot/autoip.h"
 
+#include <stddef.h>
 #include <string.h>
-
-#if defined(__clang__)
-#define AUTOIP_NOINLINE_UNOPTIMIZED __attribute__((noinline, optnone))
-#else
-#define AUTOIP_NOINLINE_UNOPTIMIZED
-#endif
-
-static AUTOIP_NOINLINE_UNOPTIMIZED void
-autoip_copy_ip4_addr_from_packed(ip4_addr_t *dst, const void *src)
-{
-  volatile u8_t *dst_bytes = (volatile u8_t *)&dst->addr;
-  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
-
-  dst_bytes[0] = src_bytes[0];
-  dst_bytes[1] = src_bytes[1];
-  dst_bytes[2] = src_bytes[2];
-  dst_bytes[3] = src_bytes[3];
-}
 
 /** Pseudo random macro based on netif informations.
  * You could use "rand()" from the C Library if you define LWIP_AUTOIP_RAND in lwipopts.h */
@@ -97,6 +80,24 @@ autoip_copy_ip4_addr_from_packed(ip4_addr_t *dst, const void *src)
                                    ((u32_t)((netif->hwaddr[4]) & 0xff))) + \
                                    (netif_autoip_data(netif)? netif_autoip_data(netif)->tried_llipaddr : 0))
 #endif /* LWIP_AUTOIP_RAND */
+
+__attribute__((noinline, optnone)) static void
+autoip_copy_bytes_safe(void *dst, const void *src, size_t len)
+{
+  u8_t *dst_bytes = (u8_t *)dst;
+  const u8_t *src_bytes = (const u8_t *)src;
+  size_t i;
+
+  for (i = 0; i < len; ++i) {
+    dst_bytes[i] = src_bytes[i];
+  }
+}
+
+__attribute__((noinline, optnone)) static void
+autoip_ip4_addr_copy_from_packed_safe(ip4_addr_t *dst, const void *src)
+{
+  autoip_copy_bytes_safe(&dst->addr, src, sizeof(dst->addr));
+}
 
 /**
  * Macro that generates the initial IP address to be tried by AUTOIP.
@@ -486,8 +487,8 @@ autoip_arp_reply(struct netif *netif, struct etharp_hdr *hdr)
     /* Copy struct ip4_addr_wordaligned to aligned ip4_addr, to support compilers without
      * structure packing (not using structure copy which breaks strict-aliasing rules).
      */
-    autoip_copy_ip4_addr_from_packed(&sipaddr, &hdr->sipaddr);
-    autoip_copy_ip4_addr_from_packed(&dipaddr, &hdr->dipaddr);
+    autoip_ip4_addr_copy_from_packed_safe(&sipaddr, &hdr->sipaddr);
+    autoip_ip4_addr_copy_from_packed_safe(&dipaddr, &hdr->dipaddr);
 
     if (autoip->state == AUTOIP_STATE_PROBING) {
       /* RFC 3927 Section 2.2.1:

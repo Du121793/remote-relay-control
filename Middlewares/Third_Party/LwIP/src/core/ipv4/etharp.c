@@ -55,55 +55,12 @@
 #include "lwip/prot/iana.h"
 #include "netif/ethernet.h"
 
+#include <stddef.h>
 #include <string.h>
 
 #ifdef LWIP_HOOK_FILENAME
 #include LWIP_HOOK_FILENAME
 #endif
-
-#if defined(__clang__)
-#define ETHARP_NOINLINE_UNOPTIMIZED __attribute__((noinline, optnone))
-#else
-#define ETHARP_NOINLINE_UNOPTIMIZED
-#endif
-
-static ETHARP_NOINLINE_UNOPTIMIZED void
-etharp_copy_ip4_addr_from_packed(ip4_addr_t *dst, const void *src)
-{
-  volatile u8_t *dst_bytes = (volatile u8_t *)&dst->addr;
-  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
-
-  dst_bytes[0] = src_bytes[0];
-  dst_bytes[1] = src_bytes[1];
-  dst_bytes[2] = src_bytes[2];
-  dst_bytes[3] = src_bytes[3];
-}
-
-static ETHARP_NOINLINE_UNOPTIMIZED void
-etharp_copy_ip4_addr_to_packed(void *dst, const ip4_addr_t *src)
-{
-  volatile u8_t *dst_bytes = (volatile u8_t *)dst;
-  const volatile u8_t *src_bytes = (const volatile u8_t *)&src->addr;
-
-  dst_bytes[0] = src_bytes[0];
-  dst_bytes[1] = src_bytes[1];
-  dst_bytes[2] = src_bytes[2];
-  dst_bytes[3] = src_bytes[3];
-}
-
-static ETHARP_NOINLINE_UNOPTIMIZED void
-etharp_copy_eth_addr_bytes(void *dst, const void *src)
-{
-  volatile u8_t *dst_bytes = (volatile u8_t *)dst;
-  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
-
-  dst_bytes[0] = src_bytes[0];
-  dst_bytes[1] = src_bytes[1];
-  dst_bytes[2] = src_bytes[2];
-  dst_bytes[3] = src_bytes[3];
-  dst_bytes[4] = src_bytes[4];
-  dst_bytes[5] = src_bytes[5];
-}
 
 /** Re-request a used ARP entry 1 minute before it would expire to prevent
  *  breaking a steadily used connection because the ARP entry timed out. */
@@ -151,6 +108,39 @@ static struct etharp_entry arp_table[ARP_TABLE_SIZE];
 #if !LWIP_NETIF_HWADDRHINT
 static netif_addr_idx_t etharp_cached_entry;
 #endif /* !LWIP_NETIF_HWADDRHINT */
+
+__attribute__((noinline, optnone)) static void
+etharp_copy_bytes_safe(void *dst, const void *src, size_t len)
+{
+  u8_t *dst_bytes = (u8_t *)dst;
+  const u8_t *src_bytes = (const u8_t *)src;
+  size_t i;
+
+  for (i = 0; i < len; ++i) {
+    dst_bytes[i] = src_bytes[i];
+  }
+}
+
+__attribute__((noinline, optnone)) static void
+etharp_ip4_addr_copy_from_packed_safe(ip4_addr_t *dst, const void *src)
+{
+  etharp_copy_bytes_safe(&dst->addr, src, sizeof(dst->addr));
+}
+
+__attribute__((noinline, optnone)) static void
+etharp_eth_addr_copy_from_packed_safe(struct eth_addr *dst, const void *src)
+{
+  etharp_copy_bytes_safe(dst->addr, src, ETH_HWADDR_LEN);
+}
+
+__attribute__((noinline, optnone)) static u16_t
+etharp_u16_from_packed_safe(const void *src)
+{
+  u16_t value;
+
+  etharp_copy_bytes_safe(&value, src, sizeof(value));
+  return value;
+}
 
 /** Try hard to create a new entry - we want the IP address to appear in
     the cache (even if this means removing an active entry or so). */
@@ -462,7 +452,7 @@ etharp_find_entry(const ip4_addr_t *ipaddr, u8_t flags, struct netif *netif)
  *
  * @see pbuf_free()
  */
-static ETHARP_NOINLINE_UNOPTIMIZED err_t
+static err_t
 etharp_update_arp_entry(struct netif *netif, const ip4_addr_t *ipaddr, struct eth_addr *ethaddr, u8_t flags)
 {
   s16_t i;
@@ -506,7 +496,7 @@ etharp_update_arp_entry(struct netif *netif, const ip4_addr_t *ipaddr, struct et
 
   LWIP_DEBUGF(ETHARP_DEBUG | LWIP_DBG_TRACE, ("etharp_update_arp_entry: updating stable entry %"S16_F"\n", i));
   /* update address */
-  etharp_copy_eth_addr_bytes(&arp_table[i].ethaddr, ethaddr);
+  SMEMCPY(&arp_table[i].ethaddr, ethaddr, ETH_HWADDR_LEN);
   /* reset time stamp */
   arp_table[i].ctime = 0;
   /* this is where we will send out queued packets! */
@@ -687,7 +677,9 @@ etharp_input(struct pbuf *p, struct netif *netif)
   struct etharp_hdr *hdr;
   /* these are aligned properly, whereas the ARP header fields might not be */
   ip4_addr_t sipaddr, dipaddr;
+  struct eth_addr shwaddr;
   u8_t for_us;
+  u16_t hwtype, proto, opcode;
 
   LWIP_ASSERT_CORE_LOCKED();
 
@@ -696,13 +688,17 @@ etharp_input(struct pbuf *p, struct netif *netif)
   hdr = (struct etharp_hdr *)p->payload;
 
   /* RFC 826 "Packet Reception": */
-  if ((hdr->hwtype != PP_HTONS(LWIP_IANA_HWTYPE_ETHERNET)) ||
+  hwtype = etharp_u16_from_packed_safe(&hdr->hwtype);
+  proto = etharp_u16_from_packed_safe(&hdr->proto);
+  opcode = etharp_u16_from_packed_safe(&hdr->opcode);
+
+  if ((hwtype != PP_HTONS(LWIP_IANA_HWTYPE_ETHERNET)) ||
       (hdr->hwlen != ETH_HWADDR_LEN) ||
       (hdr->protolen != sizeof(ip4_addr_t)) ||
-      (hdr->proto != PP_HTONS(ETHTYPE_IP)))  {
+      (proto != PP_HTONS(ETHTYPE_IP)))  {
     LWIP_DEBUGF(ETHARP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_WARNING,
                 ("etharp_input: packet dropped, wrong hw type, hwlen, proto, protolen or ethernet type (%"U16_F"/%"U16_F"/%"U16_F"/%"U16_F")\n",
-                 hdr->hwtype, (u16_t)hdr->hwlen, hdr->proto, (u16_t)hdr->protolen));
+                 hwtype, (u16_t)hdr->hwlen, proto, (u16_t)hdr->protolen));
     ETHARP_STATS_INC(etharp.proterr);
     ETHARP_STATS_INC(etharp.drop);
     pbuf_free(p);
@@ -719,8 +715,9 @@ etharp_input(struct pbuf *p, struct netif *netif)
 
   /* Copy struct ip4_addr_wordaligned to aligned ip4_addr, to support compilers without
    * structure packing (not using structure copy which breaks strict-aliasing rules). */
-  etharp_copy_ip4_addr_from_packed(&sipaddr, &hdr->sipaddr);
-  etharp_copy_ip4_addr_from_packed(&dipaddr, &hdr->dipaddr);
+  etharp_ip4_addr_copy_from_packed_safe(&sipaddr, &hdr->sipaddr);
+  etharp_ip4_addr_copy_from_packed_safe(&dipaddr, &hdr->dipaddr);
+  etharp_eth_addr_copy_from_packed_safe(&shwaddr, &hdr->shwaddr);
 
   /* this interface is not configured? */
   if (ip4_addr_isany_val(*netif_ip4_addr(netif))) {
@@ -735,11 +732,11 @@ etharp_input(struct pbuf *p, struct netif *netif)
          can result in directly sending the queued packets for this host.
      ARP message not directed to us?
       ->  update the source IP address in the cache, if present */
-  etharp_update_arp_entry(netif, &sipaddr, &(hdr->shwaddr),
+  etharp_update_arp_entry(netif, &sipaddr, &shwaddr,
                           for_us ? ETHARP_FLAG_TRY_HARD : ETHARP_FLAG_FIND_ONLY);
 
   /* now act on the message itself */
-  switch (hdr->opcode) {
+  switch (opcode) {
     /* ARP request? */
     case PP_HTONS(ARP_REQUEST):
       /* ARP request. If it asked for our address, we send out a
@@ -751,9 +748,9 @@ etharp_input(struct pbuf *p, struct netif *netif)
       if (for_us) {
         /* send ARP response */
         etharp_raw(netif,
-                   (struct eth_addr *)netif->hwaddr, &hdr->shwaddr,
+                   (struct eth_addr *)netif->hwaddr, &shwaddr,
                    (struct eth_addr *)netif->hwaddr, netif_ip4_addr(netif),
-                   &hdr->shwaddr, &sipaddr,
+                   &shwaddr, &sipaddr,
                    ARP_REPLY);
         /* we are not configured? */
       } else if (ip4_addr_isany_val(*netif_ip4_addr(netif))) {
@@ -777,7 +774,7 @@ etharp_input(struct pbuf *p, struct netif *netif)
 #endif /* (LWIP_DHCP && DHCP_DOES_ARP_CHECK) */
       break;
     default:
-      LWIP_DEBUGF(ETHARP_DEBUG | LWIP_DBG_TRACE, ("etharp_input: ARP unknown opcode type %"S16_F"\n", lwip_htons(hdr->opcode)));
+      LWIP_DEBUGF(ETHARP_DEBUG | LWIP_DBG_TRACE, ("etharp_input: ARP unknown opcode type %"S16_F"\n", lwip_htons(opcode)));
       ETHARP_STATS_INC(etharp.err);
       break;
   }
@@ -870,11 +867,13 @@ etharp_output(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr)
         !ip4_addr_islinklocal(ipaddr)) {
 #if LWIP_AUTOIP
       struct ip_hdr *iphdr = LWIP_ALIGNMENT_CAST(struct ip_hdr *, q->payload);
+      ip4_addr_t src_addr;
       /* According to RFC 3297, chapter 2.6.2 (Forwarding Rules), a packet with
          a link-local source address must always be "directly to its destination
          on the same physical link. The host MUST NOT send the packet to any
          router for forwarding". */
-      if (!ip4_addr_islinklocal(&iphdr->src))
+      etharp_ip4_addr_copy_from_packed_safe(&src_addr, ((const u8_t *)iphdr) + offsetof(struct ip_hdr, src));
+      if (!ip4_addr_islinklocal(&src_addr))
 #endif /* LWIP_AUTOIP */
       {
 #ifdef LWIP_HOOK_ETHARP_GET_GW
@@ -1141,7 +1140,7 @@ etharp_query(struct netif *netif, const ip4_addr_t *ipaddr, struct pbuf *q)
  *         ERR_MEM if the ARP packet couldn't be allocated
  *         any other err_t on failure
  */
-static ETHARP_NOINLINE_UNOPTIMIZED err_t
+static err_t
 etharp_raw(struct netif *netif, const struct eth_addr *ethsrc_addr,
            const struct eth_addr *ethdst_addr,
            const struct eth_addr *hwsrc_addr, const ip4_addr_t *ipsrc_addr,
@@ -1174,12 +1173,12 @@ etharp_raw(struct netif *netif, const struct eth_addr *ethsrc_addr,
               (netif->hwaddr_len == ETH_HWADDR_LEN));
 
   /* Write the ARP MAC-Addresses */
-  etharp_copy_eth_addr_bytes(&hdr->shwaddr, hwsrc_addr);
-  etharp_copy_eth_addr_bytes(&hdr->dhwaddr, hwdst_addr);
+  SMEMCPY(&hdr->shwaddr, hwsrc_addr, ETH_HWADDR_LEN);
+  SMEMCPY(&hdr->dhwaddr, hwdst_addr, ETH_HWADDR_LEN);
   /* Copy struct ip4_addr_wordaligned to aligned ip4_addr, to support compilers without
    * structure packing. */
-  etharp_copy_ip4_addr_to_packed(&hdr->sipaddr, ipsrc_addr);
-  etharp_copy_ip4_addr_to_packed(&hdr->dipaddr, ipdst_addr);
+  IPADDR_WORDALIGNED_COPY_FROM_IP4_ADDR_T(&hdr->sipaddr, ipsrc_addr);
+  IPADDR_WORDALIGNED_COPY_FROM_IP4_ADDR_T(&hdr->dipaddr, ipdst_addr);
 
   hdr->hwtype = PP_HTONS(LWIP_IANA_HWTYPE_ETHERNET);
   hdr->proto = PP_HTONS(ETHTYPE_IP);

@@ -22,6 +22,7 @@
 #include "main.h"
 #include "lwip/opt.h"
 #include "lwip/timeouts.h"
+#include "lwip/dhcp.h"
 #include "netif/ethernet.h"
 #include "netif/etharp.h"
 #include "lwip/ethip6.h"
@@ -36,7 +37,14 @@
 static void ethernetif_build_mac_address(uint8_t *mac_addr);
 static void ethernetif_relax_rx_filter(void);
 static void ethernetif_relax_rx_processing(void);
+static void ethernetif_force_phy_ready(void);
+__attribute__((noinline, optnone)) static void ethernetif_init_custom_pbuf_safe(struct pbuf_custom *custom_pbuf, void *payload_mem, u16_t payload_len);
 __attribute__((noinline, optnone)) static void ethernetif_copy_bytes_safe(void *dst, const void *src, size_t len);
+static void ethernetif_uart_write(const char *text);
+static void ethernetif_netif_up_callback(void *ctx);
+static void ethernetif_netif_down_callback(void *ctx);
+
+extern UART_HandleTypeDef huart3;
 
 __attribute__((noinline, optnone)) static void ethernetif_copy_bytes_safe(void *dst, const void *src, size_t len)
 {
@@ -47,6 +55,65 @@ __attribute__((noinline, optnone)) static void ethernetif_copy_bytes_safe(void *
   for (i = 0U; i < len; ++i)
   {
     dst_bytes[i] = src_bytes[i];
+  }
+}
+
+static void ethernetif_uart_write(const char *text)
+{
+  size_t len = strlen(text);
+
+  if ((len > 0U) && (huart3.Instance != NULL))
+  {
+    (void)HAL_UART_Transmit(&huart3, (uint8_t *)text, (uint16_t)len, 100U);
+  }
+}
+
+__attribute__((noinline, optnone)) static void ethernetif_init_custom_pbuf_safe(struct pbuf_custom *custom_pbuf, void *payload_mem, u16_t payload_len)
+{
+  struct pbuf *pbuf = &custom_pbuf->pbuf;
+
+  pbuf->next = NULL;
+  pbuf->payload = payload_mem;
+  pbuf->tot_len = payload_len;
+  pbuf->len = payload_len;
+  pbuf->type_internal = (u8_t)PBUF_REF;
+  pbuf->flags = PBUF_FLAG_IS_CUSTOM;
+  pbuf->ref = 1;
+  pbuf->if_idx = NETIF_NO_INDEX;
+}
+
+static void ethernetif_netif_up_callback(void *ctx)
+{
+  struct netif *netif = (struct netif *)ctx;
+
+  if (netif_is_up(netif) == 0)
+  {
+    netif_set_up(netif);
+  }
+
+  if (netif_is_link_up(netif) == 0)
+  {
+    netif_set_link_up(netif);
+  }
+
+  if (dhcp_supplied_address(netif) == 0)
+  {
+    dhcp_start(netif);
+  }
+}
+
+static void ethernetif_netif_down_callback(void *ctx)
+{
+  struct netif *netif = (struct netif *)ctx;
+
+  if (netif_is_link_up(netif) != 0)
+  {
+    netif_set_link_down(netif);
+  }
+
+  if (netif_is_up(netif) != 0)
+  {
+    netif_set_down(netif);
   }
 }
 
@@ -197,8 +264,14 @@ volatile uint32_t g_eth_link_thread_loops = 0U;
 volatile int32_t g_eth_last_phy_link_state = 0;
 volatile uint32_t g_eth_link_up_events = 0U;
 volatile uint32_t g_eth_link_down_events = 0U;
+volatile int32_t g_eth_phy_disable_power_status = 0;
+volatile int32_t g_eth_phy_start_autoneg_status = 0;
+volatile uint32_t g_eth_phy_bcr_after_cfg = 0U;
+volatile uint32_t g_eth_phy_bsr_after_cfg = 0U;
+volatile uint32_t g_eth_phy_physcsr_after_cfg = 0U;
+volatile uint32_t g_eth_phy_retry_count = 0U;
+volatile int32_t g_eth_phy_forced_mode = 0;
 static uint32_t g_eth_tx_dma_index = 0U;
-
 /* USER CODE END 2 */
 
 osSemaphoreId RxPktSemaphore = NULL;   /* Semaphore to signal incoming packets */
@@ -344,6 +417,41 @@ static void ethernetif_enable_multicast_rx(void)
 #endif
 }
 
+static void ethernetif_force_phy_ready(void)
+{
+  uint32_t bcr = 0U;
+  uint32_t bsr_after_cfg = 0U;
+  uint32_t bcr_after_cfg = 0U;
+  uint32_t phys_after_cfg = 0U;
+
+  g_eth_phy_disable_power_status = LAN8742_DisablePowerDownMode(&LAN8742);
+  g_eth_phy_start_autoneg_status = LAN8742_StartAutoNego(&LAN8742);
+
+  if (HAL_ETH_ReadPHYRegister(&heth, LAN8742.DevAddr, LAN8742_BCR, &bcr) == HAL_OK)
+  {
+    bcr |= (uint32_t)(LAN8742_BCR_AUTONEGO_EN | LAN8742_BCR_RESTART_AUTONEGO);
+    (void)HAL_ETH_WritePHYRegister(&heth, LAN8742.DevAddr, LAN8742_BCR, bcr);
+  }
+
+  HAL_Delay(50U);
+  (void)HAL_ETH_ReadPHYRegister(&heth, LAN8742.DevAddr, LAN8742_BSR, &bsr_after_cfg);
+  (void)HAL_ETH_ReadPHYRegister(&heth, LAN8742.DevAddr, LAN8742_BCR, &bcr_after_cfg);
+  (void)HAL_ETH_ReadPHYRegister(&heth, LAN8742.DevAddr, LAN8742_PHYSCSR, &phys_after_cfg);
+  g_eth_phy_bsr_after_cfg = bsr_after_cfg;
+  g_eth_phy_bcr_after_cfg = bcr_after_cfg;
+  g_eth_phy_physcsr_after_cfg = phys_after_cfg;
+  g_eth_phy_forced_mode = 0;
+}
+
+static int32_t ethernetif_force_phy_link_mode(uint32_t link_state)
+{
+  int32_t status = LAN8742_STATUS_ERROR;
+
+  status = LAN8742_SetLinkState(&LAN8742, link_state);
+  g_eth_phy_forced_mode = (int32_t)link_state;
+  return status;
+}
+
 /* USER CODE END 4 */
 
 /*******************************************************************************
@@ -460,6 +568,14 @@ static void low_level_init(struct netif *netif)
     return;
   }
 
+  /*
+   * CubeMX only discovers the PHY address here. After recent regeneration the PHY
+   * occasionally comes up with BCR=0x0000, i.e. autoneg disabled, which leaves
+   * the stack permanently stuck at LINK_DOWN. Explicitly bring the PHY into the
+   * expected state before the first link-state probe.
+   */
+  ethernetif_force_phy_ready();
+
   if (hal_eth_init_status == HAL_OK)
   {
     PHYLinkState = LAN8742_GetLinkState(&LAN8742);
@@ -504,8 +620,10 @@ static void low_level_init(struct netif *netif)
     HAL_ETH_SetMACConfig(&heth, &MACConf);
 
     HAL_ETH_Start(&heth);
-    netif_set_up(netif);
-    netif_set_link_up(netif);
+    if (tcpip_try_callback(ethernetif_netif_up_callback, netif) != ERR_OK)
+    {
+      ethernetif_uart_write("[net] low init netif up err\r\n");
+    }
 
 /* USER CODE BEGIN PHY_POST_CONFIG */
 
@@ -587,6 +705,7 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
 
   /* Keep using the known-good blocking TX path for now.
      HAL_ETH_ReleaseTxPacket() depends on CurrentPacketAddress being set. */
+  pbuf_ref(p);
   heth.TxDescList.CurrentPacketAddress = (uint32_t *)p;
   tx_status = HAL_ETH_Transmit(&heth, &TxConfig, ETH_DMA_TRANSMIT_TIMEOUT);
   g_eth_last_tx_hal_status = (uint32_t)tx_status;
@@ -600,6 +719,7 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
   }
   else
   {
+    pbuf_free(p);
     g_eth_tx_errors++;
     errval = ERR_IF;
   }
@@ -668,9 +788,6 @@ static void ethernetif_input(void const * argument)
       }
     } while(p!=NULL);
 
-    /* The Cube-generated ETH input task was running at realtime priority.
-       If anything in the RX path polls unexpectedly, make sure lower-priority
-       tasks such as the default task still get CPU time. */
     osDelay(1);
   }
 }
@@ -979,11 +1096,13 @@ void ethernet_link_thread(void const * argument)
   ETH_MACConfigTypeDef MACConf = {0};
   int32_t PHYLinkState = 0;
   uint32_t linkchanged = 0U, speed = 0U, duplex = 0U;
+  uint8_t first_loop_logged = 0U;
+  uint32_t link_down_loops = 0U;
+  uint32_t force_mode_hold_loops = 0U;
 
   struct netif *netif = (struct netif *) argument;
 /* USER CODE BEGIN ETH link init */
   g_eth_link_thread_started = 1U;
-
 /* USER CODE END ETH link init */
 
   for(;;)
@@ -993,17 +1112,26 @@ void ethernet_link_thread(void const * argument)
   g_eth_last_phy_link_state = PHYLinkState;
   linkchanged = 0U;
 
-  if(netif_is_link_up(netif) && (PHYLinkState <= LAN8742_STATUS_LINK_DOWN))
+  if (first_loop_logged == 0U)
   {
-    HAL_ETH_Stop(&heth);
-    netif_set_down(netif);
-    netif_set_link_down(netif);
-    g_eth_link_down_events++;
+    first_loop_logged = 1U;
   }
-  else if(!netif_is_link_up(netif) && (PHYLinkState > LAN8742_STATUS_LINK_DOWN))
-  {
-    switch (PHYLinkState)
+
+    if(netif_is_link_up(netif) && (PHYLinkState <= LAN8742_STATUS_LINK_DOWN))
     {
+      HAL_ETH_Stop(&heth);
+      if (tcpip_try_callback(ethernetif_netif_down_callback, netif) != ERR_OK)
+      {
+        ethernetif_uart_write("[net] ethlink netif down err\r\n");
+      }
+      g_eth_link_down_events++;
+      link_down_loops = 0U;
+      force_mode_hold_loops = 0U;
+    }
+    else if(!netif_is_link_up(netif) && (PHYLinkState > LAN8742_STATUS_LINK_DOWN))
+    {
+      switch (PHYLinkState)
+      {
     case LAN8742_STATUS_100MBITS_FULLDUPLEX:
       duplex = ETH_FULLDUPLEX_MODE;
       speed = ETH_SPEED_100M;
@@ -1028,21 +1156,72 @@ void ethernet_link_thread(void const * argument)
       break;
     }
 
-    if(linkchanged)
-    {
-      /* Get MAC Config MAC */
-      HAL_ETH_GetMACConfig(&heth, &MACConf);
-      MACConf.DuplexMode = duplex;
-      MACConf.Speed = speed;
-      HAL_ETH_SetMACConfig(&heth, &MACConf);
-      HAL_ETH_Start(&heth);
-      netif_set_up(netif);
-      netif_set_link_up(netif);
-      g_eth_link_up_events++;
+      if(linkchanged)
+      {
+        /* Get MAC Config MAC */
+        HAL_ETH_GetMACConfig(&heth, &MACConf);
+        MACConf.DuplexMode = duplex;
+        MACConf.Speed = speed;
+        HAL_ETH_SetMACConfig(&heth, &MACConf);
+        HAL_ETH_Start(&heth);
+        if (tcpip_try_callback(ethernetif_netif_up_callback, netif) == ERR_OK)
+        {
+          g_eth_link_up_events++;
+          g_eth_phy_retry_count = 0U;
+          link_down_loops = 0U;
+          force_mode_hold_loops = 0U;
+        }
+        else
+        {
+          ethernetif_uart_write("[net] ethlink netif link up err\r\n");
+        }
+      }
     }
-  }
+    else if (PHYLinkState <= LAN8742_STATUS_LINK_DOWN)
+    {
+      link_down_loops++;
 
-/* USER CODE BEGIN ETH link Thread core code for User BSP */
+      if ((link_down_loops % 10U) == 0U)
+      {
+        if (force_mode_hold_loops != 0U)
+        {
+          if (force_mode_hold_loops > 10U)
+          {
+            force_mode_hold_loops -= 10U;
+          }
+          else
+          {
+            force_mode_hold_loops = 0U;
+          }
+        }
+        else
+        {
+          g_eth_phy_retry_count++;
+
+          if (g_eth_phy_retry_count <= 3U)
+          {
+            ethernetif_force_phy_ready();
+          }
+          else
+          {
+            if (ethernetif_force_phy_link_mode(LAN8742_STATUS_100MBITS_HALFDUPLEX) == LAN8742_STATUS_OK)
+            {
+              force_mode_hold_loops = 30U;
+            }
+            else
+            {
+              ethernetif_force_phy_ready();
+            }
+          }
+        }
+      }
+    }
+    else
+    {
+      link_down_loops = 0U;
+    }
+
+  /* USER CODE BEGIN ETH link Thread core code for User BSP */
 
 /* USER CODE END ETH link Thread core code for User BSP */
 
@@ -1052,23 +1231,23 @@ void ethernet_link_thread(void const * argument)
 
 void HAL_ETH_RxAllocateCallback(uint8_t **buff)
 {
-/* USER CODE BEGIN HAL ETH RxAllocateCallback */
+  /* USER CODE BEGIN HAL ETH RxAllocateCallback */
   struct pbuf_custom *p = LWIP_MEMPOOL_ALLOC(RX_POOL);
   if (p)
   {
-    /* Get the buff from the struct pbuf address. */
-    *buff = (uint8_t *)p + offsetof(RxBuff_t, buff);
-    p->custom_free_function = pbuf_free_custom;
-    /* Initialize the struct pbuf.
-    * This must be performed whenever a buffer's allocated because it may be
-    * changed by lwIP or the app, e.g., pbuf_free decrements ref. */
-    pbuf_alloced_custom(PBUF_RAW, 0, PBUF_REF, p, *buff, ETH_RX_BUF_SIZE);
-  }
-  else
-  {
-    RxAllocStatus = RX_ALLOC_ERROR;
-    *buff = NULL;
-  }
+      /* Get the buff from the struct pbuf address. */
+      *buff = (uint8_t *)p + offsetof(RxBuff_t, buff);
+      p->custom_free_function = pbuf_free_custom;
+      /* Initialize the struct pbuf.
+      * This must be performed whenever a buffer's allocated because it may be
+      * changed by lwIP or the app, e.g., pbuf_free decrements ref. */
+      ethernetif_init_custom_pbuf_safe(p, *buff, 0U);
+    }
+    else
+    {
+      RxAllocStatus = RX_ALLOC_ERROR;
+      *buff = NULL;
+    }
 /* USER CODE END HAL ETH RxAllocateCallback */
 }
 

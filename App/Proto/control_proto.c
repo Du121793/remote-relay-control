@@ -1,4 +1,5 @@
 #include "control_proto.h"
+#include "board_relay.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -105,7 +106,7 @@ void control_proto_parse(const char *request, control_proto_command_t *command)
       char *endptr = NULL;
       unsigned long mask = strtoul(tokens[3], &endptr, 0);
 
-      if ((*endptr == '\0') && (mask <= 0x7FUL))
+      if ((*endptr == '\0') && (mask <= BOARD_RELAY_ALL_MASK))
       {
         command->type = CONTROL_PROTO_CMD_SET_RELAY_MASK;
         command->mask = (uint32_t)mask;
@@ -140,7 +141,7 @@ void control_proto_parse(const char *request, control_proto_command_t *command)
         return;
       }
 
-      if ((command->channel == 0U) || (command->channel > 7U))
+      if ((command->channel == 0U) || (command->channel > BOARD_RELAY_CHANNEL_COUNT))
       {
         command->error = CONTROL_PROTO_ERR_BAD_CHANNEL;
         return;
@@ -161,14 +162,16 @@ void control_proto_parse(const char *request, control_proto_command_t *command)
 
 int control_proto_format_pong(char *buffer, size_t buffer_size, const char *ip_text, uint32_t relay_mask)
 {
-  return snprintf(buffer, buffer_size, "OK type=pong ip=%s relay=0x%02lX\r\n",
+  return snprintf(buffer, buffer_size, "OK type=pong ip=%s relay=0x%04lX\r\n",
                   ip_text, (unsigned long)relay_mask);
 }
 
 int control_proto_format_relay_state(char *buffer, size_t buffer_size, uint32_t relay_mask)
 {
   return snprintf(buffer, buffer_size,
-                  "OK type=relay relay=0x%02lX ch1=%u ch2=%u ch3=%u ch4=%u ch5=%u ch6=%u ch7=%u\r\n",
+                  "OK type=relay relay=0x%04lX "
+                  "ch1=%u ch2=%u ch3=%u ch4=%u ch5=%u ch6=%u ch7=%u ch8=%u "
+                  "ch9=%u ch10=%u ch11=%u ch12=%u ch13=%u ch14=%u ch15=%u ch16=%u\r\n",
                   (unsigned long)relay_mask,
                   (unsigned int)((relay_mask >> 0) & 0x1U),
                   (unsigned int)((relay_mask >> 1) & 0x1U),
@@ -176,7 +179,16 @@ int control_proto_format_relay_state(char *buffer, size_t buffer_size, uint32_t 
                   (unsigned int)((relay_mask >> 3) & 0x1U),
                   (unsigned int)((relay_mask >> 4) & 0x1U),
                   (unsigned int)((relay_mask >> 5) & 0x1U),
-                  (unsigned int)((relay_mask >> 6) & 0x1U));
+                  (unsigned int)((relay_mask >> 6) & 0x1U),
+                  (unsigned int)((relay_mask >> 7) & 0x1U),
+                  (unsigned int)((relay_mask >> 8) & 0x1U),
+                  (unsigned int)((relay_mask >> 9) & 0x1U),
+                  (unsigned int)((relay_mask >> 10) & 0x1U),
+                  (unsigned int)((relay_mask >> 11) & 0x1U),
+                  (unsigned int)((relay_mask >> 12) & 0x1U),
+                  (unsigned int)((relay_mask >> 13) & 0x1U),
+                  (unsigned int)((relay_mask >> 14) & 0x1U),
+                  (unsigned int)((relay_mask >> 15) & 0x1U));
 }
 
 int control_proto_format_error(char *buffer, size_t buffer_size, control_proto_error_t error)

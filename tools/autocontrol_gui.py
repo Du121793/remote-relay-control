@@ -1,9 +1,12 @@
+import http.client
+import json
 import queue
 import socket
 import subprocess
 import threading
 import time
 import tkinter as tk
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -13,6 +16,7 @@ from typing import Dict, Optional
 APP_TITLE = "autoControl Tool"
 DISCOVERY_PORT = 40000
 CONTROL_PORT = 41000
+HTTP_PORT = 80
 MULTICAST_GROUP = "239.255.42.99"
 DISCOVER_PAYLOAD = b"DISCOVER"
 
@@ -129,10 +133,13 @@ class AutoControlApp:
 
         self.target_ip_var = tk.StringVar(value="192.168.0.218")
         self.control_port_var = tk.StringVar(value=str(CONTROL_PORT))
+        self.http_port_var = tk.StringVar(value=str(HTTP_PORT))
         self.discovery_port_var = tk.StringVar(value=str(DISCOVERY_PORT))
         self.bind_ip_var = tk.StringVar(value="0.0.0.0")
+        self.http_password_var = tk.StringVar(value="admin")
+        self.http_token_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="ready")
-        self.relay_vars = [tk.IntVar(value=0) for _ in range(7)]
+        self.relay_vars = [tk.IntVar(value=0) for _ in range(16)]
 
         self._build_ui()
         self._start_listener()
@@ -152,16 +159,31 @@ class AutoControlApp:
         ttk.Entry(top, textvariable=self.control_port_var, width=8).grid(row=0, column=3, padx=6, pady=6)
         ttk.Label(top, text="Discovery Port").grid(row=0, column=4, padx=6, pady=6, sticky=tk.W)
         ttk.Entry(top, textvariable=self.discovery_port_var, width=8).grid(row=0, column=5, padx=6, pady=6)
-        ttk.Label(top, text="Bind").grid(row=0, column=6, padx=6, pady=6, sticky=tk.W)
-        ttk.Entry(top, textvariable=self.bind_ip_var, width=14).grid(row=0, column=7, padx=6, pady=6)
+        ttk.Label(top, text="HTTP Port").grid(row=0, column=6, padx=6, pady=6, sticky=tk.W)
+        ttk.Entry(top, textvariable=self.http_port_var, width=8).grid(row=0, column=7, padx=6, pady=6)
+        ttk.Label(top, text="Bind").grid(row=0, column=8, padx=6, pady=6, sticky=tk.W)
+        ttk.Entry(top, textvariable=self.bind_ip_var, width=14).grid(row=0, column=9, padx=6, pady=6)
 
         actions = ttk.Frame(top)
-        actions.grid(row=1, column=0, columnspan=8, padx=6, pady=(0, 8), sticky=tk.W)
+        actions.grid(row=1, column=0, columnspan=10, padx=6, pady=(0, 8), sticky=tk.W)
         ttk.Button(actions, text="Discover", command=self.send_discover).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(actions, text="ICMP Ping", command=self.os_ping).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(actions, text="TCP PING", command=self.control_ping).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(actions, text="GET RELAY", command=self.get_relay).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(actions, text="HTTP Status", command=self.http_status).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(actions, text="HTTP Session", command=self.http_session).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(actions, text="HTTP Login", command=self.http_login).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(actions, text="Restart Listen", command=self._restart_listener).pack(side=tk.LEFT, padx=(0, 8))
+
+        http_auth = ttk.Frame(top)
+        http_auth.grid(row=2, column=0, columnspan=10, padx=6, pady=(0, 8), sticky=tk.W)
+        ttk.Label(http_auth, text="HTTP Password").pack(side=tk.LEFT)
+        ttk.Entry(http_auth, textvariable=self.http_password_var, width=12, show="*").pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(http_auth, text="Token").pack(side=tk.LEFT)
+        ttk.Entry(http_auth, textvariable=self.http_token_var, width=18).pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Button(http_auth, text="HTTP Logout", command=self.http_logout).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(http_auth, text="HTTP GET RELAY", command=self.http_get_relay).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(http_auth, text="HTTP Apply Mask", command=self.http_apply_relay_mask).pack(side=tk.LEFT, padx=(0, 8))
 
         middle = ttk.PanedWindow(main, orient=tk.VERTICAL)
         middle.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
@@ -253,8 +275,12 @@ class AutoControlApp:
                 self._update_node(payload)
             elif kind == "relay":
                 self._apply_relay_response(payload)
+            elif kind == "relay_json":
+                self._apply_relay_json(payload)
             elif kind == "response":
                 self._append_log(str(payload))
+            elif kind == "token":
+                self.http_token_var.set(str(payload))
             elif kind == "set_ip":
                 self.target_ip_var.set(str(payload))
             elif kind == "ping":
@@ -342,6 +368,36 @@ class AutoControlApp:
             data = sock.recv(1024)
         return data.decode("ascii", errors="replace").strip()
 
+    def _http_request(self, method: str, path: str, body: Optional[Dict[str, str]] = None) -> Dict[str, object]:
+        ip = self.target_ip_var.get().strip()
+        port = int(self.http_port_var.get().strip())
+        if not ip:
+            raise ValueError("IP is empty")
+
+        payload = ""
+        headers = {"Connection": "close"}
+        token = self.http_token_var.get().strip()
+        if token:
+            headers["X-Auth-Token"] = token
+        if body is not None:
+            payload = urllib.parse.urlencode(body)
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+        conn = http.client.HTTPConnection(ip, port, timeout=4.0)
+        try:
+            conn.request(method, path, body=payload, headers=headers)
+            response = conn.getresponse()
+            text = response.read().decode("utf-8", errors="replace")
+        finally:
+            conn.close()
+
+        try:
+            data: Dict[str, object] = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            data = {"raw": text}
+        data["_status"] = response.status
+        return data
+
     def control_ping(self) -> None:
         def work() -> None:
             response = self._tcp_request("PING")
@@ -374,15 +430,73 @@ class AutoControlApp:
             relay_var.set(value)
         self.apply_relay_mask()
 
+    def http_status(self) -> None:
+        def work() -> None:
+            data = self._http_request("GET", "/api/status")
+            self.events.put(("response", f"HTTP STATUS -> {json.dumps(data, ensure_ascii=False)}"))
+
+        self._run_background("http status", work)
+
+    def http_session(self) -> None:
+        def work() -> None:
+            data = self._http_request("GET", "/api/session")
+            self.events.put(("response", f"HTTP SESSION -> {json.dumps(data, ensure_ascii=False)}"))
+
+        self._run_background("http session", work)
+
+    def http_login(self) -> None:
+        def work() -> None:
+            data = self._http_request("POST", "/api/login", {"password": self.http_password_var.get()})
+            if "token" in data:
+                self.events.put(("token", str(data["token"])))
+            self.events.put(("response", f"HTTP LOGIN -> {json.dumps(data, ensure_ascii=False)}"))
+
+        self._run_background("http login", work)
+
+    def http_logout(self) -> None:
+        def work() -> None:
+            data = self._http_request("POST", "/api/logout", {})
+            self.events.put(("token", ""))
+            self.events.put(("response", f"HTTP LOGOUT -> {json.dumps(data, ensure_ascii=False)}"))
+
+        self.events.put(("token", ""))
+        self._run_background("http logout", work)
+
+    def http_get_relay(self) -> None:
+        def work() -> None:
+            data = self._http_request("GET", "/api/relay")
+            self.events.put(("response", f"HTTP GET RELAY -> {json.dumps(data, ensure_ascii=False)}"))
+            self.events.put(("relay_json", data))
+
+        self._run_background("http get relay", work)
+
+    def http_apply_relay_mask(self) -> None:
+        def work() -> None:
+            mask = 0
+            for index, relay_var in enumerate(self.relay_vars):
+                if relay_var.get():
+                    mask |= (1 << index)
+            data = self._http_request("POST", "/api/relay-mask", {"mask": str(mask)})
+            self.events.put(("response", f"HTTP SET RELAY MASK {mask} -> {json.dumps(data, ensure_ascii=False)}"))
+            self.events.put(("relay_json", data))
+
+        self._run_background("http apply relay mask", work)
+
     def _apply_relay_response(self, response: str) -> None:
         data = parse_key_value_line(response)
         if data.get("type") != "relay":
             return
 
-        for index in range(7):
+        for index in range(16):
             key = f"ch{index + 1}"
             if key in data:
                 self.relay_vars[index].set(1 if data[key] == "1" else 0)
+
+    def _apply_relay_json(self, data: Dict[str, object]) -> None:
+        for index in range(16):
+            key = f"ch{index + 1}"
+            if key in data:
+                self.relay_vars[index].set(1 if str(data[key]) == "1" else 0)
 
 
 def main() -> int:

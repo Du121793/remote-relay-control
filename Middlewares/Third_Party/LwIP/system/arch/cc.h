@@ -36,11 +36,13 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+void lwip_platform_assert(const char *msg, int line, const char *file);
+
 typedef int sys_prot_t;
 
 #define LWIP_PROVIDE_ERRNO
 
-#if defined (__GNUC__) && !defined (__CC_ARM) && !defined (__ARMCC_VERSION)
+#if defined (__GNUC__) & !defined (__CC_ARM)
 
 #define LWIP_TIMEVAL_PRIVATE 0
 #include <sys/time.h>
@@ -56,17 +58,17 @@ typedef int sys_prot_t;
 #define PACK_STRUCT_FIELD(x) x
 #define PACK_STRUCT_USE_INCLUDES
 
-#elif defined (__CC_ARM) || defined (__ARMCC_VERSION)
+#elif defined (__GNUC__)
 
 #define PACK_STRUCT_BEGIN
 #define PACK_STRUCT_STRUCT __attribute__ ((__packed__))
 #define PACK_STRUCT_END
 #define PACK_STRUCT_FIELD(x) x
 
-#elif defined (__GNUC__)
+#elif defined (__CC_ARM)
 
-#define PACK_STRUCT_BEGIN
-#define PACK_STRUCT_STRUCT __attribute__ ((__packed__))
+#define PACK_STRUCT_BEGIN __packed
+#define PACK_STRUCT_STRUCT
 #define PACK_STRUCT_END
 #define PACK_STRUCT_FIELD(x) x
 
@@ -79,21 +81,9 @@ typedef int sys_prot_t;
 
 #endif
 
-#define LWIP_PLATFORM_ASSERT(x) do {printf("Assertion \"%s\" failed at line %d in %s\n", \
-                                     x, __LINE__, __FILE__); } while(0)
+#define LWIP_PLATFORM_ASSERT(x) do { lwip_platform_assert((x), __LINE__, __FILE__); } while(0)
 
 /* Define random number generator function */
 #define LWIP_RAND() ((u32_t)rand())
-
-/*
- * Cortex-M7 ETH zero-copy RX needs cache-line-aligned pool storage.
- * The default lwIP fallback only guarantees generic alignment, which left
- * RX_POOL on an odd base address in this project. Force all lwIP private
- * pools to 32-byte alignment so DMA buffers land on stable boundaries.
- */
-#ifndef LWIP_DECLARE_MEMORY_ALIGNED
-#define LWIP_DECLARE_MEMORY_ALIGNED(variable_name, size) \
-  u8_t variable_name[size] __attribute__((aligned(32)))
-#endif
 
 #endif /* __CC_H__ */

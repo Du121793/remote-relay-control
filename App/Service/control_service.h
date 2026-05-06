@@ -12,6 +12,7 @@ typedef struct
   uint32_t connections;
   uint32_t commands;
   uint32_t errors;
+  uint32_t listener_up;
 } control_service_stats_t;
 
 void control_service_init(void);

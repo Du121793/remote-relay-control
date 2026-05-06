@@ -7,7 +7,8 @@
 extern "C" {
 #endif
 
-#define BOARD_RELAY_CHANNEL_COUNT 7U
+#define BOARD_RELAY_CHANNEL_COUNT 16U
+#define BOARD_RELAY_ALL_MASK      0xFFFFUL
 
 HAL_StatusTypeDef board_relay_set(uint8_t channel, GPIO_PinState state);
 GPIO_PinState board_relay_get(uint8_t channel);

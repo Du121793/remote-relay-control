@@ -86,12 +86,6 @@
 
 #include <string.h>
 
-#if defined(__clang__)
-#define PBUF_NOINLINE_UNOPTIMIZED __attribute__((noinline, optnone))
-#else
-#define PBUF_NOINLINE_UNOPTIMIZED
-#endif
-
 #define SIZEOF_STRUCT_PBUF        LWIP_MEM_ALIGN_SIZE(sizeof(struct pbuf))
 /* Since the pool is created in memp, PBUF_POOL_BUFSIZE will be automatically
    aligned there. Therefore, PBUF_POOL_BUFSIZE_ALIGNED can be used here. */
@@ -184,37 +178,14 @@ pbuf_pool_is_empty(void)
 static void
 pbuf_init_alloced_pbuf(struct pbuf *p, void *payload, u16_t tot_len, u16_t len, pbuf_type type, u8_t flags)
 {
-  volatile u8_t *flags_field;
-  volatile LWIP_PBUF_REF_T *ref_field;
-  volatile u8_t *if_idx_field;
-
   p->next = NULL;
   p->payload = payload;
   p->tot_len = tot_len;
   p->len = len;
   p->type_internal = (u8_t)type;
-  flags_field = &p->flags;
-  ref_field = &p->ref;
-  if_idx_field = &p->if_idx;
-  /*
-   * armclang may combine the trailing byte-field stores in struct pbuf into a
-   * halfword write starting at offset 0x0d, which traps on Cortex-M7 with
-   * UNALIGN_TRP enabled. Force distinct scalar stores for these tail fields.
-   */
-  *flags_field = flags;
-  *ref_field = 1;
-  *if_idx_field = NETIF_NO_INDEX;
-}
-
-static PBUF_NOINLINE_UNOPTIMIZED void
-pbuf_copy_bytes_unaligned_safe(void *dst, const void *src, u16_t len)
-{
-  volatile u8_t *dst_bytes = (volatile u8_t *)dst;
-  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
-  while (len != 0U) {
-    *dst_bytes++ = *src_bytes++;
-    len--;
-  }
+  p->flags = flags;
+  p->ref = 1;
+  p->if_idx = NETIF_NO_INDEX;
 }
 
 /**
@@ -1075,7 +1046,7 @@ pbuf_copy_partial(const struct pbuf *buf, void *dataptr, u16_t len, u16_t offset
         buf_copy_len = len;
       }
       /* copy the necessary parts of the buffer */
-      pbuf_copy_bytes_unaligned_safe(&((char *)dataptr)[left], &((char *)p->payload)[offset], buf_copy_len);
+      MEMCPY(&((char *)dataptr)[left], &((char *)p->payload)[offset], buf_copy_len);
       copied_total = (u16_t)(copied_total + buf_copy_len);
       left = (u16_t)(left + buf_copy_len);
       len = (u16_t)(len - buf_copy_len);

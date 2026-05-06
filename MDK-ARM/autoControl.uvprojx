@@ -511,6 +511,11 @@
               <FileType>1</FileType>
               <FilePath>../App/Service/control_queue.c</FilePath>
             </File>
+            <File>
+              <FileName>http_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Service/http_service.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

@@ -26,6 +26,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include "ethernetif.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,6 +47,9 @@
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
 extern UART_HandleTypeDef huart3;
+extern volatile uint32_t g_eth_irq_count;
+volatile uint32_t g_tick_probe_armed = 0U;
+volatile uint32_t g_tick_probe_hits = 0U;
 
 /* USER CODE END PV */
 
@@ -134,7 +138,6 @@ void hardfault_dump(uint32_t *stack, uint32_t exc_lr)
 
 /* External variables --------------------------------------------------------*/
 extern ETH_HandleTypeDef heth;
-extern volatile uint32_t g_eth_irq_count;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -241,6 +244,10 @@ void DebugMon_Handler(void)
 void SysTick_Handler(void)
 {
   /* USER CODE BEGIN SysTick_IRQn 0 */
+  if (g_tick_probe_armed != 0U)
+  {
+    g_tick_probe_hits++;
+  }
 
   /* USER CODE END SysTick_IRQn 0 */
   HAL_IncTick();

@@ -57,6 +57,7 @@
 #include "lwip/stats.h"
 #include "lwip/prot/iana.h"
 
+#include <stddef.h>
 #include <string.h>
 
 #ifdef LWIP_HOOK_FILENAME
@@ -106,16 +107,28 @@
 /** The IP header ID of the next outgoing IP packet */
 static u16_t ip_id;
 
-static void
-ip4_addr_copy_aligned_from_unaligned_bytes(ip4_addr_t *dst, const void *src)
+__attribute__((noinline, optnone)) static void
+ip4_copy_bytes_safe(void *dst, const void *src, size_t len)
 {
-  volatile u8_t *dst_bytes = (volatile u8_t *)&dst->addr;
-  const volatile u8_t *src_bytes = (const volatile u8_t *)src;
+  u8_t *dst_bytes = (u8_t *)dst;
+  const u8_t *src_bytes = (const u8_t *)src;
+  size_t i;
 
-  dst_bytes[0] = src_bytes[0];
-  dst_bytes[1] = src_bytes[1];
-  dst_bytes[2] = src_bytes[2];
-  dst_bytes[3] = src_bytes[3];
+  for (i = 0; i < len; ++i) {
+    dst_bytes[i] = src_bytes[i];
+  }
+}
+
+__attribute__((noinline, optnone)) static void
+ip4_addr_copy_from_packed_safe(ip4_addr_t *dst, const void *src)
+{
+  ip4_copy_bytes_safe(&dst->addr, src, sizeof(dst->addr));
+}
+
+__attribute__((noinline, optnone)) static void
+ip4_addr_copy_to_packed_safe(void *dst, const ip4_addr_t *src)
+{
+  ip4_copy_bytes_safe(dst, &src->addr, sizeof(src->addr));
 }
 
 #if LWIP_MULTICAST_TX_OPTIONS
@@ -441,8 +454,6 @@ ip4_input(struct pbuf *p, struct netif *inp)
   struct netif *netif;
   u16_t iphdr_hlen;
   u16_t iphdr_len;
-  ip4_addr_t current_dest_aligned;
-  ip4_addr_t current_src_aligned;
 #if IP_ACCEPT_LINK_LAYER_ADDRESSING || LWIP_IGMP
   int check_ip_src = 1;
 #endif /* IP_ACCEPT_LINK_LAYER_ADDRESSING || LWIP_IGMP */
@@ -525,15 +536,11 @@ ip4_input(struct pbuf *p, struct netif *inp)
   }
 #endif
 
-  /*
-   * armclang may emit word loads for packed IPv4 src/dest fields even though
-   * the incoming IP header is not guaranteed to be 4-byte aligned after the
-   * Ethernet header. Copy them through aligned locals first.
-   */
-  ip4_addr_copy_aligned_from_unaligned_bytes(&current_dest_aligned, &iphdr->dest);
-  ip4_addr_copy_aligned_from_unaligned_bytes(&current_src_aligned, &iphdr->src);
-  ip_addr_copy_from_ip4(ip_data.current_iphdr_dest, current_dest_aligned);
-  ip_addr_copy_from_ip4(ip_data.current_iphdr_src, current_src_aligned);
+  /* copy IP addresses to aligned ip_addr_t */
+  ip4_addr_copy_from_packed_safe(ip_2_ip4(&ip_data.current_iphdr_dest),
+                                 ((const u8_t *)iphdr) + offsetof(struct ip_hdr, dest));
+  ip4_addr_copy_from_packed_safe(ip_2_ip4(&ip_data.current_iphdr_src),
+                                 ((const u8_t *)iphdr) + offsetof(struct ip_hdr, src));
 
   /* match packet against an interface, i.e. is this packet for us? */
   if (ip4_addr_ismulticast(ip4_current_dest_addr())) {
@@ -931,10 +938,10 @@ ip4_output_if_opt_src(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *d
 #endif /* CHECKSUM_GEN_IP_INLINE */
 
     /* dest cannot be NULL here */
-    ip4_addr_copy(iphdr->dest, *dest);
+    ip4_addr_copy_to_packed_safe(((u8_t *)iphdr) + offsetof(struct ip_hdr, dest), dest);
 #if CHECKSUM_GEN_IP_INLINE
-    chk_sum += ip4_addr_get_u32(&iphdr->dest) & 0xFFFF;
-    chk_sum += ip4_addr_get_u32(&iphdr->dest) >> 16;
+    chk_sum += ip4_addr_get_u32(dest) & 0xFFFF;
+    chk_sum += ip4_addr_get_u32(dest) >> 16;
 #endif /* CHECKSUM_GEN_IP_INLINE */
 
     IPH_VHL_SET(iphdr, 4, ip_hlen / 4);
@@ -954,15 +961,15 @@ ip4_output_if_opt_src(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *d
     ++ip_id;
 
     if (src == NULL) {
-      ip4_addr_copy(iphdr->src, *IP4_ADDR_ANY4);
+      ip4_addr_copy_to_packed_safe(((u8_t *)iphdr) + offsetof(struct ip_hdr, src), IP4_ADDR_ANY4);
     } else {
       /* src cannot be NULL here */
-      ip4_addr_copy(iphdr->src, *src);
+      ip4_addr_copy_to_packed_safe(((u8_t *)iphdr) + offsetof(struct ip_hdr, src), src);
     }
 
 #if CHECKSUM_GEN_IP_INLINE
-    chk_sum += ip4_addr_get_u32(&iphdr->src) & 0xFFFF;
-    chk_sum += ip4_addr_get_u32(&iphdr->src) >> 16;
+    chk_sum += ip4_addr_get_u32(src == NULL ? IP4_ADDR_ANY4 : src) & 0xFFFF;
+    chk_sum += ip4_addr_get_u32(src == NULL ? IP4_ADDR_ANY4 : src) >> 16;
     chk_sum = (chk_sum >> 16) + (chk_sum & 0xFFFF);
     chk_sum = (chk_sum >> 16) + chk_sum;
     chk_sum = ~chk_sum;
@@ -991,7 +998,7 @@ ip4_output_if_opt_src(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *d
       return ERR_BUF;
     }
     iphdr = (struct ip_hdr *)p->payload;
-    ip4_addr_copy(dest_addr, iphdr->dest);
+    ip4_addr_copy_from_packed_safe(&dest_addr, ((const u8_t *)iphdr) + offsetof(struct ip_hdr, dest));
     dest = &dest_addr;
   }
 

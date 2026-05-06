@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>autoControl 路由器管理介面</title>
+<style>
+  :root {
+    --primary: rgb(69, 194, 222);
+    --light-blue: rgb(74, 203, 214);
+    --bg: rgb(239, 239, 239);
+    --panel-bg: #ffffff;
+    --text: #333333;
+    --border: #d8d8d8;
+    --success: #28a745;
+    --danger: #dc3545;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "Microsoft JhengHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .header {
+    background: linear-gradient(135deg, var(--light-blue), var(--primary));
+    color: #fff;
+    padding: 18px 20px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  }
+  .header h1 {
+    margin: 0;
+    font-size: 22px;
+  }
+  .wrap {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 20px 14px;
+  }
+  .panel {
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.04);
+  }
+  .panel h2 {
+    margin: 0 0 12px;
+    font-size: 18px;
+    color: var(--primary);
+  }
+  .row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  input[type="password"] {
+    min-width: 220px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  button {
+    border: 0;
+    border-radius: 8px;
+    padding: 10px 14px;
+    background: var(--primary);
+    color: #fff;
+    cursor: pointer;
+  }
+  button.alt {
+    background: var(--light-blue);
+  }
+  button.danger {
+    background: var(--danger);
+  }
+  .relay-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 10px;
+  }
+  .relay-card {
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+    text-align: center;
+  }
+  .relay-name {
+    display: block;
+    margin-bottom: 10px;
+    font-weight: 600;
+  }
+  .switch {
+    position: relative;
+    display: inline-block;
+    width: 52px;
+    height: 28px;
+  }
+  .switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+  .slider {
+    position: absolute;
+    inset: 0;
+    background: #c8c8c8;
+    border-radius: 28px;
+    transition: 0.2s;
+  }
+  .slider:before {
+    content: "";
+    position: absolute;
+    height: 22px;
+    width: 22px;
+    left: 3px;
+    top: 3px;
+    background: #fff;
+    border-radius: 50%;
+    transition: 0.2s;
+  }
+  input:checked + .slider {
+    background: var(--success);
+  }
+  input:checked + .slider:before {
+    transform: translateX(24px);
+  }
+  pre {
+    margin: 0;
+    padding: 14px;
+    border-radius: 10px;
+    background: #f7f7f7;
+    border: 1px solid var(--border);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>autoControl 路由器管理介面</h1>
+</div>
+<div class="wrap">
+  <div class="panel">
+    <h2>登入驗證</h2>
+    <div class="row">
+      <input id="pwd" type="password" placeholder="管理密碼（預設：admin）">
+      <button onclick="login()">登入</button>
+      <button class="danger" onclick="logout()">登出</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>繼電器控制</h2>
+    <div class="row" style="margin-bottom:12px;">
+      <button class="alt" onclick="refreshAll()">重新整理</button>
+      <button onclick="setMask(65535)">全部開啟</button>
+      <button class="danger" onclick="setMask(0)">全部關閉</button>
+    </div>
+    <div id="relays" class="relay-grid"></div>
+  </div>
+
+  <div class="panel">
+    <h2>系統狀態</h2>
+    <pre id="status">Loading...</pre>
+  </div>
+</div>
+
+<script>
+let token = localStorage.getItem("t") || "";
+
+async function req(url, method, body) {
+  const headers = {};
+  if (token) headers["X-Auth-Token"] = token;
+  if (method === "POST") headers["Content-Type"] = "application/x-www-form-urlencoded";
+  try {
+    const res = await fetch(url, { method: method || "GET", headers, body: body || null });
+    return await res.json();
+  } catch (err) {
+    return { ok: false, error: "network_error" };
+  }
+}
+
+async function login() {
+  const data = await req("/api/login", "POST", "password=" + encodeURIComponent(document.getElementById("pwd").value));
+  if (data.token) {
+    token = String(data.token);
+    localStorage.setItem("t", token);
+    document.getElementById("pwd").value = "";
+    alert("登入成功");
+  } else {
+    alert("登入失敗：" + (data.error || "unknown"));
+  }
+  refreshAll();
+}
+
+async function logout() {
+  await req("/api/logout", "POST", "");
+  token = "";
+  localStorage.removeItem("t");
+  alert("已登出");
+  refreshAll();
+}
+
+async function setChannel(channel, value) {
+  const data = await req("/api/relay-channel", "POST", "channel=" + channel + "&value=" + value);
+  if (!data.ok) alert("控制失敗：" + (data.error || "unknown"));
+  refreshAll();
+}
+
+async function setMask(mask) {
+  const data = await req("/api/relay-mask", "POST", "mask=" + mask);
+  if (!data.ok) alert("批次控制失敗：" + (data.error || "unknown"));
+  refreshAll();
+}
+
+function renderRelays(relay) {
+  const host = document.getElementById("relays");
+  if (!relay.ok) {
+    host.innerHTML = "<div>無法取得繼電器狀態</div>";
+    return;
+  }
+
+  let html = "";
+  for (let i = 1; i <= 16; i++) {
+    const checked = relay["ch" + i] ? "checked" : "";
+    html += `
+      <div class="relay-card">
+        <span class="relay-name">Relay ${i}</span>
+        <label class="switch">
+          <input type="checkbox" ${checked} onchange="setChannel(${i}, this.checked ? 1 : 0)">
+          <span class="slider"></span>
+        </label>
+      </div>`;
+  }
+  host.innerHTML = html;
+}
+
+async function refreshAll() {
+  const session = await req("/api/session");
+  const relay = await req("/api/relay");
+  renderRelays(relay);
+  document.getElementById("status").textContent =
+    "--- Session ---\n" + JSON.stringify(session, null, 2) +
+    "\n\n--- Relay ---\n" + JSON.stringify(relay, null, 2);
+}
+
+refreshAll();
+</script>
+</body>
+</html>
