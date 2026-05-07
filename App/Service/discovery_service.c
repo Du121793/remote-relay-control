@@ -2,7 +2,12 @@
 
 #include "cmsis_os.h"
 
+#include "board_relay.h"
+#include "cluster_service.h"
+#include "control_service.h"
+#include "../Config/device_config.h"
 #include "discovery_proto.h"
+#include "http_service.h"
 #include "lwip.h"
 
 #include "lwip/igmp.h"
@@ -16,14 +21,13 @@
 #include <string.h>
 
 #define DISCOVERY_UDP_PORT              40000U
-#define DISCOVERY_ANNOUNCE_INTERVAL_MS  5000U
+#define DISCOVERY_ANNOUNCE_INTERVAL_MS  2000U
 #define DISCOVERY_SERVICE_TYPE          "autoControl"
-#define DISCOVERY_CLUSTER_ID            "default"
-#define DISCOVERY_DEVICE_ID             "stm32f767zi"
 #define DISCOVERY_MULTICAST_IP0         239
 #define DISCOVERY_MULTICAST_IP1         255
 #define DISCOVERY_MULTICAST_IP2         42
 #define DISCOVERY_MULTICAST_IP3         99
+#define DISCOVERY_ANNOUNCE_BUFFER_SIZE  256U
 
 extern struct netif gnetif;
 
@@ -34,34 +38,70 @@ static uint8_t g_discovery_multicast_joined = 0U;
 static ip4_addr_t g_discovery_group_addr;
 static discovery_service_stats_t g_discovery_stats;
 static osThreadId g_discovery_task_handle = NULL;
+static volatile uint8_t g_discovery_force_announce = 0U;
 
 static void discovery_service_tcpip_step(void *arg);
 static void discovery_service_task(void const *argument);
 
 static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t port)
 {
-  char payload[192];
+  char payload[DISCOVERY_ANNOUNCE_BUFFER_SIZE];
   char ip_text[16];
   int payload_len;
+  err_t send_err;
   struct pbuf *pb;
   ip_addr_t target_addr;
+  cluster_service_state_t cluster_state;
+  http_service_stats_t http_stats;
+  control_service_stats_t control_stats;
+  uint32_t load_score;
+  uint32_t auth_tag;
+  uint32_t enabled_mask = 0U;
+  const device_config_t *config = device_config_get();
+  uint32_t relay_index;
 
   if ((g_discovery_pcb == NULL) || !netif_is_link_up(&gnetif) || !dhcp_supplied_address(&gnetif))
   {
     return;
   }
 
+  cluster_service_get_state(&cluster_state);
+  http_service_get_stats(&http_stats);
+  control_service_get_stats(&control_stats);
+  load_score = cluster_service_compute_load_score(http_stats.active_connections,
+                                                  control_stats.connections,
+                                                  control_stats.commands);
+  cluster_service_set_local_load_score(load_score);
+  auth_tag = device_config_password_tag(config);
+  for (relay_index = 0U; relay_index < DEVICE_CONFIG_RELAY_COUNT; ++relay_index)
+  {
+    if (config->relay[relay_index].enabled != 0U)
+    {
+      enabled_mask |= (1UL << relay_index);
+    }
+  }
   ip4addr_ntoa_r(netif_ip4_addr(&gnetif), ip_text, sizeof(ip_text));
   payload_len = discovery_proto_build_announce(payload,
                                                sizeof(payload),
                                                DISCOVERY_SERVICE_TYPE,
-                                               DISCOVERY_CLUSTER_ID,
-                                               DISCOVERY_DEVICE_ID,
+                                               cluster_state.cluster_name,
+                                               config->device_name,
+                                               cluster_state.self_node_id,
+                                               cluster_state.role,
+                                               cluster_state.term,
+                                               load_score,
+                                               auth_tag,
+                                               board_relay_snapshot(),
+                                               enabled_mask,
+                                               config->auto_join_cluster,
                                                ip_text,
                                                DISCOVERY_UDP_PORT,
                                                gnetif.hwaddr);
+  g_discovery_stats.last_payload_len = (payload_len > 0) ? (uint32_t)payload_len : 0U;
   if ((payload_len <= 0) || ((size_t)payload_len >= sizeof(payload)))
   {
+    g_discovery_stats.tx_failures++;
+    g_discovery_stats.last_tx_err = ERR_BUF;
     return;
   }
 
@@ -82,9 +122,17 @@ static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t por
     port = DISCOVERY_UDP_PORT;
   }
 
-  if (udp_sendto(g_discovery_pcb, pb, &target_addr, port) == ERR_OK)
+  g_discovery_stats.tx_attempts++;
+  send_err = udp_sendto(g_discovery_pcb, pb, &target_addr, port);
+  if (send_err == ERR_OK)
   {
     g_discovery_stats.announce_packets++;
+    g_discovery_stats.last_tx_err = ERR_OK;
+  }
+  else
+  {
+    g_discovery_stats.tx_failures++;
+    g_discovery_stats.last_tx_err = (int32_t)send_err;
   }
 
   pbuf_free(pb);
@@ -116,8 +164,10 @@ static void discovery_service_ensure_multicast_membership(void)
 
 static void discovery_service_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port)
 {
-  char payload[96];
+  char payload[256];
   u16_t copy_len;
+  discovery_proto_announce_t announce;
+  cluster_node_t node;
 
   LWIP_UNUSED_ARG(arg);
   LWIP_UNUSED_ARG(pcb);
@@ -138,6 +188,28 @@ static void discovery_service_udp_recv(void *arg, struct udp_pcb *pcb, struct pb
   {
     g_discovery_stats.discover_packets++;
     discovery_service_udp_send_announce(addr, port);
+  }
+  else if (discovery_proto_parse_announce(payload, copy_len, &announce) != 0U)
+  {
+    if (strcmp(announce.service, DISCOVERY_SERVICE_TYPE) == 0)
+    {
+      memset(&node, 0, sizeof(node));
+      node.valid = 1U;
+      node.auto_join = announce.auto_join;
+      node.role = announce.role;
+      node.node_id = announce.node_id;
+      node.ip_addr = ip4_addr_get_u32(ip_2_ip4(addr));
+      node.last_seen_ms = HAL_GetTick();
+      node.load_score = announce.load_score;
+      node.term = announce.term;
+      node.relay_mask = announce.relay_mask;
+      node.enabled_mask = announce.enabled_mask;
+      node.auth_tag = announce.auth_tag;
+      memcpy(node.node_name, announce.device, sizeof(node.node_name));
+      memcpy(node.cluster_name, announce.cluster, sizeof(node.cluster_name));
+      memcpy(node.mac, announce.mac, sizeof(node.mac));
+      cluster_service_note_remote_node(&node);
+    }
   }
 
   pbuf_free(p);
@@ -161,6 +233,11 @@ void discovery_service_init(void)
 void discovery_service_poll(void)
 {
   discovery_service_init();
+}
+
+void discovery_service_force_announce(void)
+{
+  g_discovery_force_announce = 1U;
 }
 
 static void discovery_service_tcpip_step(void *arg)
@@ -206,6 +283,14 @@ static void discovery_service_tcpip_step(void *arg)
 
     if ((int32_t)(now - g_discovery_next_announce_ms) >= 0)
     {
+      discovery_service_send_multicast_announce();
+      discovery_service_send_broadcast_announce();
+      g_discovery_next_announce_ms = now + DISCOVERY_ANNOUNCE_INTERVAL_MS;
+    }
+
+    if (g_discovery_force_announce != 0U)
+    {
+      g_discovery_force_announce = 0U;
       discovery_service_send_multicast_announce();
       discovery_service_send_broadcast_announce();
       g_discovery_next_announce_ms = now + DISCOVERY_ANNOUNCE_INTERVAL_MS;

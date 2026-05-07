@@ -1,6 +1,7 @@
 #include "control_service.h"
 
 #include "control_proto.h"
+#include "control_queue.h"
 #include "relay_domain.h"
 
 #include "cmsis_os.h"
@@ -21,6 +22,7 @@ static struct tcp_pcb *g_control_listener_pcb = NULL;
 static control_service_stats_t g_control_stats;
 static uint8_t g_control_service_started = 0U;
 static uint8_t g_control_last_link_up = 0U;
+static volatile uint8_t g_control_poll_pending = 0U;
 
 static void control_service_tcpip_step(void *arg);
 static err_t control_service_sent_close(void *arg, struct tcp_pcb *tpcb, u16_t len);
@@ -78,6 +80,7 @@ static void control_service_execute(const control_proto_command_t *command, char
 {
   char ip_text[16];
   relay_domain_result_t result;
+  HAL_StatusTypeDef queue_status;
 
   if (command == NULL)
   {
@@ -85,7 +88,24 @@ static void control_service_execute(const control_proto_command_t *command, char
     return;
   }
 
-  relay_domain_execute(command, &result);
+  memset(&result, 0, sizeof(result));
+
+  switch (command->type)
+  {
+    case CONTROL_PROTO_CMD_SET_RELAY:
+    case CONTROL_PROTO_CMD_SET_RELAY_MASK:
+    case CONTROL_PROTO_CMD_SET_RELAY_ALL:
+      queue_status = control_queue_submit(command, &result);
+      if (queue_status != HAL_OK)
+      {
+        result.error = CONTROL_PROTO_ERR_BAD_COMMAND;
+      }
+      break;
+
+    default:
+      relay_domain_execute(command, &result);
+      break;
+  }
 
   switch (command->type)
   {
@@ -232,6 +252,7 @@ static void control_service_tcpip_step(void *arg)
       control_service_close_listener();
     }
     g_control_last_link_up = 0U;
+    g_control_poll_pending = 0U;
     return;
   }
 
@@ -252,19 +273,24 @@ static void control_service_tcpip_step(void *arg)
         else
         {
           g_control_stats.errors++;
+          g_control_poll_pending = 0U;
         }
       }
       else
       {
         g_control_stats.errors++;
         (void)tcp_close(pcb);
+        g_control_poll_pending = 0U;
       }
     }
     else
     {
       g_control_stats.errors++;
+      g_control_poll_pending = 0U;
     }
   }
+
+  g_control_poll_pending = 0U;
 }
 
 void control_service_init(void)
@@ -279,8 +305,20 @@ void control_service_init(void)
 
 void control_service_poll(void)
 {
+  err_t err;
+
   control_service_init();
-  (void)tcpip_callback(control_service_tcpip_step, NULL);
+  if (g_control_poll_pending != 0U)
+  {
+    return;
+  }
+
+  g_control_poll_pending = 1U;
+  err = tcpip_callback(control_service_tcpip_step, NULL);
+  if (err != ERR_OK)
+  {
+    g_control_poll_pending = 0U;
+  }
 }
 
 void control_service_get_stats(control_service_stats_t *stats)

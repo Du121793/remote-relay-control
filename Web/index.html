@@ -1,253 +1,94 @@
-<!DOCTYPE html>
-<html lang="zh-TW">
+﻿<!DOCTYPE html>
+<html lang="zh-Hant">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>autoControl 路由器管理介面</title>
-<style>
-  :root {
-    --primary: rgb(69, 194, 222);
-    --light-blue: rgb(74, 203, 214);
-    --bg: rgb(239, 239, 239);
-    --panel-bg: #ffffff;
-    --text: #333333;
-    --border: #d8d8d8;
-    --success: #28a745;
-    --danger: #dc3545;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    font-family: "Segoe UI", "Microsoft JhengHei", sans-serif;
-    background: var(--bg);
-    color: var(--text);
-  }
-  .header {
-    background: linear-gradient(135deg, var(--light-blue), var(--primary));
-    color: #fff;
-    padding: 18px 20px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-  }
-  .header h1 {
-    margin: 0;
-    font-size: 22px;
-  }
-  .wrap {
-    max-width: 980px;
-    margin: 0 auto;
-    padding: 20px 14px;
-  }
-  .panel {
-    background: var(--panel-bg);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 16px;
-    margin-bottom: 16px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.04);
-  }
-  .panel h2 {
-    margin: 0 0 12px;
-    font-size: 18px;
-    color: var(--primary);
-  }
-  .row {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  input[type="password"] {
-    min-width: 220px;
-    padding: 10px 12px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-  }
-  button {
-    border: 0;
-    border-radius: 8px;
-    padding: 10px 14px;
-    background: var(--primary);
-    color: #fff;
-    cursor: pointer;
-  }
-  button.alt {
-    background: var(--light-blue);
-  }
-  button.danger {
-    background: var(--danger);
-  }
-  .relay-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-    gap: 10px;
-  }
-  .relay-card {
-    background: #fff;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 12px;
-    text-align: center;
-  }
-  .relay-name {
-    display: block;
-    margin-bottom: 10px;
-    font-weight: 600;
-  }
-  .switch {
-    position: relative;
-    display: inline-block;
-    width: 52px;
-    height: 28px;
-  }
-  .switch input {
-    opacity: 0;
-    width: 0;
-    height: 0;
-  }
-  .slider {
-    position: absolute;
-    inset: 0;
-    background: #c8c8c8;
-    border-radius: 28px;
-    transition: 0.2s;
-  }
-  .slider:before {
-    content: "";
-    position: absolute;
-    height: 22px;
-    width: 22px;
-    left: 3px;
-    top: 3px;
-    background: #fff;
-    border-radius: 50%;
-    transition: 0.2s;
-  }
-  input:checked + .slider {
-    background: var(--success);
-  }
-  input:checked + .slider:before {
-    transform: translateX(24px);
-  }
-  pre {
-    margin: 0;
-    padding: 14px;
-    border-radius: 10px;
-    background: #f7f7f7;
-    border: 1px solid var(--border);
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>autoControl 路由器管理介面</title>
+  <style>
+    :root{--primary:#45c2de;--primary2:#22b0d1;--bg:#f3f5f7;--border:#dbe3ea;--ok:#24a25d;--danger:#e15263;--text:#243240;--muted:#6d7a88;--warn:#ffb347}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:"Segoe UI","Microsoft JhengHei",Arial,sans-serif}
+    .topbar{background:linear-gradient(90deg,var(--primary),#5bd0d7);color:#fff;padding:14px 24px;font-size:24px;font-weight:700}
+    .shell{max-width:1260px;margin:0 auto;padding:18px}.panel{background:#fff;border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:16px;box-shadow:0 4px 14px rgba(0,0,0,.06)}
+    .title{font-size:18px;font-weight:700;color:var(--primary2);margin-bottom:10px}.sub{font-size:13px;color:var(--muted);line-height:1.5}.hidden{display:none!important}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.grow{flex:1 1 240px}.nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+    button,input,select{font:inherit}.btn,.nav button{border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}.btn:disabled{opacity:.55;cursor:not-allowed}
+    .pri,.nav button{background:var(--primary);color:#fff}.nav button.active{background:var(--primary2)}.sec{background:#edf4f8;color:var(--text)}.warn{background:var(--warn);color:#5d3d00}.danger{background:var(--danger);color:#fff}
+    label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}input,select{width:100%;border:1px solid var(--border);border-radius:9px;padding:10px 12px}
+    .checkline{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--text);font-weight:600}.checkline input{width:auto;margin:0}
+    .msg{border-radius:10px;padding:12px 14px;margin-bottom:14px;font-weight:700}.info{background:#eefaff;color:#106c87}.error{background:#ffe7ea;color:#912536}.warnbox{background:#fff4de;color:#785100}
+    .device-list,.cluster-grid{display:grid;grid-template-columns:1fr;gap:14px}.device-card,.cluster-card{border:1px solid var(--border);border-radius:12px;padding:14px;background:#fff}
+    .device-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:12px}.device-name{font-size:18px;font-weight:700}.badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700}
+    .badge-local{background:#dff7ea;color:#0d7a42}.badge-cluster{background:#e8f4fb;color:#0f7694}.device-meta{font-size:12px;color:var(--muted);line-height:1.5}
+    .relay-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}.relay-card{border:1px solid var(--border);border-radius:12px;padding:12px;background:#fafcfd}
+    .relay-name{font-size:14px;font-weight:700;word-break:break-word;min-height:20px}.relay-state{margin-top:6px;color:var(--muted);font-size:12px;font-weight:700}
+    .relay-actions{margin-top:10px;display:flex;align-items:center;justify-content:space-between;gap:8px}.relay-buttons{display:flex;align-items:center;gap:6px}
+    .sw{position:relative;width:52px;height:30px;border:0;border-radius:999px;background:#d7dee5}.sw::after{content:"";position:absolute;top:4px;left:4px;width:22px;height:22px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.22);transition:transform .18s ease}
+    .sw.on{background:var(--ok)}.sw.on::after{transform:translateX(22px)}.sw.pending{background:#9bd9e8}.panic{min-width:28px;height:28px;padding:0 8px;border:0;border-radius:8px;background:var(--danger);color:#fff;font-size:12px;font-weight:700;cursor:pointer}
+    table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid var(--border);text-align:left;font-size:14px;vertical-align:middle}th{color:var(--muted)}
+    pre{margin:0;background:#f6f8fa;border:1px solid var(--border);border-radius:10px;padding:12px;white-space:pre-wrap;word-break:break-word;font-size:12px}.pick-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}
+  </style>
 </head>
 <body>
-<div class="header">
-  <h1>autoControl 路由器管理介面</h1>
-</div>
-<div class="wrap">
-  <div class="panel">
-    <h2>登入驗證</h2>
-    <div class="row">
-      <input id="pwd" type="password" placeholder="管理密碼（預設：admin）">
-      <button onclick="login()">登入</button>
-      <button class="danger" onclick="logout()">登出</button>
+<div class="topbar">autoControl 路由器管理介面</div>
+<div class="shell">
+  <div id="msg" class="msg info hidden"></div>
+  <div id="loginView" class="panel"><div class="title">登入驗證</div><div class="row"><div class="grow"><label for="pwd">管理密碼</label><input id="pwd" type="password" placeholder="預設：admin"></div><div style="padding-top:24px"><button class="btn pri" onclick="login()">登入</button></div></div></div>
+  <div id="appView" class="hidden">
+    <div class="panel"><div class="row" style="justify-content:space-between"><div><div class="title" id="headTitle">控制中心</div><div class="sub" id="headSub">---</div></div><div class="row"><button id="goMasterBtn" class="btn warn hidden" onclick="goToMaster()">前往 Master</button><button class="btn sec" onclick="refreshAll(true,'manual')">重新整理</button><button class="btn danger" onclick="logout()">登出</button></div></div></div>
+    <div class="nav"><button id="tabBtn-home" class="active" onclick="showTab('home')">主畫面</button><button id="tabBtn-cluster" onclick="showTab('cluster')">叢集與節點</button><button id="tabBtn-settings" onclick="showTab('settings')">設定</button><button id="tabBtn-status" onclick="showTab('status')">系統狀態</button></div>
+    <div id="tab-home"><div class="panel"><div class="title">設備與繼電器</div><div class="sub">設備會依照本地或同叢集節點往下排列。一般開關只會鎖住自己，紅色「停」不會被一般控制凍結。只有 Master 可以控制繼電器。</div><div id="deviceList" class="device-list"></div></div></div>
+    <div id="tab-cluster" class="hidden"><div class="panel"><div class="title">可見節點</div><div id="clusterNodes" class="cluster-grid"></div></div></div>
+    <div id="tab-settings" class="hidden">
+      <div class="panel"><div class="title">本地叢集設定</div><div class="sub">本地裝置無論目前是 Master 還是 Member，都可以修改自己的叢集名稱、密碼與加入模式。要退出叢集可以直接改掉本地叢集設定。</div><div class="pick-row" style="margin-top:10px"><div><label for="detectedCluster">偵測到的叢集</label><select id="detectedCluster"></select></div><button class="btn sec" onclick="applyDetectedCluster()">套用選取叢集</button></div><div class="row" style="margin-top:12px"><div class="grow"><label for="cfgDevice">設備名稱</label><input id="cfgDevice"></div><div class="grow"><label for="cfgCluster">叢集名稱</label><input id="cfgCluster"></div></div><div class="row"><div class="grow"><label for="cfgPassword">叢集密碼</label><input id="cfgPassword" type="password" placeholder="留空表示清除密碼"></div><div class="grow"><label for="cfgAuto">自動加入</label><select id="cfgAuto"><option value="1">啟用</option><option value="0">停用</option></select></div></div><div class="row"><label class="checkline"><input id="cfgEnabled" type="checkbox"> <span>啟用叢集</span></label></div><div class="row"><button class="btn pri" onclick="saveClusterConfig()">儲存本地叢集設定</button></div></div>
+      <div class="panel"><div class="title">本地繼電器設定</div><table><thead><tr><th>通道</th><th>名稱</th><th>啟用</th><th>記憶狀態</th><th>開機預設開</th><th>儲存</th></tr></thead><tbody id="relayCfgBody"></tbody></table></div>
+      <div id="remoteRelayConfigPanels"></div>
     </div>
-  </div>
-
-  <div class="panel">
-    <h2>繼電器控制</h2>
-    <div class="row" style="margin-bottom:12px;">
-      <button class="alt" onclick="refreshAll()">重新整理</button>
-      <button onclick="setMask(65535)">全部開啟</button>
-      <button class="danger" onclick="setMask(0)">全部關閉</button>
-    </div>
-    <div id="relays" class="relay-grid"></div>
-  </div>
-
-  <div class="panel">
-    <h2>系統狀態</h2>
-    <pre id="status">Loading...</pre>
+    <div id="tab-status" class="hidden"><div class="panel"><div class="title">系統狀態</div><pre id="statusText">{}</pre></div></div>
   </div>
 </div>
-
 <script>
-let token = localStorage.getItem("t") || "";
-
-async function req(url, method, body) {
-  const headers = {};
-  if (token) headers["X-Auth-Token"] = token;
-  if (method === "POST") headers["Content-Type"] = "application/x-www-form-urlencoded";
-  try {
-    const res = await fetch(url, { method: method || "GET", headers, body: body || null });
-    return await res.json();
-  } catch (err) {
-    return { ok: false, error: "network_error" };
-  }
-}
-
-async function login() {
-  const data = await req("/api/login", "POST", "password=" + encodeURIComponent(document.getElementById("pwd").value));
-  if (data.token) {
-    token = String(data.token);
-    localStorage.setItem("t", token);
-    document.getElementById("pwd").value = "";
-    alert("登入成功");
-  } else {
-    alert("登入失敗：" + (data.error || "unknown"));
-  }
-  refreshAll();
-}
-
-async function logout() {
-  await req("/api/logout", "POST", "");
-  token = "";
-  localStorage.removeItem("t");
-  alert("已登出");
-  refreshAll();
-}
-
-async function setChannel(channel, value) {
-  const data = await req("/api/relay-channel", "POST", "channel=" + channel + "&value=" + value);
-  if (!data.ok) alert("控制失敗：" + (data.error || "unknown"));
-  refreshAll();
-}
-
-async function setMask(mask) {
-  const data = await req("/api/relay-mask", "POST", "mask=" + mask);
-  if (!data.ok) alert("批次控制失敗：" + (data.error || "unknown"));
-  refreshAll();
-}
-
-function renderRelays(relay) {
-  const host = document.getElementById("relays");
-  if (!relay.ok) {
-    host.innerHTML = "<div>無法取得繼電器狀態</div>";
-    return;
-  }
-
-  let html = "";
-  for (let i = 1; i <= 16; i++) {
-    const checked = relay["ch" + i] ? "checked" : "";
-    html += `
-      <div class="relay-card">
-        <span class="relay-name">Relay ${i}</span>
-        <label class="switch">
-          <input type="checkbox" ${checked} onchange="setChannel(${i}, this.checked ? 1 : 0)">
-          <span class="slider"></span>
-        </label>
-      </div>`;
-  }
-  host.innerHTML = html;
-}
-
-async function refreshAll() {
-  const session = await req("/api/session");
-  const relay = await req("/api/relay");
-  renderRelays(relay);
-  document.getElementById("status").textContent =
-    "--- Session ---\n" + JSON.stringify(session, null, 2) +
-    "\n\n--- Relay ---\n" + JSON.stringify(relay, null, 2);
-}
-
-refreshAll();
+const REMOTE_ADMIN_PASSWORD='admin';
+const state={token:null,authenticated:false,previousAuthenticated:false,clusterConfig:null,relayState:null,relayConfig:[],relayConfigLoaded:false,remoteRelayConfigs:{},remoteTokens:{},nodes:[],status:null,refreshInFlight:false,refreshPending:false,activeTab:'home',pendingLocal:{},pendingRemote:{},pollTimer:null,pollTick:0};
+const showMessage=(t,k='info')=>{const b=document.getElementById('msg');b.textContent=t;b.className=`msg ${k==='error'?'error':k==='warn'?'warnbox':'info'}`;b.classList.remove('hidden')};
+const hideMessage=()=>document.getElementById('msg').classList.add('hidden');
+const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+const bit=(m,ch)=>(((m>>>0)>>>(ch-1))&1)===1; const mutateRelayMask=(m,ch,v)=>{const x=1<<(ch-1);return v?((m|x)>>>0):((m&(~x))>>>0)}; const roleText=r=>r===2?'Master':r===1?'Member':'Standalone';
+const isMaster=()=>!!(state.clusterConfig&&(!state.clusterConfig.cluster_enabled||state.clusterConfig.is_local_master)); const masterIp=()=>state.clusterConfig&&state.clusterConfig.master_ip?state.clusterConfig.master_ip:'';
+const localPending=ch=>Object.prototype.hasOwnProperty.call(state.pendingLocal,String(ch)); const remotePending=(id,ch)=>Object.prototype.hasOwnProperty.call(state.pendingRemote,`${id}:${ch}`);
+const localRelayConfig=ch=>state.relayConfig.find(r=>Number(r.channel)===Number(ch))||null; const localRelayName=ch=>{const r=localRelayConfig(ch);return r&&r.name?r.name:`Relay ${ch}`}; const localEnabledMask=()=>state.relayConfig.reduce((m,r)=>r.enabled?(m|(1<<(Number(r.channel)-1))):m,0)>>>0;
+const remoteRelayConfig=(id,ch)=>(state.remoteRelayConfigs[String(id)]||[]).find(r=>Number(r.channel)===Number(ch))||null; const remoteRelayName=(id,ch)=>{const r=remoteRelayConfig(id,ch);return r&&r.name?r.name:`CH${ch}`};
+async function fetchJson(url,options={},useToken=true,timeoutMs=3500){const ctl=new AbortController();const tid=setTimeout(()=>ctl.abort(),timeoutMs);const opts={...options,signal:ctl.signal,headers:{...(options.headers||{})}};if(useToken&&state.token)opts.headers['X-Auth-Token']=String(state.token);try{const res=await fetch(url,opts);const text=await res.text();let data;try{data=JSON.parse(text)}catch(_){data={ok:false,error:'bad_json',raw:text}}if(!res.ok&&!data.error)data.error=`http_${res.status}`;return data}catch(err){if(err&&err.name==='AbortError')return{ok:false,error:'timeout'};return{ok:false,error:'network_error'}}finally{clearTimeout(tid)}}
+const apiFetch=(u,o={})=>fetchJson(u,o,true,3500); const apiFetchAbsolute=(u,o={})=>fetchJson(u,o,false,4000);
+async function remoteApiFetch(ip,path,options={},retry=true){async function loginRemote(){const r=await apiFetchAbsolute(`http://${ip}/api/login`,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`password=${encodeURIComponent(REMOTE_ADMIN_PASSWORD)}`});if(r.ok&&r.token){state.remoteTokens[ip]=r.token;return true}return false} if(!state.remoteTokens[ip]&&!(await loginRemote()))return{ok:false,error:'remote_login_failed'}; const opts={...options,headers:{...(options.headers||{}),'X-Auth-Token':String(state.remoteTokens[ip])}}; const r=await apiFetchAbsolute(`http://${ip}${path}`,opts); if(retry&&(r.error==='unauthorized'||r.error==='http_401')){delete state.remoteTokens[ip]; if(await loginRemote()) return remoteApiFetch(ip,path,options,false)} return r;}
+async function login(){const d=await apiFetch('/api/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`password=${encodeURIComponent(document.getElementById('pwd').value)}`}); if(!d.ok){showMessage(`登入失敗：${d.error}`,'error');return} state.token=d.token; state.authenticated=true; state.previousAuthenticated=true; document.getElementById('loginView').classList.add('hidden'); document.getElementById('appView').classList.remove('hidden'); hideMessage(); startPoller(); await refreshAll(true,'manual')}
+async function logout(){await apiFetch('/api/logout',{method:'POST'}); state.token=null; state.authenticated=false; state.previousAuthenticated=false; state.clusterConfig=null; state.relayState=null; state.nodes=[]; state.pendingLocal={}; state.pendingRemote={}; document.getElementById('appView').classList.add('hidden'); document.getElementById('loginView').classList.remove('hidden'); document.getElementById('pwd').value=''; showMessage('已登出。')}
+function showTab(name){state.activeTab=name; ['home','cluster','settings','status'].forEach(t=>{document.getElementById(`tab-${t}`).classList.toggle('hidden',t!==name); document.getElementById(`tabBtn-${t}`).classList.toggle('active',t===name)}); if(state.authenticated)refreshAll(name==='settings'||name==='status','manual')}
+function startPoller(){if(state.pollTimer)return; state.pollTimer=setInterval(()=>{if(document.hidden||!state.authenticated||state.activeTab==='settings')return; state.pollTick+=1; refreshAll(false,'poll')},3000)}
+function updateHeader(){const t=document.getElementById('headTitle'),s=document.getElementById('headSub'),b=document.getElementById('goMasterBtn'); if(!state.clusterConfig){t.textContent='控制中心'; s.textContent='---'; b.classList.add('hidden'); return} t.textContent=`${state.clusterConfig.device_name||'autoControl'} / ${roleText(state.clusterConfig.role)}`; s.textContent=`叢集：${state.clusterConfig.cluster_name||'-'} · 節點 ID：${state.clusterConfig.self_node_id} · Term：${state.clusterConfig.term}`; b.classList.toggle('hidden',isMaster()||!masterIp())}
+function fillSettings(){if(!state.clusterConfig)return; document.getElementById('cfgDevice').value=state.clusterConfig.device_name||''; document.getElementById('cfgCluster').value=state.clusterConfig.cluster_name||''; document.getElementById('cfgEnabled').checked=!!state.clusterConfig.cluster_enabled; document.getElementById('cfgAuto').value=String(state.clusterConfig.auto_join_cluster?1:0)}
+function fillDetectedClusters(){const sel=document.getElementById('detectedCluster'); const names=[...new Set(state.nodes.map(n=>n.cluster_name).filter(Boolean))]; sel.innerHTML=names.length?names.map(n=>`<option value="${esc(n)}">${esc(n)}</option>`).join(''):'<option value="">目前沒有偵測到其他叢集</option>'}
+function applyDetectedCluster(){const sel=document.getElementById('detectedCluster'); if(!sel.value){showMessage('目前沒有可套用的叢集。','warn'); return} document.getElementById('cfgCluster').value=sel.value; document.getElementById('cfgEnabled').checked=true; document.getElementById('cfgAuto').value='1'; showMessage(`已套用叢集名稱：${sel.value}`)}
+function syncPending(){if(state.relayState){Object.keys(state.pendingLocal).forEach(k=>{if(bit(state.relayState.relay_mask,Number(k))===!!state.pendingLocal[k])delete state.pendingLocal[k]})} state.nodes.forEach(n=>{for(let ch=1;ch<=16;ch++){const key=`${n.node_id}:${ch}`; if(Object.prototype.hasOwnProperty.call(state.pendingRemote,key)&&bit(n.relay_mask,ch)===!!state.pendingRemote[key]) delete state.pendingRemote[key]}})}
+function buildDeviceCards(){const cards=[]; if(state.relayState){cards.push({kind:'本地',role:state.clusterConfig?state.clusterConfig.role:0,name:state.clusterConfig&&state.clusterConfig.device_name?state.clusterConfig.device_name:'本機',ip:'',relay_mask:state.relayState.relay_mask>>>0,enabled_mask:localEnabledMask(),controllable:isMaster(),local:true})} state.nodes.filter(n=>n.same_cluster).forEach(n=>cards.push({kind:'同叢集',role:n.role,name:n.name||`Node ${n.node_id}`,ip:n.ip_text||'',relay_mask:n.relay_mask>>>0,enabled_mask:(typeof n.enabled_mask==='number'?n.enabled_mask:0xFFFF)>>>0,controllable:isMaster()&&!!n.controllable,local:false,node_id:n.node_id})); return cards}
+function effectiveMask(card){let mask=card.relay_mask>>>0; if(card.local){for(let ch=1;ch<=16;ch++)if(localPending(ch))mask=mutateRelayMask(mask,ch,!!state.pendingLocal[String(ch)])} else {for(let ch=1;ch<=16;ch++)if(remotePending(card.node_id,ch))mask=mutateRelayMask(mask,ch,!!state.pendingRemote[`${card.node_id}:${ch}`])} return mask>>>0}
+function renderHome(){const box=document.getElementById('deviceList'); const cards=buildDeviceCards(); if(!cards.length){box.innerHTML='<div class="sub">目前沒有可顯示的設備。</div>';return} box.innerHTML=cards.map(card=>{const mask=effectiveMask(card); const relays=Array.from({length:16},(_,i)=>{const ch=i+1; if(!bit(card.enabled_mask,ch))return ''; const on=bit(mask,ch), pending=card.local?localPending(ch):remotePending(card.node_id,ch), toggleDisabled=!card.controllable||pending, stopDisabled=!card.controllable; const name=card.local?localRelayName(ch):remoteRelayName(card.node_id,ch); const toggleCall=card.local?`setLocalRelay(${ch},${on?0:1})`:`setRemoteRelay(${card.node_id},${ch},${on?0:1})`; const stopCall=card.local?`setLocalRelay(${ch},0)`:`setRemoteRelay(${card.node_id},${ch},0)`; return `<div class="relay-card"><div class="relay-name">${esc(name)}</div><div class="relay-state">CH${ch} / ${on?'開':'關'}</div><div class="relay-actions"><span class="sub">${pending?'等待中':''}</span><div class="relay-buttons"><button class="sw ${on?'on':''} ${pending?'pending':''}" ${toggleDisabled?'disabled':''} onclick="${toggleCall}"></button><button class="panic" ${stopDisabled?'disabled':''} onclick="${stopCall}">停</button></div></div></div>`}).filter(Boolean).join(''); const meta=`${card.ip?`${esc(card.ip)} · `:''}${roleText(card.role)}${card.local?' · 只有 Master 可以控制本地繼電器':''}`; return `<div class="device-card"><div class="device-head"><div><div class="device-name">${esc(card.name)}</div><div class="device-meta">${meta}</div></div><span class="badge ${card.kind==='本地'?'badge-local':'badge-cluster'}">${card.kind}</span></div><div class="relay-grid">${relays||'<div class="sub">這台設備沒有啟用任何可控制繼電器。</div>'}</div></div>`}).join('')}
+function renderCluster(){const box=document.getElementById('clusterNodes'); if(!state.nodes.length){box.innerHTML='<div class="sub">目前沒有偵測到其他節點。</div>';return} box.innerHTML=state.nodes.map(n=>`<div class="cluster-card"><div class="device-name">${esc(n.name||`Node ${n.node_id}`)}</div><div class="device-meta">IP：${esc(n.ip_text||'-')}<br>叢集：${esc(n.cluster_name||'-')}<br>角色：${roleText(n.role)} · Load：${n.load} · Term：${n.term}<br>密碼匹配：${n.auth_match?'是':'否'} · 可由本頁控制：${n.controllable?'是':'否'}</div></div>`).join('')}
+function renderRelayConfig(){const body=document.getElementById('relayCfgBody'); if(!state.relayConfig.length){body.innerHTML='<tr><td colspan="6" class="sub">尚未載入本地繼電器設定。</td></tr>';return} body.innerHTML=state.relayConfig.map(r=>`<tr><td>${r.channel}</td><td><input id="relayName${r.channel}" value="${esc(r.name||'')}"></td><td><input id="relayEnabled${r.channel}" type="checkbox" ${r.enabled?'checked':''}></td><td><input id="relayRemember${r.channel}" type="checkbox" ${r.remember_state?'checked':''}></td><td><input id="relayBoot${r.channel}" type="checkbox" ${r.boot_default_on?'checked':''}></td><td><button class="btn pri" onclick="saveRelayConfig(${r.channel})">儲存</button></td></tr>`).join('')}
+function renderRemoteRelayConfigs(){const box=document.getElementById('remoteRelayConfigPanels'); const nodes=state.nodes.filter(n=>n.same_cluster&&n.controllable&&n.ip_text); if(!nodes.length){box.innerHTML='';return} box.innerHTML=nodes.map(n=>{const rows=state.remoteRelayConfigs[String(n.node_id)]||[]; if(!rows.length){return `<div class="panel"><div class="title">${esc(n.name||n.ip_text)} / 遠端繼電器設定</div><div class="sub">尚未載入遠端設定。</div></div>`} return `<div class="panel"><div class="title">${esc(n.name||n.ip_text)} / 遠端繼電器設定</div><table><thead><tr><th>通道</th><th>名稱</th><th>啟用</th><th>記憶狀態</th><th>開機預設開</th><th>儲存</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${r.channel}</td><td><input id="remoteRelayName_${n.node_id}_${r.channel}" value="${esc(r.name||'')}"></td><td><input id="remoteRelayEnabled_${n.node_id}_${r.channel}" type="checkbox" ${r.enabled?'checked':''}></td><td><input id="remoteRelayRemember_${n.node_id}_${r.channel}" type="checkbox" ${r.remember_state?'checked':''}></td><td><input id="remoteRelayBoot_${n.node_id}_${r.channel}" type="checkbox" ${r.boot_default_on?'checked':''}></td><td><button class="btn pri" onclick="saveRemoteRelayConfig(${n.node_id},${r.channel})">儲存</button></td></tr>`).join('')}</tbody></table></div>`}).join('')}
+function renderStatus(){document.getElementById('statusText').textContent=JSON.stringify(state.status||{},null,2)} function renderAll(){updateHeader(); fillSettings(); fillDetectedClusters(); renderHome(); renderCluster(); renderRelayConfig(); renderRemoteRelayConfigs(); renderStatus()}
+async function fetchSession(){const d=await apiFetch('/api/session'); if(!d.ok)return false; const a=!!d.authenticated; if(state.previousAuthenticated&&!a){state.token=null;state.authenticated=false;state.clusterConfig=null;state.relayState=null;state.nodes=[];state.pendingLocal={};state.pendingRemote={}; document.getElementById('appView').classList.add('hidden'); document.getElementById('loginView').classList.remove('hidden'); showMessage('目前控制權已被其他裝置接管，請重新登入。','warn'); return false} state.authenticated=a; state.previousAuthenticated=a; return a}
+const fetchClusterConfig=async()=>{const d=await apiFetch('/api/config/cluster'); if(d.ok)state.clusterConfig=d; return d.ok}; const fetchRelayState=async()=>{const d=await apiFetch('/api/relay'); if(d.ok)state.relayState=d; return d.ok}; const fetchRelayConfig=async()=>{const d=await apiFetch('/api/config/relays'); if(d.ok){state.relayConfig=Array.isArray(d.relays)?d.relays:[]; state.relayConfigLoaded=true} return d.ok}; const fetchNodes=async()=>{const d=await apiFetch('/api/cluster/nodes'); if(d.ok)state.nodes=Array.isArray(d.nodes)?d.nodes:[]; return d.ok}; const fetchStatus=async()=>{const d=await apiFetch('/api/status'); if(d.ok)state.status=d; return d.ok};
+async function fetchRemoteRelayConfigs(){for(const n of state.nodes.filter(x=>x.same_cluster&&x.controllable&&x.ip_text)){const d=await remoteApiFetch(n.ip_text,'/api/config/relays'); if(d.ok&&Array.isArray(d.relays))state.remoteRelayConfigs[String(n.node_id)]=d.relays} return true}
+function shouldPoll(name,force,source){if(force||source!=='poll')return true; const tick=state.pollTick; switch(name){case 'session': case 'clusterConfig': return (tick%3)===0; case 'relay': return state.activeTab==='home'; case 'nodes': return state.activeTab==='home'?((tick%2)===0):state.activeTab==='cluster'; case 'relayConfig': return false; case 'status': return state.activeTab==='status'&&((tick%2)===0); default:return false}}
+async function refreshAll(force=false,source='manual'){if(state.refreshInFlight){state.refreshPending=true;return} state.refreshInFlight=true; try{if(shouldPoll('session',force,source)){const ok=await fetchSession(); if(!ok){renderAll(); return}} document.getElementById('loginView').classList.add('hidden'); document.getElementById('appView').classList.remove('hidden'); const tasks=[]; if(shouldPoll('clusterConfig',force,source))tasks.push(fetchClusterConfig()); if(shouldPoll('relay',force,source))tasks.push(fetchRelayState()); if(shouldPoll('nodes',force,source))tasks.push(fetchNodes()); if((state.activeTab==='settings'&&!state.relayConfigLoaded)||force)tasks.push(fetchRelayConfig()); if(shouldPoll('status',force,source))tasks.push(fetchStatus()); await Promise.all(tasks); if(state.activeTab==='settings'&&isMaster())await fetchRemoteRelayConfigs(); syncPending(); renderAll()} finally{state.refreshInFlight=false; if(state.refreshPending){state.refreshPending=false; refreshAll(false,'poll')}}}
+async function setLocalRelay(channel,value){if(!isMaster()){showMessage('只有 Master 可以控制本地繼電器。','warn');return} state.pendingLocal[String(channel)]=!!value; renderHome(); const d=await apiFetch('/api/relay-channel',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`channel=${channel}&value=${value}`}); if(!d.ok){delete state.pendingLocal[String(channel)]; renderHome(); showMessage(d.error==='not_master'&&d.master_ip?`這台是 Member，請前往 Master：${d.master_ip}`:`本地繼電器控制失敗：${d.error}`,d.error==='not_master'?'warn':'error'); return} state.relayState=d; syncPending(); renderHome()}
+async function setRemoteRelay(nodeId,channel,value){if(!isMaster()){showMessage('只有 Master 可以控制同叢集成員。','warn');return} const key=`${nodeId}:${channel}`; state.pendingRemote[key]=!!value; renderHome(); const d=await apiFetch('/api/cluster/node-relay',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`node_id=${nodeId}&channel=${channel}&value=${value}`}); if(!d.ok){delete state.pendingRemote[key]; renderHome(); showMessage(`遠端繼電器控制失敗：${d.error}`,'error'); return} fetchNodes().then(()=>{syncPending();renderHome()})}
+async function saveClusterConfig(){const body=[`device_name=${encodeURIComponent(document.getElementById('cfgDevice').value)}`,`cluster_name=${encodeURIComponent(document.getElementById('cfgCluster').value)}`,`cluster_password=${encodeURIComponent(document.getElementById('cfgPassword').value)}`,`cluster_enabled=${document.getElementById('cfgEnabled').checked?1:0}`,`auto_join_cluster=${encodeURIComponent(document.getElementById('cfgAuto').value)}`].join('&'); const d=await apiFetch('/api/config/cluster',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}); if(!d.ok){showMessage(`儲存叢集設定失敗：${d.error}`,'error'); return} document.getElementById('cfgPassword').value=''; showMessage('本地叢集設定已更新。'); await refreshAll(true,'manual')}
+async function saveRelayConfig(channel){const body=[`channel=${channel}`,`name=${encodeURIComponent(document.getElementById(`relayName${channel}`).value)}`,`enabled=${document.getElementById(`relayEnabled${channel}`).checked?1:0}`,`remember_state=${document.getElementById(`relayRemember${channel}`).checked?1:0}`,`boot_default_on=${document.getElementById(`relayBoot${channel}`).checked?1:0}`].join('&'); const d=await apiFetch('/api/config/relay',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}); if(!d.ok){showMessage(`儲存本地繼電器設定失敗：${d.error}`,'error'); return} showMessage(`通道 ${channel} 設定已更新。`); state.relayConfigLoaded=false; await refreshAll(true,'manual')}
+async function saveRemoteRelayConfig(nodeId,channel){const node=state.nodes.find(n=>Number(n.node_id)===Number(nodeId)); if(!node||!node.ip_text){showMessage('找不到遠端節點。','error'); return} const body=[`channel=${channel}`,`name=${encodeURIComponent(document.getElementById(`remoteRelayName_${nodeId}_${channel}`).value)}`,`enabled=${document.getElementById(`remoteRelayEnabled_${nodeId}_${channel}`).checked?1:0}`,`remember_state=${document.getElementById(`remoteRelayRemember_${nodeId}_${channel}`).checked?1:0}`,`boot_default_on=${document.getElementById(`remoteRelayBoot_${nodeId}_${channel}`).checked?1:0}`].join('&'); const d=await remoteApiFetch(node.ip_text,'/api/config/relay',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}); if(!d.ok){showMessage(`遠端繼電器設定儲存失敗：${d.error}`,'error'); return} if(Array.isArray(d.relays))state.remoteRelayConfigs[String(nodeId)]=d.relays; else await fetchRemoteRelayConfigs(); showMessage(`已更新 ${node.name||node.ip_text} 的繼電器設定。`); renderAll()}
+function goToMaster(){if(!masterIp()){showMessage('目前找不到 Master。','warn'); return} window.location.href=`http://${masterIp()}/`}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.authenticated)refreshAll(false,'poll')});
+(async function(){const ok=await fetchSession(); if(ok){document.getElementById('loginView').classList.add('hidden'); document.getElementById('appView').classList.remove('hidden'); startPoller(); await refreshAll(true,'manual')} else {document.getElementById('loginView').classList.remove('hidden'); document.getElementById('appView').classList.add('hidden')}})();
 </script>
 </body>
 </html>

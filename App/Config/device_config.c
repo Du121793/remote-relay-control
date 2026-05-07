@@ -1,0 +1,619 @@
+#include "device_config.h"
+
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "stm32f7xx_hal.h"
+#include "stm32f7xx_hal_flash.h"
+#include "stm32f7xx_hal_flash_ex.h"
+#include "FreeRTOS.h"
+#include "queue.h"
+#include "task.h"
+
+static device_config_t g_device_config;
+static uint32_t g_device_config_last_flash_error = 0U;
+static QueueHandle_t g_device_config_queue = NULL;
+static TaskHandle_t g_device_config_task_handle = NULL;
+static uint8_t g_device_config_runtime_dirty = 0U;
+static uint32_t g_device_config_runtime_due_ms = 0U;
+
+#define DEVICE_CONFIG_FLASH_ADDRESS   0x081E0000UL
+#define DEVICE_CONFIG_QUEUE_LENGTH    2U
+#define DEVICE_CONFIG_WAIT_MS         2000U
+#define DEVICE_CONFIG_RUNTIME_SAVE_DELAY_MS  1500U
+
+typedef struct
+{
+  device_config_t config;
+  uint8_t *result;
+  TaskHandle_t waiting_task;
+} device_config_request_t;
+
+typedef struct
+{
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint32_t config_crc32;
+  char device_name[DEVICE_CONFIG_NAME_MAX_LEN];
+  uint8_t auto_join_cluster;
+  uint8_t cluster_enabled;
+  uint8_t reserved0[2];
+  char cluster_name[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN];
+  uint8_t cluster_password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN];
+  device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
+} device_config_v1_t;
+
+static uint8_t device_config_save_direct(const device_config_t *config);
+static void device_config_worker_task(void *argument);
+static void device_config_worker_init(void);
+static void device_config_copy_locked(device_config_t *dst);
+
+static uint32_t device_config_flash_sector(void)
+{
+#if defined(FLASH_OPTCR_nDBANK)
+  if ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U)
+  {
+    return FLASH_SECTOR_11;
+  }
+  return FLASH_SECTOR_23;
+#else
+  return FLASH_SECTOR_11;
+#endif
+}
+
+static uint32_t device_config_flash_bank(void)
+{
+#if defined(FLASH_OPTCR_nDBANK)
+  if ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U)
+  {
+    return FLASH_BANK_1;
+  }
+  return FLASH_BANK_2;
+#else
+  return FLASH_BANK_1;
+#endif
+}
+
+static uint8_t device_config_flash_erase(void)
+{
+  FLASH_EraseInitTypeDef erase_init;
+  uint32_t sector_error = 0U;
+
+  memset(&erase_init, 0, sizeof(erase_init));
+  erase_init.TypeErase = FLASH_TYPEERASE_SECTORS;
+  erase_init.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+  erase_init.Banks = device_config_flash_bank();
+  erase_init.Sector = device_config_flash_sector();
+  erase_init.NbSectors = 1U;
+
+  if (HAL_FLASHEx_Erase(&erase_init, &sector_error) != HAL_OK)
+  {
+    g_device_config_last_flash_error = HAL_FLASH_GetError();
+    return 0U;
+  }
+
+  g_device_config_last_flash_error = 0U;
+  return 1U;
+}
+
+static uint32_t device_config_crc32_bytes(const uint8_t *data, uint32_t length)
+{
+  uint32_t crc = 0xFFFFFFFFUL;
+  uint32_t i;
+  uint32_t bit;
+
+  for (i = 0U; i < length; ++i)
+  {
+    crc ^= data[i];
+    for (bit = 0U; bit < 8U; ++bit)
+    {
+      uint32_t mask = (uint32_t)(-(int32_t)(crc & 1U));
+      crc = (crc >> 1) ^ (0xEDB88320UL & mask);
+    }
+  }
+
+  return ~crc;
+}
+
+static void device_config_copy_locked(device_config_t *dst)
+{
+  taskENTER_CRITICAL();
+  *dst = g_device_config;
+  taskEXIT_CRITICAL();
+}
+
+static uint8_t device_config_v1_is_valid(const device_config_v1_t *config)
+{
+  device_config_v1_t temp;
+
+  if (config == NULL)
+  {
+    return 0U;
+  }
+
+  if (config->magic != DEVICE_CONFIG_MAGIC)
+  {
+    return 0U;
+  }
+
+  if ((config->version != 1U) || (config->size != sizeof(*config)))
+  {
+    return 0U;
+  }
+
+  temp = *config;
+  temp.config_crc32 = 0U;
+  return (config->config_crc32 ==
+          device_config_crc32_bytes((const uint8_t *)&temp, (uint32_t)sizeof(temp))) ? 1U : 0U;
+}
+
+void device_config_hash_password_text(const char *text, uint8_t hash_out[DEVICE_CONFIG_PASSWORD_HASH_LEN])
+{
+  uint32_t crc;
+  uint32_t index;
+
+  if (hash_out == NULL)
+  {
+    return;
+  }
+
+  if (text == NULL)
+  {
+    memset(hash_out, 0, DEVICE_CONFIG_PASSWORD_HASH_LEN);
+    return;
+  }
+
+  crc = device_config_crc32_bytes((const uint8_t *)text, (uint32_t)strlen(text));
+  for (index = 0U; index < DEVICE_CONFIG_PASSWORD_HASH_LEN; index += 4U)
+  {
+    hash_out[index + 0U] = (uint8_t)((crc >> 24) & 0xFFU);
+    hash_out[index + 1U] = (uint8_t)((crc >> 16) & 0xFFU);
+    hash_out[index + 2U] = (uint8_t)((crc >> 8) & 0xFFU);
+    hash_out[index + 3U] = (uint8_t)(crc & 0xFFU);
+  }
+}
+
+uint32_t device_config_password_tag(const device_config_t *config)
+{
+  uint32_t hash = 2166136261UL;
+  uint32_t index;
+  uint8_t non_zero = 0U;
+
+  if (config == NULL)
+  {
+    return 0U;
+  }
+
+  for (index = 0U; index < DEVICE_CONFIG_PASSWORD_HASH_LEN; ++index)
+  {
+    uint8_t value = config->cluster_password_hash[index];
+    if (value != 0U)
+    {
+      non_zero = 1U;
+    }
+    hash ^= value;
+    hash *= 16777619UL;
+  }
+
+  return (non_zero != 0U) ? hash : 0U;
+}
+
+void device_config_build_defaults(device_config_t *config)
+{
+  uint32_t i;
+
+  if (config == NULL)
+  {
+    return;
+  }
+
+  memset(config, 0, sizeof(*config));
+  config->magic = DEVICE_CONFIG_MAGIC;
+  config->version = DEVICE_CONFIG_VERSION;
+  config->size = (uint16_t)sizeof(*config);
+  memcpy(config->device_name, "autoControl", sizeof("autoControl"));
+  config->auto_join_cluster = 1U;
+  config->cluster_enabled = 1U;
+  memcpy(config->cluster_name, "default", sizeof("default"));
+  config->saved_relay_mask = 0U;
+
+  for (i = 0U; i < DEVICE_CONFIG_RELAY_COUNT; ++i)
+  {
+    device_config_relay_t *relay = &config->relay[i];
+    int name_len;
+
+    relay->enabled = 1U;
+    relay->remember_state = 1U;
+    relay->boot_default_on = 0U;
+    name_len = snprintf(relay->name, sizeof(relay->name), "Relay%lu", (unsigned long)(i + 1U));
+    if ((name_len < 0) || ((size_t)name_len >= sizeof(relay->name)))
+    {
+      memcpy(relay->name, "Relay", sizeof("Relay"));
+    }
+  }
+
+  config->config_crc32 = device_config_compute_crc32(config);
+}
+
+void device_config_init(void)
+{
+  device_config_t loaded;
+
+  if (device_config_load(&loaded) != 0U)
+  {
+    g_device_config = loaded;
+    return;
+  }
+
+  device_config_build_defaults(&g_device_config);
+  (void)device_config_save_direct(&g_device_config);
+  device_config_worker_init();
+}
+
+const device_config_t *device_config_get(void)
+{
+  return &g_device_config;
+}
+
+void device_config_set(const device_config_t *config)
+{
+  if (config == NULL)
+  {
+    return;
+  }
+
+  taskENTER_CRITICAL();
+  g_device_config = *config;
+  g_device_config.config_crc32 = device_config_compute_crc32(&g_device_config);
+  taskEXIT_CRITICAL();
+}
+
+uint8_t device_config_update_and_save(const device_config_t *config)
+{
+  device_config_request_t request;
+  uint8_t saved = 0U;
+
+  if (config == NULL)
+  {
+    return 0U;
+  }
+
+  taskENTER_CRITICAL();
+  g_device_config = *config;
+  g_device_config.config_crc32 = device_config_compute_crc32(&g_device_config);
+  request.config = g_device_config;
+  taskEXIT_CRITICAL();
+  device_config_worker_init();
+
+  if ((g_device_config_queue == NULL) || (g_device_config_task_handle == NULL) ||
+      (xTaskGetSchedulerState() != taskSCHEDULER_RUNNING))
+  {
+    return device_config_save_direct(&request.config);
+  }
+
+  request.result = &saved;
+  request.waiting_task = xTaskGetCurrentTaskHandle();
+  (void)ulTaskNotifyTake(pdTRUE, 0U);
+
+  if (xQueueSend(g_device_config_queue, &request, pdMS_TO_TICKS(DEVICE_CONFIG_WAIT_MS)) != pdPASS)
+  {
+    return 0U;
+  }
+
+  if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(DEVICE_CONFIG_WAIT_MS)) == 0U)
+  {
+    return 0U;
+  }
+
+  return saved;
+}
+
+uint32_t device_config_compute_crc32(const device_config_t *config)
+{
+  device_config_t temp;
+
+  if (config == NULL)
+  {
+    return 0U;
+  }
+
+  temp = *config;
+  temp.config_crc32 = 0U;
+  return device_config_crc32_bytes((const uint8_t *)&temp, (uint32_t)sizeof(temp));
+}
+
+uint8_t device_config_is_valid(const device_config_t *config)
+{
+  if (config == NULL)
+  {
+    return 0U;
+  }
+
+  if (config->magic != DEVICE_CONFIG_MAGIC)
+  {
+    return 0U;
+  }
+
+  if ((config->version != DEVICE_CONFIG_VERSION) || (config->size != sizeof(*config)))
+  {
+    return 0U;
+  }
+
+  return (config->config_crc32 == device_config_compute_crc32(config)) ? 1U : 0U;
+}
+
+uint8_t device_config_load(device_config_t *config)
+{
+  const device_config_t *stored = (const device_config_t *)DEVICE_CONFIG_FLASH_ADDRESS;
+  const device_config_v1_t *stored_v1 = (const device_config_v1_t *)DEVICE_CONFIG_FLASH_ADDRESS;
+  uint32_t index;
+
+  if (config == NULL)
+  {
+    return 0U;
+  }
+
+  memcpy(config, stored, sizeof(*config));
+  if (device_config_is_valid(config) != 0U)
+  {
+    return 1U;
+  }
+
+  if (device_config_v1_is_valid(stored_v1) != 0U)
+  {
+    memset(config, 0, sizeof(*config));
+    config->magic = DEVICE_CONFIG_MAGIC;
+    config->version = DEVICE_CONFIG_VERSION;
+    config->size = (uint16_t)sizeof(*config);
+    memcpy(config->device_name, stored_v1->device_name, sizeof(config->device_name));
+    config->auto_join_cluster = stored_v1->auto_join_cluster;
+    config->cluster_enabled = stored_v1->cluster_enabled;
+    memcpy(config->cluster_name, stored_v1->cluster_name, sizeof(config->cluster_name));
+    memcpy(config->cluster_password_hash,
+           stored_v1->cluster_password_hash,
+           sizeof(config->cluster_password_hash));
+    memcpy(config->relay, stored_v1->relay, sizeof(config->relay));
+    config->saved_relay_mask = 0U;
+    for (index = 0U; index < DEVICE_CONFIG_RELAY_COUNT; ++index)
+    {
+      if (config->relay[index].boot_default_on != 0U)
+      {
+        config->saved_relay_mask |= (1UL << index);
+      }
+    }
+    config->config_crc32 = device_config_compute_crc32(config);
+    return 1U;
+  }
+
+  return 0U;
+}
+
+uint8_t device_config_save(const device_config_t *config)
+{
+  return device_config_save_direct(config);
+}
+
+static uint8_t device_config_save_direct(const device_config_t *config)
+{
+  const uint32_t *src32;
+  uint32_t offset;
+  device_config_t temp;
+
+  if ((config == NULL) || (device_config_is_valid(config) == 0U))
+  {
+    return 0U;
+  }
+
+  temp = *config;
+  temp.config_crc32 = device_config_compute_crc32(&temp);
+  src32 = (const uint32_t *)&temp;
+  g_device_config_last_flash_error = 0U;
+
+  HAL_FLASH_Unlock();
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
+                         FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_ERSERR);
+
+  if (device_config_flash_erase() == 0U)
+  {
+    HAL_FLASH_Lock();
+    return 0U;
+  }
+
+  for (offset = 0U; offset < sizeof(temp); offset += sizeof(uint32_t))
+  {
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,
+                          DEVICE_CONFIG_FLASH_ADDRESS + offset,
+                          src32[offset / sizeof(uint32_t)]) != HAL_OK)
+    {
+      g_device_config_last_flash_error = HAL_FLASH_GetError();
+      HAL_FLASH_Lock();
+      return 0U;
+    }
+  }
+
+  HAL_FLASH_Lock();
+  return 1U;
+}
+
+static void device_config_worker_task(void *argument)
+{
+  device_config_request_t request;
+
+  (void)argument;
+
+  for (;;)
+  {
+    if (xQueueReceive(g_device_config_queue, &request, portMAX_DELAY) == pdPASS)
+    {
+      if (request.result != NULL)
+      {
+        *request.result = device_config_save_direct(&request.config);
+      }
+
+      if (request.waiting_task != NULL)
+      {
+        xTaskNotifyGive(request.waiting_task);
+      }
+    }
+  }
+}
+
+static void device_config_worker_init(void)
+{
+  if (g_device_config_queue != NULL)
+  {
+    return;
+  }
+
+  g_device_config_queue = xQueueCreate(DEVICE_CONFIG_QUEUE_LENGTH, sizeof(device_config_request_t));
+  if ((g_device_config_queue != NULL) && (g_device_config_task_handle == NULL))
+  {
+    (void)xTaskCreate(device_config_worker_task,
+                      "CfgSave",
+                      256U,
+                      NULL,
+                      tskIDLE_PRIORITY + 1U,
+                      &g_device_config_task_handle);
+  }
+}
+
+void device_config_reset(void)
+{
+  device_config_build_defaults(&g_device_config);
+}
+
+uint32_t device_config_last_flash_error(void)
+{
+  return g_device_config_last_flash_error;
+}
+
+uint32_t device_config_build_startup_relay_mask(const device_config_t *config)
+{
+  uint32_t mask = 0U;
+  uint32_t index;
+
+  if (config == NULL)
+  {
+    return 0U;
+  }
+
+  for (index = 0U; index < DEVICE_CONFIG_RELAY_COUNT; ++index)
+  {
+    if (config->relay[index].enabled == 0U)
+    {
+      continue;
+    }
+
+    if (config->relay[index].remember_state != 0U)
+    {
+      if ((config->saved_relay_mask & (1UL << index)) != 0U)
+      {
+        mask |= (1UL << index);
+      }
+    }
+    else if (config->relay[index].boot_default_on != 0U)
+    {
+      mask |= (1UL << index);
+    }
+  }
+
+  return mask;
+}
+
+uint8_t device_config_persist_runtime_relay_mask(uint32_t relay_mask)
+{
+  device_config_t config;
+  uint32_t index;
+  uint32_t new_saved_mask = 0U;
+
+  config = g_device_config;
+  for (index = 0U; index < DEVICE_CONFIG_RELAY_COUNT; ++index)
+  {
+    if ((config.relay[index].enabled != 0U) && (config.relay[index].remember_state != 0U))
+    {
+      if ((relay_mask & (1UL << index)) != 0U)
+      {
+        new_saved_mask |= (1UL << index);
+      }
+    }
+    else if ((config.saved_relay_mask & (1UL << index)) != 0U)
+    {
+      new_saved_mask |= (1UL << index);
+    }
+  }
+
+  if (new_saved_mask == config.saved_relay_mask)
+  {
+    return 1U;
+  }
+
+  config.saved_relay_mask = new_saved_mask;
+  return device_config_update_and_save(&config);
+}
+
+void device_config_runtime_relay_mask_set(uint32_t relay_mask)
+{
+  uint32_t index;
+  uint32_t new_saved_mask = 0U;
+
+  taskENTER_CRITICAL();
+  for (index = 0U; index < DEVICE_CONFIG_RELAY_COUNT; ++index)
+  {
+    if ((g_device_config.relay[index].enabled != 0U) &&
+        (g_device_config.relay[index].remember_state != 0U) &&
+        ((relay_mask & (1UL << index)) != 0U))
+    {
+      new_saved_mask |= (1UL << index);
+    }
+    else if ((g_device_config.relay[index].remember_state == 0U) &&
+             ((g_device_config.saved_relay_mask & (1UL << index)) != 0U))
+    {
+      new_saved_mask |= (1UL << index);
+    }
+  }
+
+  if (new_saved_mask != g_device_config.saved_relay_mask)
+  {
+    g_device_config.saved_relay_mask = new_saved_mask;
+    g_device_config_runtime_dirty = 1U;
+    g_device_config_runtime_due_ms = HAL_GetTick() + DEVICE_CONFIG_RUNTIME_SAVE_DELAY_MS;
+  }
+  taskEXIT_CRITICAL();
+}
+
+void device_config_poll(void)
+{
+  device_config_t snapshot;
+
+  if (g_device_config_runtime_dirty == 0U)
+  {
+    return;
+  }
+
+  if ((int32_t)(HAL_GetTick() - g_device_config_runtime_due_ms) < 0)
+  {
+    return;
+  }
+
+  device_config_copy_locked(&snapshot);
+
+  if (device_config_update_and_save(&snapshot) != 0U)
+  {
+    taskENTER_CRITICAL();
+    if (g_device_config.saved_relay_mask == snapshot.saved_relay_mask)
+    {
+      g_device_config_runtime_dirty = 0U;
+    }
+    else
+    {
+      g_device_config_runtime_due_ms = HAL_GetTick() + DEVICE_CONFIG_RUNTIME_SAVE_DELAY_MS;
+    }
+    taskEXIT_CRITICAL();
+  }
+  else
+  {
+    g_device_config_runtime_due_ms = HAL_GetTick() + DEVICE_CONFIG_RUNTIME_SAVE_DELAY_MS;
+  }
+}

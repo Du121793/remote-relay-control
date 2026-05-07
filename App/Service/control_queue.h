@@ -20,6 +20,12 @@ typedef struct
 
 void control_queue_init(void);
 HAL_StatusTypeDef control_queue_submit(const control_proto_command_t *command, relay_domain_result_t *result);
+HAL_StatusTypeDef control_queue_submit_remote(uint32_t ip_addr,
+                                              const control_proto_command_t *command,
+                                              relay_domain_result_t *result);
+HAL_StatusTypeDef control_queue_submit_remote_async(uint32_t ip_addr,
+                                                    uint32_t node_id,
+                                                    const control_proto_command_t *command);
 void control_queue_poll(void);
 void control_queue_get_stats(control_queue_stats_t *stats);
 

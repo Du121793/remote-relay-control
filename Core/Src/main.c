@@ -26,6 +26,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "board_relay.h"
+#include "cluster_service.h"
+#include "../../App/Config/device_config.h"
 #include "http_service.h"
 #include "control_service.h"
 #include "discovery_service.h"
@@ -88,9 +90,7 @@ static char g_ip_text[16];
 static char g_mask_text[16];
 static char g_gw_text[16];
 static uint32_t next_dhcp_report_ms = 0U;
-static uint32_t next_diag_report_ms = 0U;
 static const uint32_t g_dhcp_report_interval_ms = 2000U;
-static const uint32_t g_diag_report_interval_ms = 3000U;
 static uint8_t g_last_link_up = 0xFFU;
 static uint8_t g_last_dhcp_bound = 0xFFU;
 static uint8_t g_last_dhcp_state = 0xFFU;
@@ -111,9 +111,7 @@ void lwip_platform_assert(const char *msg, int line, const char *file);
 static void log_startup_banner(void);
 static const char *dhcp_state_to_string(uint8_t state);
 static void log_link_state(uint8_t link_up);
-static void log_link_progress(void);
-static void log_dhcp_state(uint8_t force_progress);
-static void log_runtime_diag(void);
+static void log_dhcp_state(void);
 static void disable_unaligned_trap_for_lwip(void);
 __attribute__((noinline, optnone, used)) static void aeabi_copy_bytes_forward(void *dst, const void *src, size_t len);
 __attribute__((noinline, optnone, used)) static void aeabi_move_bytes_safe(void *dst, const void *src, size_t len);
@@ -268,49 +266,13 @@ static const char *dhcp_state_to_string(uint8_t state)
 
 static void log_link_state(uint8_t link_up)
 {
-  if (link_up != 0U)
-  {
-    (void)snprintf(g_uart_message, sizeof(g_uart_message),
-                   "[net] link up phy=%ld\r\n",
-                   (long)g_eth_last_phy_link_state);
-    uart3_write(g_uart_message);
-    return;
-  }
-
-  log_link_progress();
-}
-
-static void log_link_progress(void)
-{
-  uint32_t bsr = 0U;
-  uint32_t bcr = 0U;
-  uint32_t physcsr = 0U;
-
-  (void)HAL_ETH_ReadPHYRegister(&heth, LAN8742.DevAddr, LAN8742_BSR, &bsr);
-  (void)HAL_ETH_ReadPHYRegister(&heth, LAN8742.DevAddr, LAN8742_BCR, &bcr);
-  (void)HAL_ETH_ReadPHYRegister(&heth, LAN8742.DevAddr, LAN8742_PHYSCSR, &physcsr);
-
   (void)snprintf(g_uart_message, sizeof(g_uart_message),
-                 "[net] link down phy=%ld started=%lu loops=%lu irq=%lu retry=%lu force=%ld bsr=0x%04lX bcr=0x%04lX phys=0x%04lX dev=%lu pwr=%ld an=%ld cfg_bsr=0x%04lX cfg_bcr=0x%04lX cfg_phys=0x%04lX\r\n",
-                 (long)g_eth_last_phy_link_state,
-                 (unsigned long)g_eth_link_thread_started,
-                 (unsigned long)g_eth_link_thread_loops,
-                 (unsigned long)g_eth_irq_count,
-                 (unsigned long)g_eth_phy_retry_count,
-                 (long)g_eth_phy_forced_mode,
-                 (unsigned long)(bsr & 0xFFFFU),
-                 (unsigned long)(bcr & 0xFFFFU),
-                 (unsigned long)(physcsr & 0xFFFFU),
-                 (unsigned long)LAN8742.DevAddr,
-                 (long)g_eth_phy_disable_power_status,
-                 (long)g_eth_phy_start_autoneg_status,
-                 (unsigned long)(g_eth_phy_bsr_after_cfg & 0xFFFFU),
-                 (unsigned long)(g_eth_phy_bcr_after_cfg & 0xFFFFU),
-                 (unsigned long)(g_eth_phy_physcsr_after_cfg & 0xFFFFU));
+                 (link_up != 0U) ? "[net] link up phy=%ld\r\n" : "[net] link down phy=%ld\r\n",
+                 (long)g_eth_last_phy_link_state);
   uart3_write(g_uart_message);
 }
 
-static void log_dhcp_state(uint8_t force_progress)
+static void log_dhcp_state(void)
 {
   struct dhcp *dhcp = netif_dhcp_data(&gnetif);
   uint8_t bound = dhcp_supplied_address(&gnetif);
@@ -325,63 +287,12 @@ static void log_dhcp_state(uint8_t force_progress)
                    "[net] dhcp bound ip=%s mask=%s gw=%s\r\n",
                    g_ip_text, g_mask_text, g_gw_text);
   }
-  else if (force_progress != 0U)
-  {
-    (void)snprintf(g_uart_message, sizeof(g_uart_message),
-                   "[net] dhcp %s tx=%lu rx=%lu irq=%lu\r\n",
-                   dhcp_state_to_string(state),
-                   (unsigned long)g_eth_tx_packets,
-                   (unsigned long)g_eth_rx_packets,
-                   (unsigned long)g_eth_irq_count);
-  }
   else
   {
     (void)snprintf(g_uart_message, sizeof(g_uart_message),
                    "[net] dhcp %s\r\n",
                    dhcp_state_to_string(state));
   }
-  uart3_write(g_uart_message);
-}
-
-static void log_runtime_diag(void)
-{
-  http_service_stats_t http_stats;
-  control_service_stats_t control_stats;
-  discovery_service_stats_t discovery_stats;
-  UBaseType_t default_stack_hw = 0U;
-
-  http_service_get_stats(&http_stats);
-  control_service_get_stats(&control_stats);
-  discovery_service_get_stats(&discovery_stats);
-
-  if (defaultTaskHandle != NULL)
-  {
-    default_stack_hw = uxTaskGetStackHighWaterMark(defaultTaskHandle);
-  }
-
-  (void)snprintf(g_uart_message, sizeof(g_uart_message),
-                 "[diag] heap=%lu min=%lu stack=%lu http=%lu/%lu/%lu ctl=%lu/%lu/%lu disc=%lu/%lu/%lu mem=%lu/%lu/%lu tcp=%lu/%lu seg=%lu/%lu pbuf=%lu/%lu\r\n",
-                 (unsigned long)xPortGetFreeHeapSize(),
-                 (unsigned long)xPortGetMinimumEverFreeHeapSize(),
-                 (unsigned long)default_stack_hw,
-                 (unsigned long)http_stats.active_connections,
-                 (unsigned long)http_stats.close_pending_connections,
-                 (unsigned long)http_stats.listener_up,
-                 (unsigned long)control_stats.commands,
-                 (unsigned long)control_stats.errors,
-                 (unsigned long)control_stats.listener_up,
-                 (unsigned long)discovery_stats.rx_packets,
-                 (unsigned long)discovery_stats.announce_packets,
-                 (unsigned long)discovery_stats.discover_packets,
-                 (unsigned long)lwip_stats.mem.avail,
-                 (unsigned long)lwip_stats.mem.used,
-                 (unsigned long)lwip_stats.mem.err,
-                 (unsigned long)MEMP_STATS_GET(used, MEMP_TCP_PCB),
-                 (unsigned long)MEMP_STATS_GET(max, MEMP_TCP_PCB),
-                 (unsigned long)MEMP_STATS_GET(used, MEMP_TCP_SEG),
-                 (unsigned long)MEMP_STATS_GET(max, MEMP_TCP_SEG),
-                 (unsigned long)MEMP_STATS_GET(used, MEMP_PBUF),
-                 (unsigned long)MEMP_STATS_GET(max, MEMP_PBUF));
   uart3_write(g_uart_message);
 }
 
@@ -405,7 +316,6 @@ static void disable_unaligned_trap_for_lwip(void)
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
@@ -436,7 +346,6 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -444,6 +353,9 @@ int main(void)
   MX_ADC1_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
+  device_config_init();
+  (void)board_relay_apply_mask(device_config_build_startup_relay_mask(device_config_get()));
+  cluster_service_init();
   log_startup_banner();
 
   /* USER CODE END 2 */
@@ -712,7 +624,6 @@ void StartDefaultTask(void const * argument)
   MX_LWIP_Init();
   uart3_write("[boot] lwip initialized\r\n");
   next_dhcp_report_ms = HAL_GetTick() + g_dhcp_report_interval_ms;
-  next_diag_report_ms = HAL_GetTick() + g_diag_report_interval_ms;
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
   for(;;)
@@ -729,29 +640,17 @@ void StartDefaultTask(void const * argument)
       log_link_state(link_up);
     }
 
-    if ((link_up == 0U) && ((int32_t)(now - next_dhcp_report_ms) >= 0))
-    {
-      log_link_progress();
-      next_dhcp_report_ms = now + g_dhcp_report_interval_ms;
-    }
-
     if ((dhcp_bound != g_last_dhcp_bound) || (dhcp_state != g_last_dhcp_state))
     {
       g_last_dhcp_bound = dhcp_bound;
       g_last_dhcp_state = dhcp_state;
-      log_dhcp_state(0U);
+      log_dhcp_state();
       next_dhcp_report_ms = now + g_dhcp_report_interval_ms;
     }
     else if ((link_up != 0U) && (dhcp_bound == 0U) && ((int32_t)(now - next_dhcp_report_ms) >= 0))
     {
-      log_dhcp_state(1U);
+      log_dhcp_state();
       next_dhcp_report_ms = now + g_dhcp_report_interval_ms;
-    }
-
-    if ((int32_t)(now - next_diag_report_ms) >= 0)
-    {
-      log_runtime_diag();
-      next_diag_report_ms = now + g_diag_report_interval_ms;
     }
 
     if (g_eth_tx_packets != g_eth_tx_free_packets)
@@ -760,7 +659,10 @@ void StartDefaultTask(void const * argument)
     }
 
     control_service_poll();
+    discovery_service_poll();
+    cluster_service_poll();
     http_service_poll();
+    device_config_poll();
 
     osDelay(100);
   }

@@ -209,23 +209,19 @@ NMI_Handler     PROC
                 EXPORT  NMI_Handler                [WEAK]
                 B       .
                 ENDP
-HardFault_Handler\
-                PROC
+HardFault_Handler PROC
                 EXPORT  HardFault_Handler          [WEAK]
                 B       .
                 ENDP
-MemManage_Handler\
-                PROC
+MemManage_Handler PROC
                 EXPORT  MemManage_Handler          [WEAK]
                 B       .
                 ENDP
-BusFault_Handler\
-                PROC
+BusFault_Handler PROC
                 EXPORT  BusFault_Handler           [WEAK]
                 B       .
                 ENDP
-UsageFault_Handler\
-                PROC
+UsageFault_Handler PROC
                 EXPORT  UsageFault_Handler         [WEAK]
                 B       .
                 ENDP
@@ -233,8 +229,7 @@ SVC_Handler     PROC
                 EXPORT  SVC_Handler                [WEAK]
                 B       .
                 ENDP
-DebugMon_Handler\
-                PROC
+DebugMon_Handler PROC
                 EXPORT  DebugMon_Handler           [WEAK]
                 B       .
                 ENDP
