@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "ethernetif.h"
+#include "fault_service.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -128,10 +129,9 @@ void hardfault_dump(uint32_t *stack, uint32_t exc_lr)
                  (unsigned long)r3,
                  (unsigned long)r12);
   panic_uart_write(message);
-
-  for (;;)
-  {
-  }
+  fault_service_record_hardfault(stack, exc_lr);
+  HAL_Delay(20U);
+  NVIC_SystemReset();
 }
 
 /* USER CODE END 0 */
@@ -188,7 +188,21 @@ void MemManage_Handler(void)
   while (1)
   {
     /* USER CODE BEGIN W1_MemoryManagement_IRQn 0 */
-    panic_uart_write_once("\r\n[fault] MemManage\r\n");
+    char message[160];
+    if (g_panic_latched == 0U)
+    {
+      g_panic_latched = 1U;
+      (void)snprintf(message, sizeof(message),
+                     "\r\n[fault] MemManage CFSR=0x%08lX HFSR=0x%08lX MMFAR=0x%08lX BFAR=0x%08lX\r\n",
+                     (unsigned long)SCB->CFSR,
+                     (unsigned long)SCB->HFSR,
+                     (unsigned long)SCB->MMFAR,
+                     (unsigned long)SCB->BFAR);
+      panic_uart_write(message);
+      fault_service_record_simple(FAULT_SERVICE_TYPE_MEMMANAGE);
+      HAL_Delay(20U);
+      NVIC_SystemReset();
+    }
     /* USER CODE END W1_MemoryManagement_IRQn 0 */
   }
 }
@@ -205,6 +219,9 @@ void BusFault_Handler(void)
   {
     /* USER CODE BEGIN W1_BusFault_IRQn 0 */
     panic_uart_write_once("\r\n[fault] BusFault\r\n");
+    fault_service_record_simple(FAULT_SERVICE_TYPE_BUSFAULT);
+    HAL_Delay(20U);
+    NVIC_SystemReset();
     /* USER CODE END W1_BusFault_IRQn 0 */
   }
 }
@@ -221,6 +238,9 @@ void UsageFault_Handler(void)
   {
     /* USER CODE BEGIN W1_UsageFault_IRQn 0 */
     panic_uart_write_once("\r\n[fault] UsageFault\r\n");
+    fault_service_record_simple(FAULT_SERVICE_TYPE_USAGEFAULT);
+    HAL_Delay(20U);
+    NVIC_SystemReset();
     /* USER CODE END W1_UsageFault_IRQn 0 */
   }
 }

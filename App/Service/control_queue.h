@@ -6,6 +6,7 @@
 #include "main.h"
 #include "control_proto.h"
 #include "relay_domain.h"
+#include "../Config/device_config.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,6 +27,8 @@ HAL_StatusTypeDef control_queue_submit_remote(uint32_t ip_addr,
 HAL_StatusTypeDef control_queue_submit_remote_async(uint32_t ip_addr,
                                                     uint32_t node_id,
                                                     const control_proto_command_t *command);
+HAL_StatusTypeDef control_queue_submit_backend_sync_async(uint32_t ip_addr,
+                                                          const device_config_t *config);
 void control_queue_poll(void);
 void control_queue_get_stats(control_queue_stats_t *stats);
 

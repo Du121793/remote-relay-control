@@ -1,0 +1,13 @@
+{
+  "name": "backend-test",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Express + TCP backend for autoControl long-link testing",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

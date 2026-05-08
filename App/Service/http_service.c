@@ -3,6 +3,7 @@
 #include "cmsis_os.h"
 
 #include "board_relay.h"
+#include "backend_link_service.h"
 #include "control_proto.h"
 #include "control_queue.h"
 #include "control_service.h"
@@ -66,6 +67,7 @@ static uint8_t g_http_service_started = 0U;
 static uint8_t g_http_last_link_up = 0U;
 static volatile uint8_t g_http_poll_pending = 0U;
 static uint32_t g_http_poll_skip_count = 0U;
+static uint32_t g_http_backend_sync_last_ms = 0U;
 static char g_http_request_buffer[HTTP_REQUEST_BUFFER_SIZE];
 static char g_http_response_buffer[HTTP_BODY_BUFFER_SIZE];
 
@@ -91,6 +93,7 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
 static void http_service_format_relay_config_json(char *buffer, size_t buffer_size);
 static uint8_t http_service_get_master_ip_text(char *buffer, size_t buffer_size, uint8_t *is_local_master);
 static uint8_t http_service_is_master_control_allowed(char *master_ip_text, size_t buffer_size);
+static void http_service_sync_backend_config_to_cluster_async(void);
 static size_t http_service_bounded_text_len(const char *text, size_t max_len);
 static void http_service_json_escape_copy(char *dst, size_t dst_size, const char *src, size_t src_max_len);
 
@@ -301,6 +304,8 @@ static void http_service_close(struct tcp_pcb *tpcb, http_service_connection_t *
 
 static void http_service_close_listener(void)
 {
+  err_t err;
+
   if (g_http_listener_pcb == NULL)
   {
     return;
@@ -309,7 +314,11 @@ static void http_service_close_listener(void)
   http_service_log_status("[http] listener down\r\n");
   tcp_arg(g_http_listener_pcb, NULL);
   tcp_accept(g_http_listener_pcb, NULL);
-  (void)tcp_close(g_http_listener_pcb);
+  err = tcp_close(g_http_listener_pcb);
+  if (err != ERR_OK)
+  {
+    tcp_abort(g_http_listener_pcb);
+  }
   g_http_listener_pcb = NULL;
 }
 
@@ -668,6 +677,7 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
   char gw_text[16];
   control_service_stats_t control_stats;
   discovery_service_stats_t discovery_stats;
+  backend_link_stats_t backend_stats;
   cluster_service_state_t cluster_state;
   size_t heap_free = xPortGetFreeHeapSize();
   size_t heap_min = xPortGetMinimumEverFreeHeapSize();
@@ -679,6 +689,7 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
 
   control_service_get_stats(&control_stats);
   discovery_service_get_stats(&discovery_stats);
+  backend_link_service_get_stats(&backend_stats);
   cluster_service_get_state(&cluster_state);
   (void)ip4addr_ntoa_r(netif_ip4_addr(&gnetif), ip_text, sizeof(ip_text));
   (void)ip4addr_ntoa_r(netif_ip4_netmask(&gnetif), mask_text, sizeof(mask_text));
@@ -706,13 +717,14 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  "\"netmask\":\"%s\","
                  "\"gateway\":\"%s\","
                  "\"relay_mask\":%lu,"
-                 "\"cluster\":{\"enabled\":%u,\"name\":\"%s\",\"role\":%u,\"join_mode\":%u,\"self_node_id\":%lu,\"master_node_id\":%lu,\"term\":%lu},"
+                 "\"cluster\":{\"enabled\":%u,\"name\":\"%s\",\"role\":%u,\"join_mode\":%u,\"self_node_id\":%lu,\"master_node_id\":%lu,\"term\":%lu,\"master_eligible\":%u,\"health_score\":%lu,\"health_lateness_ms\":%lu,\"health_bad_streak\":%lu},"
                  "\"ports\":{\"control\":41000,\"discovery\":40000,\"http\":80},"
                  "\"rtos\":{\"heap_free\":%lu,\"heap_min\":%lu},"
                  "\"control\":{\"connections\":%lu,\"commands\":%lu,\"errors\":%lu,\"listener_up\":%lu},"
                  "\"discovery\":{\"rx\":%lu,\"tx_attempts\":%lu,\"announce\":%lu,\"tx_failures\":%lu,\"discover\":%lu,\"last_tx_err\":%ld,\"last_payload_len\":%lu},"
                  "\"auth\":{\"required\":1,\"active_session\":%u,\"sessions_issued\":%lu,\"login_failures\":%lu},"
                  "\"http\":{\"connections\":%lu,\"requests\":%lu,\"errors\":%lu,\"active\":%lu,\"close_pending\":%lu,\"listener_up\":%lu},"
+                 "\"backend\":{\"connected\":%u,\"should_run\":%u,\"port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"sent_hello\":%lu,\"sent_heartbeat\":%lu,\"sent_status\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"last_error\":%lu},"
                  "\"lwip\":{\"mem_avail\":%lu,\"mem_used\":%lu,\"mem_err\":%lu,\"tcp_pcb_used\":%lu,\"tcp_pcb_max\":%lu,\"tcp_seg_used\":%lu,\"tcp_seg_max\":%lu,\"pbuf_used\":%lu,\"pbuf_max\":%lu}"
                  "}",
                  (unsigned long)HAL_GetTick(),
@@ -729,6 +741,10 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)cluster_state.self_node_id,
                  (unsigned long)cluster_state.master_node_id,
                  (unsigned long)cluster_state.term,
+                 (unsigned int)cluster_state.master_eligible,
+                 (unsigned long)cluster_state.health_score,
+                 (unsigned long)cluster_state.health_lateness_ms,
+                 (unsigned long)cluster_state.health_bad_streak,
                  (unsigned long)heap_free,
                  (unsigned long)heap_min,
                  (unsigned long)control_stats.connections,
@@ -751,6 +767,17 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)http_active,
                  (unsigned long)http_close_pending,
                  (unsigned long)((g_http_listener_pcb != NULL) ? 1U : 0U),
+                 (unsigned int)backend_stats.connected,
+                 (unsigned int)backend_stats.should_run,
+                 (unsigned int)backend_stats.port,
+                 (unsigned long)backend_stats.connect_attempts,
+                 (unsigned long)backend_stats.connect_failures,
+                 (unsigned long)backend_stats.sent_hello,
+                 (unsigned long)backend_stats.sent_heartbeat,
+                 (unsigned long)backend_stats.sent_status,
+                 (unsigned long)backend_stats.received_commands,
+                 (unsigned long)backend_stats.command_errors,
+                 (unsigned long)backend_stats.last_error,
                  (unsigned long)lwip_stats.mem.avail,
                  (unsigned long)lwip_stats.mem.used,
                  (unsigned long)lwip_stats.mem.err,
@@ -892,17 +919,55 @@ static uint8_t http_service_is_master_control_allowed(char *master_ip_text, size
     return 1U;
   }
 
-  if (http_service_get_master_ip_text(master_ip_text, buffer_size, &is_local_master) == 0U)
+  if ((cluster_state.role == CLUSTER_ROLE_MASTER) &&
+      (cluster_state.master_node_id == cluster_state.self_node_id))
   {
+    (void)http_service_get_master_ip_text(master_ip_text, buffer_size, &is_local_master);
     return 1U;
   }
 
-  if ((cluster_state.role == CLUSTER_ROLE_MEMBER) && (is_local_master == 0U))
+  if (http_service_get_master_ip_text(master_ip_text, buffer_size, &is_local_master) == 0U)
   {
     return 0U;
   }
 
-  return 1U;
+  return (is_local_master != 0U) ? 1U : 0U;
+}
+
+static void http_service_sync_backend_config_to_cluster_async(void)
+{
+  cluster_service_state_t cluster_state;
+  const cluster_node_t *nodes;
+  const device_config_t *config = device_config_get();
+  uint32_t count = 0U;
+  uint32_t index;
+  uint32_t local_auth_tag;
+
+  cluster_service_get_state(&cluster_state);
+  if ((cluster_state.role != CLUSTER_ROLE_MASTER) ||
+      (config->cluster_enabled == 0U) ||
+      (config->backend_key[0] == '\0'))
+  {
+    return;
+  }
+
+  nodes = cluster_service_get_nodes(&count);
+  (void)count;
+  local_auth_tag = device_config_password_tag(config);
+  for (index = 0U; index < CLUSTER_SERVICE_NODE_CAPACITY; ++index)
+  {
+    if ((nodes[index].valid == 0U) ||
+        (nodes[index].online == 0U) ||
+        (nodes[index].ip_addr == 0U) ||
+        (nodes[index].role != CLUSTER_ROLE_MEMBER) ||
+        (strcmp(nodes[index].cluster_name, config->cluster_name) != 0) ||
+        (nodes[index].auth_tag != local_auth_tag))
+    {
+      continue;
+    }
+
+    (void)control_queue_submit_backend_sync_async(nodes[index].ip_addr, config);
+  }
 }
 
 static void http_service_format_cluster_config_json(char *buffer, size_t buffer_size)
@@ -912,6 +977,7 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
   char master_ip[16];
   char device_name_json[(DEVICE_CONFIG_NAME_MAX_LEN * 2U) + 8U];
   char cluster_name_json[(DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN * 2U) + 8U];
+  char backend_host_json[(DEVICE_CONFIG_BACKEND_HOST_MAX_LEN * 2U) + 8U];
   uint8_t is_local_master = 0U;
 
   cluster_service_get_state(&cluster_state);
@@ -920,6 +986,8 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                                 config->device_name, sizeof(config->device_name));
   http_service_json_escape_copy(cluster_name_json, sizeof(cluster_name_json),
                                 config->cluster_name, sizeof(config->cluster_name));
+  http_service_json_escape_copy(backend_host_json, sizeof(backend_host_json),
+                                config->backend_host, sizeof(config->backend_host));
   (void)snprintf(buffer, buffer_size,
                  "{"
                  "\"ok\":true,"
@@ -934,7 +1002,10 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                  "\"master_node_id\":%lu,"
                  "\"term\":%lu,"
                  "\"master_ip\":\"%s\","
-                 "\"is_local_master\":%u"
+                 "\"is_local_master\":%u,"
+                 "\"backend_host\":\"%s\","
+                 "\"backend_port\":%u,"
+                 "\"backend_key_configured\":%u"
                  "}",
                  device_name_json,
                  (unsigned int)config->cluster_enabled,
@@ -947,7 +1018,10 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                  (unsigned long)cluster_state.master_node_id,
                  (unsigned long)cluster_state.term,
                  master_ip,
-                 (unsigned int)is_local_master);
+                 (unsigned int)is_local_master,
+                 backend_host_json,
+                 (unsigned int)config->backend_port,
+                 (unsigned int)(config->backend_key[0] != '\0' ? 1U : 0U));
 }
 
 static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_size)
@@ -990,7 +1064,7 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
     (void)ip4addr_ntoa_r(&ip_addr, ip_text, sizeof(ip_text));
     written = snprintf(buffer + used,
                        buffer_size - used,
-                       "%s{\"node_id\":%lu,\"ip\":%lu,\"ip_text\":\"%s\",\"role\":%u,\"term\":%lu,\"load\":%lu,\"relay_mask\":%lu,\"enabled_mask\":%lu,\"auto\":%u,\"same_cluster\":%u,\"controllable\":%u,\"auth_match\":%u,\"cluster_name\":\"%s\",\"name\":\"%s\"}",
+                       "%s{\"node_id\":%lu,\"ip\":%lu,\"ip_text\":\"%s\",\"role\":%u,\"term\":%lu,\"load\":%lu,\"relay_mask\":%lu,\"enabled_mask\":%lu,\"auto\":%u,\"online\":%u,\"device_state\":%u,\"same_cluster\":%u,\"controllable\":%u,\"auth_match\":%u,\"cluster_name\":\"%s\",\"name\":\"%s\"}",
                        (used > (size_t)20U) ? "," : "",
                        (unsigned long)nodes[index].node_id,
                        (unsigned long)nodes[index].ip_addr,
@@ -1001,6 +1075,8 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
                        (unsigned long)nodes[index].relay_mask,
                        (unsigned long)nodes[index].enabled_mask,
                        (unsigned int)nodes[index].auto_join,
+                       (unsigned int)nodes[index].online,
+                       (unsigned int)nodes[index].device_state,
                        (unsigned int)same_cluster,
                        (unsigned int)same_cluster,
                        (unsigned int)(nodes[index].auth_tag == local_auth_tag ? 1U : 0U),
@@ -1162,7 +1238,7 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
   if ((strcmp(method, "GET") == 0) &&
       ((strcmp(path, "/") == 0) || (strcmp(path, "/index.html") == 0)))
   {
-    return http_service_send_payload_streaming(connection, "200 OK", "text/html; charset=utf-8", g_http_index_html, (size_t)g_http_index_html_len);
+    return http_service_send_payload_streaming(connection, "200 OK", "text/html; charset=utf-8", WEB_INDEX_HTML, (size_t)WEB_INDEX_HTML_LEN);
   }
 
   if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/session") == 0))
@@ -1341,6 +1417,13 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/config/cluster") == 0))
   {
     device_config_t config;
+    const device_config_t *current_config = device_config_get();
+    char backend_host[DEVICE_CONFIG_BACKEND_HOST_MAX_LEN];
+    char backend_port_text[16];
+    char backend_key[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
+    uint8_t cluster_password_supplied = 0U;
+    uint8_t cluster_identity_changed = 0U;
+    uint8_t cluster_runtime_changed = 0U;
 
     if (!authenticated)
     {
@@ -1348,7 +1431,7 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
     }
 
-    config = *device_config_get();
+    config = *current_config;
 
     if (http_service_extract_form_text(body, "device_name", device_name, sizeof(device_name)))
     {
@@ -1374,6 +1457,7 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
 
     if (http_service_extract_form_text(body, "cluster_password", password_text, sizeof(password_text)))
     {
+      cluster_password_supplied = 1U;
       if (password_text[0] != '\0')
       {
         device_config_hash_password_text(password_text, config.cluster_password_hash);
@@ -1382,6 +1466,28 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
       {
         memset(config.cluster_password_hash, 0, sizeof(config.cluster_password_hash));
       }
+    }
+
+    if (http_service_extract_form_text(body, "backend_host", backend_host, sizeof(backend_host)))
+    {
+      memset(config.backend_host, 0, sizeof(config.backend_host));
+      strncpy(config.backend_host, backend_host, sizeof(config.backend_host) - 1U);
+    }
+
+    if (http_service_extract_form_text(body, "backend_port", backend_port_text, sizeof(backend_port_text)))
+    {
+      uint32_t backend_port_value = 0U;
+      if (http_service_parse_u32_value(backend_port_text, &backend_port_value) &&
+          (backend_port_value <= 65535U))
+      {
+        config.backend_port = (uint16_t)backend_port_value;
+      }
+    }
+
+    if (http_service_extract_form_text(body, "backend_key", backend_key, sizeof(backend_key)))
+    {
+      memset(config.backend_key, 0, sizeof(config.backend_key));
+      strncpy(config.backend_key, backend_key, sizeof(config.backend_key) - 1U);
     }
 
     if (config.device_name[0] == '\0')
@@ -1393,6 +1499,51 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
     if ((config.cluster_enabled != 0U) && (config.cluster_name[0] == '\0'))
     {
       http_service_format_error_json(response_body, response_body_size, "bad_cluster_name");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+
+    if (strncmp(config.cluster_name,
+                current_config->cluster_name,
+                sizeof(config.cluster_name)) != 0)
+    {
+      cluster_identity_changed = 1U;
+    }
+
+    if ((cluster_password_supplied != 0U) &&
+        (memcmp(config.cluster_password_hash,
+                current_config->cluster_password_hash,
+                sizeof(config.cluster_password_hash)) != 0))
+    {
+      cluster_identity_changed = 1U;
+    }
+
+    if ((config.cluster_enabled == 0U) || (cluster_identity_changed != 0U))
+    {
+      memset(config.backend_key, 0, sizeof(config.backend_key));
+    }
+
+    if ((config.cluster_enabled != current_config->cluster_enabled) ||
+        (config.auto_join_cluster != current_config->auto_join_cluster) ||
+        (strncmp(config.cluster_name,
+                 current_config->cluster_name,
+                 sizeof(config.cluster_name)) != 0) ||
+        ((cluster_password_supplied != 0U) &&
+         (memcmp(config.cluster_password_hash,
+                 current_config->cluster_password_hash,
+                 sizeof(config.cluster_password_hash)) != 0)))
+    {
+      cluster_runtime_changed = 1U;
+    }
+
+    if (config.backend_host[0] == '\0')
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_backend_host");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+
+    if (config.backend_port == 0U)
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_backend_port");
       return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
     }
 
@@ -1408,8 +1559,36 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
                                        response_body);
     }
 
-    cluster_service_reload_from_config();
-    discovery_service_force_announce();
+    if (cluster_runtime_changed != 0U)
+    {
+      cluster_service_reload_from_config();
+      discovery_service_force_announce();
+      {
+        cluster_service_state_t reloaded_state;
+        const cluster_node_t *nodes;
+        uint32_t count = 0U;
+        uint32_t index;
+        uint32_t local_auth_tag = device_config_password_tag(device_config_get());
+
+        cluster_service_get_state(&reloaded_state);
+        if (reloaded_state.role == CLUSTER_ROLE_MASTER)
+        {
+          nodes = cluster_service_get_nodes(&count);
+          for (index = 0U; index < CLUSTER_SERVICE_NODE_CAPACITY; ++index)
+          {
+            if ((nodes[index].valid == 0U) ||
+                (nodes[index].ip_addr == 0U) ||
+                (strcmp(nodes[index].cluster_name, reloaded_state.cluster_name) != 0) ||
+                (nodes[index].auth_tag != local_auth_tag))
+            {
+              continue;
+            }
+
+            (void)control_queue_submit_backend_sync_async(nodes[index].ip_addr, device_config_get());
+          }
+        }
+      }
+    }
     http_service_format_cluster_config_json(response_body, response_body_size);
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
@@ -1495,6 +1674,32 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
 
+  if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/cluster/forget") == 0))
+  {
+    uint32_t node_id;
+
+    if (!authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if (cluster_state.role != CLUSTER_ROLE_MASTER)
+    {
+      (void)snprintf(response_body, response_body_size,
+                     "{\"ok\":false,\"error\":\"not_master\",\"master_ip\":\"%s\"}", master_ip_text);
+      return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
+    }
+    if (!http_service_extract_form_value(body, "node_id", &node_id) ||
+        (cluster_service_remove_node(node_id) == 0U))
+    {
+      http_service_format_error_json(response_body, response_body_size, "forget_failed");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+
+    http_service_format_cluster_nodes_json(response_body, response_body_size);
+    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+  }
+
   http_service_format_error_json(response_body, response_body_size, "not_found");
   return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
 }
@@ -1561,6 +1766,12 @@ static void http_service_error(void *arg, err_t err)
 {
   http_service_connection_t *connection = (http_service_connection_t *)arg;
   char message[64];
+
+  if ((err == ERR_CLSD) || (err == ERR_RST))
+  {
+    http_service_release_connection(connection);
+    return;
+  }
 
   g_http_service_stats.errors++;
   http_service_release_connection(connection);
@@ -1692,7 +1903,7 @@ static void http_service_tcpip_step(void *arg)
     {
       g_http_service_stats.errors++;
       http_service_log_status("[http] bind err\r\n");
-      (void)tcp_close(pcb);
+      tcp_abort(pcb);
       g_http_poll_pending = 0U;
       return;
     }
@@ -1702,7 +1913,7 @@ static void http_service_tcpip_step(void *arg)
     {
       g_http_service_stats.errors++;
       http_service_log_status("[http] listen err\r\n");
-      (void)tcp_close(pcb);
+      tcp_abort(pcb);
       g_http_poll_pending = 0U;
       return;
     }
@@ -1731,8 +1942,15 @@ void http_service_init(void)
 void http_service_poll(void)
 {
   err_t err;
+  uint32_t now;
 
   http_service_init();
+  now = HAL_GetTick();
+  if ((int32_t)(now - g_http_backend_sync_last_ms) >= 10000)
+  {
+    http_service_sync_backend_config_to_cluster_async();
+    g_http_backend_sync_last_ms = now;
+  }
   if (g_http_poll_pending != 0U)
   {
     g_http_poll_skip_count++;

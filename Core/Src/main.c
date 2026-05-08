@@ -30,6 +30,7 @@
 #include "../../App/Config/device_config.h"
 #include "http_service.h"
 #include "control_service.h"
+#include "backend_link_service.h"
 #include "discovery_service.h"
 #include "lwip/stats.h"
 #include "lwip/dhcp.h"
@@ -660,8 +661,9 @@ void StartDefaultTask(void const * argument)
 
     control_service_poll();
     discovery_service_poll();
-    cluster_service_poll();
+    backend_link_service_poll();
     http_service_poll();
+    cluster_service_poll();
     device_config_poll();
 
     osDelay(100);

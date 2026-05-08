@@ -45,10 +45,27 @@ typedef struct
   device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
 } device_config_v1_t;
 
+typedef struct
+{
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint32_t config_crc32;
+  char device_name[DEVICE_CONFIG_NAME_MAX_LEN];
+  uint8_t auto_join_cluster;
+  uint8_t cluster_enabled;
+  uint8_t reserved0[2];
+  char cluster_name[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN];
+  uint8_t cluster_password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN];
+  uint32_t saved_relay_mask;
+  device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
+} device_config_v2_t;
+
 static uint8_t device_config_save_direct(const device_config_t *config);
 static void device_config_worker_task(void *argument);
 static void device_config_worker_init(void);
 static void device_config_copy_locked(device_config_t *dst);
+static uint8_t device_config_v2_is_valid(const device_config_v2_t *config);
 
 static uint32_t device_config_flash_sector(void)
 {
@@ -117,6 +134,35 @@ static uint32_t device_config_crc32_bytes(const uint8_t *data, uint32_t length)
   return ~crc;
 }
 
+static uint32_t device_config_crc32_zeroed_range(const uint8_t *data,
+                                                 uint32_t length,
+                                                 uint32_t zero_offset,
+                                                 uint32_t zero_length)
+{
+  uint32_t crc = 0xFFFFFFFFUL;
+  uint32_t i;
+  uint32_t bit;
+
+  for (i = 0U; i < length; ++i)
+  {
+    uint8_t value = data[i];
+
+    if ((i >= zero_offset) && (i < (zero_offset + zero_length)))
+    {
+      value = 0U;
+    }
+
+    crc ^= value;
+    for (bit = 0U; bit < 8U; ++bit)
+    {
+      uint32_t mask = (uint32_t)(-(int32_t)(crc & 1U));
+      crc = (crc >> 1) ^ (0xEDB88320UL & mask);
+    }
+  }
+
+  return ~crc;
+}
+
 static void device_config_copy_locked(device_config_t *dst)
 {
   taskENTER_CRITICAL();
@@ -126,8 +172,6 @@ static void device_config_copy_locked(device_config_t *dst)
 
 static uint8_t device_config_v1_is_valid(const device_config_v1_t *config)
 {
-  device_config_v1_t temp;
-
   if (config == NULL)
   {
     return 0U;
@@ -143,10 +187,35 @@ static uint8_t device_config_v1_is_valid(const device_config_v1_t *config)
     return 0U;
   }
 
-  temp = *config;
-  temp.config_crc32 = 0U;
   return (config->config_crc32 ==
-          device_config_crc32_bytes((const uint8_t *)&temp, (uint32_t)sizeof(temp))) ? 1U : 0U;
+          device_config_crc32_zeroed_range((const uint8_t *)config,
+                                           (uint32_t)sizeof(*config),
+                                           (uint32_t)offsetof(device_config_v1_t, config_crc32),
+                                           (uint32_t)sizeof(config->config_crc32))) ? 1U : 0U;
+}
+
+static uint8_t device_config_v2_is_valid(const device_config_v2_t *config)
+{
+  if (config == NULL)
+  {
+    return 0U;
+  }
+
+  if (config->magic != DEVICE_CONFIG_MAGIC)
+  {
+    return 0U;
+  }
+
+  if ((config->version != 2U) || (config->size != sizeof(*config)))
+  {
+    return 0U;
+  }
+
+  return (config->config_crc32 ==
+          device_config_crc32_zeroed_range((const uint8_t *)config,
+                                           (uint32_t)sizeof(*config),
+                                           (uint32_t)offsetof(device_config_v2_t, config_crc32),
+                                           (uint32_t)sizeof(config->config_crc32))) ? 1U : 0U;
 }
 
 void device_config_hash_password_text(const char *text, uint8_t hash_out[DEVICE_CONFIG_PASSWORD_HASH_LEN])
@@ -217,6 +286,8 @@ void device_config_build_defaults(device_config_t *config)
   config->auto_join_cluster = 1U;
   config->cluster_enabled = 1U;
   memcpy(config->cluster_name, "default", sizeof("default"));
+  memcpy(config->backend_host, "192.168.0.10", sizeof("192.168.0.10"));
+  config->backend_port = 42001U;
   config->saved_relay_mask = 0U;
 
   for (i = 0U; i < DEVICE_CONFIG_RELAY_COUNT; ++i)
@@ -249,7 +320,6 @@ void device_config_init(void)
 
   device_config_build_defaults(&g_device_config);
   (void)device_config_save_direct(&g_device_config);
-  device_config_worker_init();
 }
 
 const device_config_t *device_config_get(void)
@@ -312,16 +382,15 @@ uint8_t device_config_update_and_save(const device_config_t *config)
 
 uint32_t device_config_compute_crc32(const device_config_t *config)
 {
-  device_config_t temp;
-
   if (config == NULL)
   {
     return 0U;
   }
 
-  temp = *config;
-  temp.config_crc32 = 0U;
-  return device_config_crc32_bytes((const uint8_t *)&temp, (uint32_t)sizeof(temp));
+  return device_config_crc32_zeroed_range((const uint8_t *)config,
+                                          (uint32_t)sizeof(*config),
+                                          (uint32_t)offsetof(device_config_t, config_crc32),
+                                          (uint32_t)sizeof(config->config_crc32));
 }
 
 uint8_t device_config_is_valid(const device_config_t *config)
@@ -347,6 +416,7 @@ uint8_t device_config_is_valid(const device_config_t *config)
 uint8_t device_config_load(device_config_t *config)
 {
   const device_config_t *stored = (const device_config_t *)DEVICE_CONFIG_FLASH_ADDRESS;
+  const device_config_v2_t *stored_v2 = (const device_config_v2_t *)DEVICE_CONFIG_FLASH_ADDRESS;
   const device_config_v1_t *stored_v1 = (const device_config_v1_t *)DEVICE_CONFIG_FLASH_ADDRESS;
   uint32_t index;
 
@@ -358,6 +428,27 @@ uint8_t device_config_load(device_config_t *config)
   memcpy(config, stored, sizeof(*config));
   if (device_config_is_valid(config) != 0U)
   {
+    return 1U;
+  }
+
+  if (device_config_v2_is_valid(stored_v2) != 0U)
+  {
+    memset(config, 0, sizeof(*config));
+    config->magic = DEVICE_CONFIG_MAGIC;
+    config->version = DEVICE_CONFIG_VERSION;
+    config->size = (uint16_t)sizeof(*config);
+    memcpy(config->device_name, stored_v2->device_name, sizeof(config->device_name));
+    config->auto_join_cluster = stored_v2->auto_join_cluster;
+    config->cluster_enabled = stored_v2->cluster_enabled;
+    memcpy(config->cluster_name, stored_v2->cluster_name, sizeof(config->cluster_name));
+    memcpy(config->cluster_password_hash,
+           stored_v2->cluster_password_hash,
+           sizeof(config->cluster_password_hash));
+    config->saved_relay_mask = stored_v2->saved_relay_mask;
+    memcpy(config->relay, stored_v2->relay, sizeof(config->relay));
+    memcpy(config->backend_host, "192.168.0.10", sizeof("192.168.0.10"));
+    config->backend_port = 42001U;
+    config->config_crc32 = device_config_compute_crc32(config);
     return 1U;
   }
 
@@ -374,6 +465,8 @@ uint8_t device_config_load(device_config_t *config)
     memcpy(config->cluster_password_hash,
            stored_v1->cluster_password_hash,
            sizeof(config->cluster_password_hash));
+    memcpy(config->backend_host, "192.168.0.10", sizeof("192.168.0.10"));
+    config->backend_port = 42001U;
     memcpy(config->relay, stored_v1->relay, sizeof(config->relay));
     config->saved_relay_mask = 0U;
     for (index = 0U; index < DEVICE_CONFIG_RELAY_COUNT; ++index)

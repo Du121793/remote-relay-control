@@ -29,12 +29,20 @@ typedef enum
   CLUSTER_JOIN_AUTO = 2
 } cluster_join_mode_t;
 
+typedef enum
+{
+  CLUSTER_DEVICE_STATE_STOPPED = 0,
+  CLUSTER_DEVICE_STATE_RUNNING = 1,
+  CLUSTER_DEVICE_STATE_FROZEN = 2
+} cluster_device_state_t;
+
 typedef struct
 {
   uint8_t valid;
+  uint8_t online;
   uint8_t auto_join;
   uint8_t role;
-  uint8_t reserved;
+  uint8_t device_state;
   uint32_t node_id;
   uint32_t ip_addr;
   uint32_t last_seen_ms;
@@ -54,10 +62,14 @@ typedef struct
   uint8_t join_mode;
   uint8_t role;
   uint8_t has_master;
+  uint8_t master_eligible;
   uint32_t self_node_id;
   uint32_t master_node_id;
   uint32_t term;
   uint32_t node_count;
+  uint32_t health_score;
+  uint32_t health_lateness_ms;
+  uint32_t health_bad_streak;
   char cluster_name[CLUSTER_SERVICE_CLUSTER_NAME_LEN];
 } cluster_service_state_t;
 

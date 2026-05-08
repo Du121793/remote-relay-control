@@ -195,8 +195,10 @@ static void discovery_service_udp_recv(void *arg, struct udp_pcb *pcb, struct pb
     {
       memset(&node, 0, sizeof(node));
       node.valid = 1U;
+      node.online = 1U;
       node.auto_join = announce.auto_join;
       node.role = announce.role;
+      node.device_state = CLUSTER_DEVICE_STATE_RUNNING;
       node.node_id = announce.node_id;
       node.ip_addr = ip4_addr_get_u32(ip_2_ip4(addr));
       node.last_seen_ms = HAL_GetTick();

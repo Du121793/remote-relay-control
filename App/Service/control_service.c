@@ -1,5 +1,4 @@
 #include "control_service.h"
-
 #include "control_proto.h"
 #include "control_queue.h"
 #include "relay_domain.h"
@@ -30,6 +29,8 @@ static err_t control_service_poll_close(void *arg, struct tcp_pcb *tpcb);
 
 static void control_service_close(struct tcp_pcb *tpcb)
 {
+  err_t err;
+
   if (tpcb == NULL)
   {
     return;
@@ -39,11 +40,17 @@ static void control_service_close(struct tcp_pcb *tpcb)
   tcp_recv(tpcb, NULL);
   tcp_err(tpcb, NULL);
   tcp_poll(tpcb, NULL, 0);
-  (void)tcp_close(tpcb);
+  err = tcp_close(tpcb);
+  if (err != ERR_OK)
+  {
+    tcp_abort(tpcb);
+  }
 }
 
 static void control_service_close_listener(void)
 {
+  err_t err;
+
   if (g_control_listener_pcb == NULL)
   {
     return;
@@ -51,7 +58,11 @@ static void control_service_close_listener(void)
 
   tcp_arg(g_control_listener_pcb, NULL);
   tcp_accept(g_control_listener_pcb, NULL);
-  (void)tcp_close(g_control_listener_pcb);
+  err = tcp_close(g_control_listener_pcb);
+  if (err != ERR_OK)
+  {
+    tcp_abort(g_control_listener_pcb);
+  }
   g_control_listener_pcb = NULL;
 }
 

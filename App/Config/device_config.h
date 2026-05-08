@@ -11,8 +11,10 @@ extern "C" {
 #define DEVICE_CONFIG_NAME_MAX_LEN           32U
 #define DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN   32U
 #define DEVICE_CONFIG_PASSWORD_HASH_LEN      32U
+#define DEVICE_CONFIG_BACKEND_HOST_MAX_LEN   64U
+#define DEVICE_CONFIG_BACKEND_KEY_MAX_LEN    64U
 #define DEVICE_CONFIG_MAGIC                  0x43464731UL
-#define DEVICE_CONFIG_VERSION                2U
+#define DEVICE_CONFIG_VERSION                3U
 
 typedef struct
 {
@@ -35,6 +37,10 @@ typedef struct
   uint8_t reserved0[2];
   char cluster_name[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN];
   uint8_t cluster_password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN];
+  char backend_host[DEVICE_CONFIG_BACKEND_HOST_MAX_LEN];
+  uint16_t backend_port;
+  uint16_t reserved1;
+  char backend_key[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
   uint32_t saved_relay_mask;
   device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
 } device_config_t;
