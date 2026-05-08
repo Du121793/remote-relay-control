@@ -527,6 +527,11 @@
               <FilePath>../App/Service/backend_link_service.c</FilePath>
             </File>
             <File>
+              <FileName>mqtt_link_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Service/mqtt_link_service.c</FilePath>
+            </File>
+            <File>
               <FileName>fault_service.c</FileName>
               <FileType>1</FileType>
               <FilePath>../App/Service/fault_service.c</FilePath>

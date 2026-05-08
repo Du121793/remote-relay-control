@@ -61,11 +61,63 @@ typedef struct
   device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
 } device_config_v2_t;
 
+typedef struct
+{
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint32_t config_crc32;
+  char device_name[DEVICE_CONFIG_NAME_MAX_LEN];
+  uint8_t auto_join_cluster;
+  uint8_t cluster_enabled;
+  uint8_t reserved0[2];
+  char cluster_name[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN];
+  uint8_t cluster_password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN];
+  char backend_host[DEVICE_CONFIG_BACKEND_HOST_MAX_LEN];
+  uint16_t backend_port;
+  uint16_t reserved1;
+  char backend_key[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
+  uint32_t saved_relay_mask;
+  device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
+} device_config_v3_t;
+
+typedef struct
+{
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint32_t config_crc32;
+  char device_name[DEVICE_CONFIG_NAME_MAX_LEN];
+  uint8_t auto_join_cluster;
+  uint8_t cluster_enabled;
+  uint8_t reserved0[2];
+  char cluster_name[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN];
+  uint8_t cluster_password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN];
+  char backend_host[DEVICE_CONFIG_BACKEND_HOST_MAX_LEN];
+  uint16_t backend_port;
+  uint16_t reserved1;
+  char backend_key[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
+  uint8_t cloud_enabled;
+  uint8_t cloud_transport;
+  uint8_t reserved2[2];
+  char cloud_broker_host[DEVICE_CONFIG_CLOUD_HOST_MAX_LEN];
+  uint16_t cloud_broker_port;
+  uint16_t reserved3;
+  char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+  char cloud_device_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+  char cloud_key_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+  uint32_t saved_relay_mask;
+  device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
+} device_config_v4_t;
+
 static uint8_t device_config_save_direct(const device_config_t *config);
 static void device_config_worker_task(void *argument);
 static void device_config_worker_init(void);
 static void device_config_copy_locked(device_config_t *dst);
+static uint8_t device_config_normalize_runtime_defaults(device_config_t *config);
 static uint8_t device_config_v2_is_valid(const device_config_v2_t *config);
+static uint8_t device_config_v3_is_valid(const device_config_v3_t *config);
+static uint8_t device_config_v4_is_valid(const device_config_v4_t *config);
 
 static uint32_t device_config_flash_sector(void)
 {
@@ -218,6 +270,54 @@ static uint8_t device_config_v2_is_valid(const device_config_v2_t *config)
                                            (uint32_t)sizeof(config->config_crc32))) ? 1U : 0U;
 }
 
+static uint8_t device_config_v3_is_valid(const device_config_v3_t *config)
+{
+  if (config == NULL)
+  {
+    return 0U;
+  }
+
+  if (config->magic != DEVICE_CONFIG_MAGIC)
+  {
+    return 0U;
+  }
+
+  if ((config->version != 3U) || (config->size != sizeof(*config)))
+  {
+    return 0U;
+  }
+
+  return (config->config_crc32 ==
+          device_config_crc32_zeroed_range((const uint8_t *)config,
+                                           (uint32_t)sizeof(*config),
+                                           (uint32_t)offsetof(device_config_v3_t, config_crc32),
+                                           (uint32_t)sizeof(config->config_crc32))) ? 1U : 0U;
+}
+
+static uint8_t device_config_v4_is_valid(const device_config_v4_t *config)
+{
+  if (config == NULL)
+  {
+    return 0U;
+  }
+
+  if (config->magic != DEVICE_CONFIG_MAGIC)
+  {
+    return 0U;
+  }
+
+  if ((config->version != 4U) || (config->size != sizeof(*config)))
+  {
+    return 0U;
+  }
+
+  return (config->config_crc32 ==
+          device_config_crc32_zeroed_range((const uint8_t *)config,
+                                           (uint32_t)sizeof(*config),
+                                           (uint32_t)offsetof(device_config_v4_t, config_crc32),
+                                           (uint32_t)sizeof(config->config_crc32))) ? 1U : 0U;
+}
+
 void device_config_hash_password_text(const char *text, uint8_t hash_out[DEVICE_CONFIG_PASSWORD_HASH_LEN])
 {
   uint32_t crc;
@@ -286,8 +386,18 @@ void device_config_build_defaults(device_config_t *config)
   config->auto_join_cluster = 1U;
   config->cluster_enabled = 1U;
   memcpy(config->cluster_name, "default", sizeof("default"));
-  memcpy(config->backend_host, "192.168.0.10", sizeof("192.168.0.10"));
+  memcpy(config->backend_host, "192.168.0.139", sizeof("192.168.0.139"));
   config->backend_port = 42001U;
+  memcpy(config->backend_key, "dev-key", sizeof("dev-key"));
+  config->cloud_enabled = 0U;
+  config->cloud_transport = 1U;
+  memcpy(config->cloud_broker_host, "broker.example.com", sizeof("broker.example.com"));
+  config->cloud_broker_port = 8883U;
+  config->cloud_cluster_id[0] = '\0';
+  config->cloud_device_id[0] = '\0';
+  config->cloud_key_id[0] = '\0';
+  config->cloud_cluster_ca_fingerprint[0] = '\0';
+  config->cloud_cluster_binding_secret[0] = '\0';
   config->saved_relay_mask = 0U;
 
   for (i = 0U; i < DEVICE_CONFIG_RELAY_COUNT; ++i)
@@ -315,6 +425,11 @@ void device_config_init(void)
   if (device_config_load(&loaded) != 0U)
   {
     g_device_config = loaded;
+    if (device_config_normalize_runtime_defaults(&g_device_config) != 0U)
+    {
+      g_device_config.config_crc32 = device_config_compute_crc32(&g_device_config);
+      (void)device_config_save_direct(&g_device_config);
+    }
     return;
   }
 
@@ -416,6 +531,8 @@ uint8_t device_config_is_valid(const device_config_t *config)
 uint8_t device_config_load(device_config_t *config)
 {
   const device_config_t *stored = (const device_config_t *)DEVICE_CONFIG_FLASH_ADDRESS;
+  const device_config_v4_t *stored_v4 = (const device_config_v4_t *)DEVICE_CONFIG_FLASH_ADDRESS;
+  const device_config_v3_t *stored_v3 = (const device_config_v3_t *)DEVICE_CONFIG_FLASH_ADDRESS;
   const device_config_v2_t *stored_v2 = (const device_config_v2_t *)DEVICE_CONFIG_FLASH_ADDRESS;
   const device_config_v1_t *stored_v1 = (const device_config_v1_t *)DEVICE_CONFIG_FLASH_ADDRESS;
   uint32_t index;
@@ -428,6 +545,66 @@ uint8_t device_config_load(device_config_t *config)
   memcpy(config, stored, sizeof(*config));
   if (device_config_is_valid(config) != 0U)
   {
+    return 1U;
+  }
+
+  if (device_config_v4_is_valid(stored_v4) != 0U)
+  {
+    memset(config, 0, sizeof(*config));
+    config->magic = DEVICE_CONFIG_MAGIC;
+    config->version = DEVICE_CONFIG_VERSION;
+    config->size = (uint16_t)sizeof(*config);
+    memcpy(config->device_name, stored_v4->device_name, sizeof(config->device_name));
+    config->auto_join_cluster = stored_v4->auto_join_cluster;
+    config->cluster_enabled = stored_v4->cluster_enabled;
+    memcpy(config->cluster_name, stored_v4->cluster_name, sizeof(config->cluster_name));
+    memcpy(config->cluster_password_hash, stored_v4->cluster_password_hash, sizeof(config->cluster_password_hash));
+    memcpy(config->backend_host, stored_v4->backend_host, sizeof(config->backend_host));
+    config->backend_port = stored_v4->backend_port;
+    memcpy(config->backend_key, stored_v4->backend_key, sizeof(config->backend_key));
+    config->cloud_enabled = stored_v4->cloud_enabled;
+    config->cloud_transport = stored_v4->cloud_transport;
+    memcpy(config->cloud_broker_host, stored_v4->cloud_broker_host, sizeof(config->cloud_broker_host));
+    config->cloud_broker_port = stored_v4->cloud_broker_port;
+    memcpy(config->cloud_cluster_id, stored_v4->cloud_cluster_id, sizeof(config->cloud_cluster_id));
+    memcpy(config->cloud_device_id, stored_v4->cloud_device_id, sizeof(config->cloud_device_id));
+    memcpy(config->cloud_key_id, stored_v4->cloud_key_id, sizeof(config->cloud_key_id));
+    config->cloud_cluster_ca_fingerprint[0] = '\0';
+    config->cloud_cluster_binding_secret[0] = '\0';
+    config->saved_relay_mask = stored_v4->saved_relay_mask;
+    memcpy(config->relay, stored_v4->relay, sizeof(config->relay));
+    config->config_crc32 = device_config_compute_crc32(config);
+    return 1U;
+  }
+
+  if (device_config_v3_is_valid(stored_v3) != 0U)
+  {
+    memset(config, 0, sizeof(*config));
+    config->magic = DEVICE_CONFIG_MAGIC;
+    config->version = DEVICE_CONFIG_VERSION;
+    config->size = (uint16_t)sizeof(*config);
+    memcpy(config->device_name, stored_v3->device_name, sizeof(config->device_name));
+    config->auto_join_cluster = stored_v3->auto_join_cluster;
+    config->cluster_enabled = stored_v3->cluster_enabled;
+    memcpy(config->cluster_name, stored_v3->cluster_name, sizeof(config->cluster_name));
+    memcpy(config->cluster_password_hash,
+           stored_v3->cluster_password_hash,
+           sizeof(config->cluster_password_hash));
+    memcpy(config->backend_host, stored_v3->backend_host, sizeof(config->backend_host));
+    config->backend_port = stored_v3->backend_port;
+    memcpy(config->backend_key, stored_v3->backend_key, sizeof(config->backend_key));
+    config->cloud_enabled = 0U;
+    config->cloud_transport = 1U;
+    memcpy(config->cloud_broker_host, "broker.example.com", sizeof("broker.example.com"));
+    config->cloud_broker_port = 8883U;
+    config->cloud_cluster_id[0] = '\0';
+    config->cloud_device_id[0] = '\0';
+    config->cloud_key_id[0] = '\0';
+    config->cloud_cluster_ca_fingerprint[0] = '\0';
+    config->cloud_cluster_binding_secret[0] = '\0';
+    config->saved_relay_mask = stored_v3->saved_relay_mask;
+    memcpy(config->relay, stored_v3->relay, sizeof(config->relay));
+    config->config_crc32 = device_config_compute_crc32(config);
     return 1U;
   }
 
@@ -448,6 +625,15 @@ uint8_t device_config_load(device_config_t *config)
     memcpy(config->relay, stored_v2->relay, sizeof(config->relay));
     memcpy(config->backend_host, "192.168.0.10", sizeof("192.168.0.10"));
     config->backend_port = 42001U;
+    config->cloud_enabled = 0U;
+    config->cloud_transport = 1U;
+    memcpy(config->cloud_broker_host, "broker.example.com", sizeof("broker.example.com"));
+    config->cloud_broker_port = 8883U;
+    config->cloud_cluster_id[0] = '\0';
+    config->cloud_device_id[0] = '\0';
+    config->cloud_key_id[0] = '\0';
+    config->cloud_cluster_ca_fingerprint[0] = '\0';
+    config->cloud_cluster_binding_secret[0] = '\0';
     config->config_crc32 = device_config_compute_crc32(config);
     return 1U;
   }
@@ -467,6 +653,15 @@ uint8_t device_config_load(device_config_t *config)
            sizeof(config->cluster_password_hash));
     memcpy(config->backend_host, "192.168.0.10", sizeof("192.168.0.10"));
     config->backend_port = 42001U;
+    config->cloud_enabled = 0U;
+    config->cloud_transport = 1U;
+    memcpy(config->cloud_broker_host, "broker.example.com", sizeof("broker.example.com"));
+    config->cloud_broker_port = 8883U;
+    config->cloud_cluster_id[0] = '\0';
+    config->cloud_device_id[0] = '\0';
+    config->cloud_key_id[0] = '\0';
+    config->cloud_cluster_ca_fingerprint[0] = '\0';
+    config->cloud_cluster_binding_secret[0] = '\0';
     memcpy(config->relay, stored_v1->relay, sizeof(config->relay));
     config->saved_relay_mask = 0U;
     for (index = 0U; index < DEVICE_CONFIG_RELAY_COUNT; ++index)
@@ -481,6 +676,36 @@ uint8_t device_config_load(device_config_t *config)
   }
 
   return 0U;
+}
+
+static uint8_t device_config_normalize_runtime_defaults(device_config_t *config)
+{
+  uint8_t changed = 0U;
+
+  if (config == NULL)
+  {
+    return 0U;
+  }
+
+  if (config->backend_host[0] == '\0')
+  {
+    memcpy(config->backend_host, "192.168.0.139", sizeof("192.168.0.139"));
+    changed = 1U;
+  }
+
+  if (config->backend_port == 0U)
+  {
+    config->backend_port = 42001U;
+    changed = 1U;
+  }
+
+  if (config->backend_key[0] == '\0')
+  {
+    memcpy(config->backend_key, "dev-key", sizeof("dev-key"));
+    changed = 1U;
+  }
+
+  return changed;
 }
 
 uint8_t device_config_save(const device_config_t *config)
@@ -565,7 +790,7 @@ static void device_config_worker_init(void)
   {
     (void)xTaskCreate(device_config_worker_task,
                       "CfgSave",
-                      256U,
+                      1024U,
                       NULL,
                       tskIDLE_PRIORITY + 1U,
                       &g_device_config_task_handle);

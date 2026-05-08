@@ -6,12 +6,18 @@ const crypto = require("crypto");
 
 const HTTP_PORT = Number(process.env.HTTP_PORT || 4300);
 const TCP_PORT = Number(process.env.TCP_PORT || 42001);
+const CLOUD_BROKER_HOST = String(process.env.CLOUD_BROKER_HOST || "broker.example.com");
+const CLOUD_BROKER_PORT = Number(process.env.CLOUD_BROKER_PORT || 8883);
+const CLOUD_TRANSPORT = Number(process.env.CLOUD_TRANSPORT || 1);
 const DUPLICATE_MASTER_GRACE_MS = Number(process.env.DUPLICATE_MASTER_GRACE_MS || 15000);
 const DUPLICATE_MASTER_SCAN_MS = Number(process.env.DUPLICATE_MASTER_SCAN_MS || 2000);
 const CLIENT_STALE_MS = Number(process.env.CLIENT_STALE_MS || 12000);
+const PROVISIONING_RESEND_COOLDOWN_MS = Number(process.env.PROVISIONING_RESEND_COOLDOWN_MS || 30000);
 const REMOTE_ADMIN_PASSWORD = process.env.REMOTE_ADMIN_PASSWORD || "admin";
 const DATA_DIR = path.join(__dirname, "data");
 const KEYS_PATH = path.join(DATA_DIR, "keys.json");
+const CLOUD_DEVICES_PATH = path.join(DATA_DIR, "cloud-devices.json");
+const CLOUD_CLUSTERS_PATH = path.join(DATA_DIR, "cloud-clusters.json");
 const LEGACY_BOOTSTRAP_KEY = process.env.BACKEND_KEY || "dev-key";
 
 const DEVICE_STATE_TEXT = {
@@ -34,13 +40,18 @@ const clients = new Map();
 const events = [];
 const duplicateMasterState = new Map();
 const knownNodes = new Map();
+const cloudDevices = new Map();
+const cloudClusters = new Map();
 const sseClients = new Set();
 const remoteSessionCache = new Map();
 const relayConfirmTimers = new Map();
 const relayConfirmInflight = new Set();
 const relayConfirmDirty = new Set();
+const autoProvisionTimers = new Map();
+const helloProvisionTimers = new Map();
 let keyStore = [];
 let stateBroadcastScheduled = false;
+let cloudRegistrySaveTimer = 0;
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -51,6 +62,26 @@ function ensureDataDir() {
 function saveKeyStore() {
   ensureDataDir();
   fs.writeFileSync(KEYS_PATH, JSON.stringify({ keys: keyStore }, null, 2));
+}
+
+function saveCloudRegistry() {
+  ensureDataDir();
+  fs.writeFileSync(CLOUD_DEVICES_PATH, JSON.stringify({
+    devices: Array.from(cloudDevices.values()),
+  }, null, 2));
+  fs.writeFileSync(CLOUD_CLUSTERS_PATH, JSON.stringify({
+    clusters: Array.from(cloudClusters.values()),
+  }, null, 2));
+}
+
+function scheduleCloudRegistrySave() {
+  if (cloudRegistrySaveTimer) {
+    return;
+  }
+  cloudRegistrySaveTimer = setTimeout(() => {
+    cloudRegistrySaveTimer = 0;
+    saveCloudRegistry();
+  }, 200);
 }
 
 function createKeyRecord(label, keyText) {
@@ -81,11 +112,165 @@ function loadKeyStore() {
   if (keyStore.length === 0) {
     keyStore.push(createKeyRecord("bootstrap", LEGACY_BOOTSTRAP_KEY));
     saveKeyStore();
+    return;
+  }
+
+  if (!keyStore.some((item) => String(item.key || "").trim() === LEGACY_BOOTSTRAP_KEY)) {
+    keyStore.unshift(createKeyRecord("bootstrap", LEGACY_BOOTSTRAP_KEY));
+    saveKeyStore();
   }
 }
 
 function generateKeyText() {
   return crypto.randomBytes(24).toString("base64url");
+}
+
+function generateClusterIdentityId() {
+  return `cluster-${crypto.randomBytes(6).toString("hex")}`;
+}
+
+function generateDeviceIdentityId() {
+  return `device-${crypto.randomBytes(6).toString("hex")}`;
+}
+
+function generateCloudKeyId() {
+  return `key-${crypto.randomBytes(4).toString("hex")}`;
+}
+
+function generatePemKeyPair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  return {
+    publicPem: publicKey.export({ type: "spki", format: "pem" }).toString(),
+    privatePem: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+  };
+}
+
+function fingerprintPem(pem) {
+  return crypto.createHash("sha256").update(String(pem || ""), "utf8").digest("hex");
+}
+
+function signJson(privatePem, payload) {
+  const body = Buffer.from(JSON.stringify(payload), "utf8");
+  return crypto.sign(null, body, privatePem).toString("base64");
+}
+
+function buildClusterCaBundle(clusterId, keyId) {
+  const pair = generatePemKeyPair();
+  return {
+    caPublicPem: pair.publicPem,
+    caPrivatePem: pair.privatePem,
+    caFingerprint: fingerprintPem(pair.publicPem),
+    bindingSecret: crypto.randomBytes(32).toString("base64url"),
+    issuedForClusterId: clusterId,
+    issuedByKeyId: keyId,
+    issuedAt: nowIso(),
+  };
+}
+
+function buildDeviceCredentialBundle(clusterRecord, deviceId, deviceName, keyId) {
+  const pair = generatePemKeyPair();
+  const certificatePayload = {
+    version: 1,
+    clusterId: clusterRecord.clusterId,
+    clusterCaFingerprint: clusterRecord.caFingerprint || "",
+    deviceId,
+    deviceName,
+    keyId,
+    publicKeyPem: pair.publicPem,
+    issuedAt: nowIso(),
+    issuerKeyId: clusterRecord.keyId,
+  };
+  return {
+    devicePublicPem: pair.publicPem,
+    devicePrivatePem: pair.privatePem,
+    deviceFingerprint: fingerprintPem(pair.publicPem),
+    certificatePayload,
+    certificateSignature: signJson(clusterRecord.caPrivatePem, certificatePayload),
+  };
+}
+
+function rotateDeviceCredential(clusterRecord, record) {
+  if (!clusterRecord || !record) {
+    return null;
+  }
+  const bundle = buildDeviceCredentialBundle(
+    clusterRecord,
+    record.deviceId,
+    record.device || record.deviceId,
+    record.keyId || clusterRecord.keyId || generateCloudKeyId()
+  );
+  record.devicePublicPem = bundle.devicePublicPem;
+  record.devicePrivatePem = bundle.devicePrivatePem;
+  record.deviceFingerprint = bundle.deviceFingerprint;
+  record.certificatePayload = bundle.certificatePayload;
+  record.certificateSignature = bundle.certificateSignature;
+  record.lastUpdatedAt = nowIso();
+  return record;
+}
+
+function rotateClusterCa(clusterRecord) {
+  if (!clusterRecord) {
+    return null;
+  }
+  const bundle = buildClusterCaBundle(clusterRecord.clusterId, clusterRecord.keyId || generateCloudKeyId());
+  clusterRecord.caPublicPem = bundle.caPublicPem;
+  clusterRecord.caPrivatePem = bundle.caPrivatePem;
+  clusterRecord.caFingerprint = bundle.caFingerprint;
+  clusterRecord.bindingSecret = bundle.bindingSecret;
+  clusterRecord.lastUpdatedAt = nowIso();
+  for (const deviceRecord of cloudDevices.values()) {
+    if (deviceRecord.clusterId === clusterRecord.clusterId) {
+      rotateDeviceCredential(clusterRecord, deviceRecord);
+      cloudDevices.set(deviceRecord.registryKey, deviceRecord);
+    }
+  }
+  return clusterRecord;
+}
+
+function ensureClusterIdentityMaterial(record) {
+  if (!record) {
+    return null;
+  }
+  if (record.caPublicPem && record.caPrivatePem && record.caFingerprint && record.bindingSecret) {
+    return record;
+  }
+  const bundle = buildClusterCaBundle(record.clusterId, record.keyId || generateCloudKeyId());
+  record.caPublicPem = bundle.caPublicPem;
+  record.caPrivatePem = bundle.caPrivatePem;
+  record.caFingerprint = bundle.caFingerprint;
+  record.bindingSecret = bundle.bindingSecret;
+  record.issuedAt = record.issuedAt || bundle.issuedAt;
+  return record;
+}
+
+function ensureDeviceIdentityMaterial(clusterRecord, record) {
+  if (!clusterRecord || !record) {
+    return null;
+  }
+  if (record.devicePublicPem && record.devicePrivatePem && record.deviceFingerprint && record.certificatePayload && record.certificateSignature) {
+    return record;
+  }
+  const bundle = buildDeviceCredentialBundle(
+    clusterRecord,
+    record.deviceId,
+    record.device || record.deviceId,
+    record.keyId || clusterRecord.keyId || generateCloudKeyId()
+  );
+  record.devicePublicPem = bundle.devicePublicPem;
+  record.devicePrivatePem = bundle.devicePrivatePem;
+  record.deviceFingerprint = bundle.deviceFingerprint;
+  record.certificatePayload = bundle.certificatePayload;
+  record.certificateSignature = bundle.certificateSignature;
+  return record;
+}
+
+function sanitizeIdentitySegment(text, fallback) {
+  const normalized = String(text || "")
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return normalized || fallback;
 }
 
 function findKeyRecordBySecret(secret) {
@@ -136,8 +321,277 @@ function normalizeIp(ipText) {
   return text;
 }
 
+function cloudClusterKeyOf(record) {
+  return String(record?.cloudClusterId || "").trim() || String(record?.cluster || "").trim();
+}
+
+function cloudDeviceKeyOf(record) {
+  const clusterId = cloudClusterKeyOf(record);
+  const deviceId = String(record?.cloudDeviceId || "").trim();
+  if (!clusterId || !deviceId) {
+    return "";
+  }
+  return `${clusterId}|${deviceId}`;
+}
+
+function findCloudDeviceRecord(clusterId, deviceId) {
+  return cloudDevices.get(`${String(clusterId || "").trim()}|${String(deviceId || "").trim()}`) || null;
+}
+
+function findCloudClusterRecord(clusterId) {
+  return cloudClusters.get(String(clusterId || "").trim()) || null;
+}
+
+function buildClusterProvisioning(record) {
+  return {
+    cloud_enabled: 1,
+    cloud_transport: Number(record.transport || CLOUD_TRANSPORT),
+    cloud_broker_host: String(record.brokerHost || CLOUD_BROKER_HOST),
+    cloud_broker_port: Number(record.brokerPort || CLOUD_BROKER_PORT),
+    cloud_cluster_id: record.clusterId,
+    cloud_key_id: record.keyId,
+    cloud_cluster_ca_fingerprint: record.caFingerprint || "",
+    cloud_cluster_binding_secret: record.bindingSecret || "",
+  };
+}
+
+function buildProvisioningFormFields(provisioning) {
+  return Object.entries(provisioning)
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
+}
+
+function buildDeviceProvisioning(clusterRecord, deviceRecord) {
+  return {
+    ...buildClusterProvisioning(clusterRecord),
+    cloud_device_id: deviceRecord.deviceId,
+    cloud_key_id: deviceRecord.keyId,
+    suggested_device_name: deviceRecord.device || deviceRecord.deviceId,
+    cluster_name_hint: clusterRecord.clusterName || clusterRecord.clusterId,
+    cloud_device_fingerprint: deviceRecord.deviceFingerprint || "",
+  };
+}
+
+function buildDeviceProvisioningBundle(clusterRecord, deviceRecord) {
+  return {
+    cluster: cloudClusterSummary(clusterRecord),
+    device: cloudDeviceSummary(deviceRecord),
+    provisioning: buildDeviceProvisioning(clusterRecord, deviceRecord),
+    trustBundle: {
+      clusterCaPublicPem: clusterRecord.caPublicPem || "",
+      clusterCaFingerprint: clusterRecord.caFingerprint || "",
+      clusterBindingSecret: clusterRecord.bindingSecret || "",
+    },
+    deviceBundle: {
+      devicePublicPem: deviceRecord.devicePublicPem || "",
+      devicePrivatePem: deviceRecord.devicePrivatePem || "",
+      deviceFingerprint: deviceRecord.deviceFingerprint || "",
+      certificatePayload: deviceRecord.certificatePayload || null,
+      certificateSignature: deviceRecord.certificateSignature || "",
+    },
+  };
+}
+
+function buildProvisioningApplyPayload(clusterRecord, deviceRecord) {
+  const provisioning = buildDeviceProvisioning(clusterRecord, deviceRecord);
+  const fields = [
+    ["cloud_enabled", provisioning.cloud_enabled],
+    ["cloud_transport", provisioning.cloud_transport],
+    ["cloud_broker_host", provisioning.cloud_broker_host],
+    ["cloud_broker_port", provisioning.cloud_broker_port],
+    ["cloud_cluster_id", provisioning.cloud_cluster_id],
+    ["cloud_device_id", provisioning.cloud_device_id],
+    ["cloud_key_id", provisioning.cloud_key_id],
+    ["cloud_cluster_ca_fingerprint", provisioning.cloud_cluster_ca_fingerprint || ""],
+    ["cloud_cluster_binding_secret", provisioning.cloud_cluster_binding_secret || ""],
+  ];
+  if (provisioning.suggested_device_name) {
+    fields.push(["device_name", provisioning.suggested_device_name]);
+  }
+  return fields
+    .map(([key, value]) => `${encodeURIComponent(String(key))}=${encodeURIComponent(String(value))}`)
+    .join("&");
+}
+
+function buildProvisioningApplyMessage(clusterRecord, deviceRecord) {
+  const provisioning = buildDeviceProvisioning(clusterRecord, deviceRecord);
+  return {
+    type: "config_cloud",
+    cloud_enabled: Number(provisioning.cloud_enabled || 0),
+    cloud_transport: Number(provisioning.cloud_transport || 0),
+    cloud_broker_host: String(provisioning.cloud_broker_host || ""),
+    cloud_broker_port: Number(provisioning.cloud_broker_port || 0),
+    cloud_cluster_id: String(provisioning.cloud_cluster_id || ""),
+    cloud_device_id: String(provisioning.cloud_device_id || ""),
+    cloud_key_id: String(provisioning.cloud_key_id || ""),
+    cloud_cluster_ca_fingerprint: String(provisioning.cloud_cluster_ca_fingerprint || ""),
+    cloud_cluster_binding_secret: String(provisioning.cloud_cluster_binding_secret || ""),
+    device_name: String(provisioning.suggested_device_name || ""),
+  };
+}
+
+function needsProvisioningForClient(client, clusterRecord, deviceRecord) {
+  if (!client || !clusterRecord || !deviceRecord) {
+    return false;
+  }
+  if (String(client.cloudClusterId || "").trim() !== String(clusterRecord.clusterId || "").trim()) {
+    return true;
+  }
+  if (String(client.cloudDeviceId || "").trim() !== String(deviceRecord.deviceId || "").trim()) {
+    return true;
+  }
+  if (String(client.cloudKeyId || "").trim() !== String(deviceRecord.keyId || "").trim()) {
+    return true;
+  }
+  if (!String(client.cloudClusterBindingSecret || "").trim()) {
+    return true;
+  }
+  if (!String(client.cloudClusterCaFingerprint || "").trim()) {
+    return true;
+  }
+  if (!isFingerprintCompatible(clusterRecord.caFingerprint, client.cloudClusterCaFingerprint)) {
+    return true;
+  }
+  return false;
+}
+
+function resolveProvisioningRecords(client) {
+  const clusterId = cloudClusterKeyOf(client);
+  const clusterRecord = findCloudClusterRecord(clusterId);
+  const deviceId = String(client?.cloudDeviceId || "").trim() ||
+    deriveFallbackDeviceId(client);
+  let deviceRecord;
+
+  if (!clusterRecord || !deviceId) {
+    return { clusterRecord: null, deviceRecord: null, deviceId: "" };
+  }
+
+  deviceRecord = findCloudDeviceRecord(clusterId, deviceId);
+  if (!deviceRecord) {
+    syncCloudRegistryFromKnownNode({
+      nodeId: Number(client?.nodeId || 0),
+      device: client?.device || "",
+      cluster: client?.cluster || "",
+      ip: client?.ip || "",
+      role: Number(client?.role || 0),
+      online: 1,
+      deviceState: Number(client?.deviceState || 0),
+      relayMask: Number(client?.relayMask || 0) >>> 0,
+      sourceMasterNodeId: Number(client?.nodeId || 0),
+      cloudClusterId: clusterId,
+      cloudDeviceId: deviceId,
+      cloudKeyId: String(client?.cloudKeyId || "").trim(),
+      cloudTransport: Number(client?.cloudTransport || 0),
+      backendKey: client?.backendKey || "",
+      lastSeenAt: nowIso(),
+    });
+    deviceRecord = findCloudDeviceRecord(clusterId, deviceId);
+  }
+
+  return { clusterRecord, deviceRecord, deviceId };
+}
+
+function provisioningSignature(clusterRecord, deviceRecord) {
+  return JSON.stringify(buildProvisioningApplyMessage(clusterRecord, deviceRecord));
+}
+
+function maybeSendProvisioningToClient(client) {
+  const { clusterRecord, deviceRecord } = resolveProvisioningRecords(client);
+  let signature;
+  let lastAppliedMs;
+  if (!clusterRecord || !deviceRecord) {
+    return false;
+  }
+  if (!needsProvisioningForClient(client, clusterRecord, deviceRecord)) {
+    client.provisioningSignature = "";
+    client.provisioningSentAt = 0;
+    return false;
+  }
+  signature = provisioningSignature(clusterRecord, deviceRecord);
+  lastAppliedMs = Number(client.provisioningSentAt || 0);
+  if ((client.provisioningSignature === signature) &&
+      ((Date.now() - lastAppliedMs) < PROVISIONING_RESEND_COOLDOWN_MS)) {
+    return false;
+  }
+  if (!sendJson(client, JSON.parse(signature))) {
+    pushEvent("cloud-device-auto-apply-send-failed", {
+      nodeId: Number(client?.nodeId || 0),
+      clusterId: clusterRecord.clusterId,
+      deviceId: deviceRecord.deviceId,
+      keyId: String(deviceRecord.keyId || ""),
+    });
+    return false;
+  }
+  client.provisioningSignature = signature;
+  client.provisioningSentAt = Date.now();
+  pushEvent("cloud-device-auto-applied", {
+    nodeId: Number(client.nodeId || 0),
+    clusterId: clusterRecord.clusterId,
+    deviceId: deviceRecord.deviceId,
+    keyId: String(deviceRecord.keyId || ""),
+    via: "backend_link",
+  });
+  return true;
+}
+
+function scheduleProvisioningForClient(client, delayMs = 6000) {
+  void client;
+  void delayMs;
+}
+
+function isFingerprintCompatible(expected, reported) {
+  const expectedText = String(expected || "").trim();
+  const reportedText = String(reported || "").trim();
+  if (!expectedText || !reportedText) {
+    return true;
+  }
+  if (expectedText === reportedText) {
+    return true;
+  }
+  if (reportedText.length >= 16 && expectedText.startsWith(reportedText)) {
+    return true;
+  }
+  return false;
+}
+
+function rejectHello(client, socket, error) {
+  pushEvent("hello-reject", {
+    nodeId: Number(client?.nodeId || 0),
+    device: client?.device || "",
+    cluster: client?.cluster || "",
+    cloudClusterId: client?.cloudClusterId || "",
+    cloudDeviceId: client?.cloudDeviceId || "",
+    cloudKeyId: client?.cloudKeyId || "",
+    error,
+  });
+  sendJson(client, { type: "hello_ack", ok: false, error });
+  socket.end();
+}
+
+async function applyProvisioningToNode(node, clusterRecord, deviceRecord) {
+  const nodeId = Number(node.nodeId || 0);
+  const activeClient = findClientByNodeId(nodeId);
+
+  if (activeClient && sendJson(activeClient, buildProvisioningApplyMessage(clusterRecord, deviceRecord))) {
+    return { ok: true, via: "backend_link" };
+  }
+  throw new Error("node_not_connected");
+}
+
 function nowIso() {
   return new Date().toISOString();
+}
+
+function deriveFallbackDeviceId(source) {
+  const nodeId = Number(source?.nodeId || 0);
+  if (nodeId > 0) {
+    return `node-${nodeId}`;
+  }
+  return sanitizeIdentitySegment(source?.device || "", "node-unknown");
+}
+
+function localClusterKey(backendKey, clusterName) {
+  return `${String(backendKey || "").trim()}|${String(clusterName || "").trim()}`;
 }
 
 function isClientStale(client) {
@@ -154,10 +608,15 @@ function clientSummary(client) {
     nodeId: client.nodeId,
     device: client.device,
     cluster: client.cluster,
+    cloudTransport: Number(client.cloudTransport || 0),
+    cloudClusterId: client.cloudClusterId || "",
+    cloudDeviceId: client.cloudDeviceId || "",
+    cloudKeyId: client.cloudKeyId || "",
     ip: client.ip,
     connectedAt: client.connectedAt,
     lastMessageAt: client.lastMessageAt,
     role: client.role,
+    term: Number(client.term || 0),
     relayMask: client.relayMask,
     session: client.session,
     key: client.key,
@@ -188,13 +647,51 @@ function resolveKnownNode(nodeId) {
   return Array.from(knownNodes.values()).find((item) => Number(item.nodeId) === Number(nodeId)) || null;
 }
 
+function effectiveMasterNodeIdForGroup(backendKey, clusterName) {
+  const clusterKey = localClusterKey(backendKey, clusterName);
+  const activeMasters = Array.from(clients.values())
+    .filter((item) =>
+      localClusterKey(item.key, item.cluster) === clusterKey &&
+      !item.socket.destroyed &&
+      !isClientStale(item) &&
+      Number(item.role || 0) === 2)
+    .sort((a, b) => {
+      const termDiff = Number(b.term || 0) - Number(a.term || 0);
+      if (termDiff !== 0) {
+        return termDiff;
+      }
+      return Number(a.nodeId || 0) - Number(b.nodeId || 0);
+    });
+  if (activeMasters.length > 0) {
+    return Number(activeMasters[0].nodeId || 0);
+  }
+
+  const knownMasters = Array.from(knownNodes.values())
+    .filter((item) =>
+      localClusterKey(item.backendKey, item.cluster) === clusterKey &&
+      Number(item.online ? 1 : 0) === 1 &&
+      Number(item.role || 0) === 2)
+    .sort((a, b) => {
+      const termDiff = Number(b.term || 0) - Number(a.term || 0);
+      if (termDiff !== 0) {
+        return termDiff;
+      }
+      return Number(a.nodeId || 0) - Number(b.nodeId || 0);
+    });
+  if (knownMasters.length > 0) {
+    return Number(knownMasters[0].nodeId || 0);
+  }
+
+  return 0;
+}
+
 async function remoteNodeRequest(nodeId, pathText, form) {
   const node = resolveKnownNode(nodeId);
   let token;
   let response;
   let data;
 
-  if (!node || !node.ip || !node.online) {
+  if (!node || !node.ip) {
     throw new Error("node_offline");
   }
 
@@ -228,13 +725,67 @@ async function remoteNodeRequest(nodeId, pathText, form) {
   return data;
 }
 
+function loadCloudRegistry() {
+  ensureDataDir();
+  cloudDevices.clear();
+  cloudClusters.clear();
+  let dirty = false;
+
+  if (fs.existsSync(CLOUD_CLUSTERS_PATH)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(CLOUD_CLUSTERS_PATH, "utf8"));
+      for (const record of Array.isArray(parsed.clusters) ? parsed.clusters : []) {
+        if (record && record.clusterId) {
+          ensureClusterIdentityMaterial(record);
+          cloudClusters.set(record.clusterId, record);
+          dirty = true;
+        }
+      }
+    } catch (_error) {
+    }
+  }
+
+  if (fs.existsSync(CLOUD_DEVICES_PATH)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(CLOUD_DEVICES_PATH, "utf8"));
+      for (const record of Array.isArray(parsed.devices) ? parsed.devices : []) {
+        if (record && record.registryKey) {
+          const clusterRecord = findCloudClusterRecord(record.clusterId);
+          if (clusterRecord) {
+            ensureDeviceIdentityMaterial(clusterRecord, record);
+            dirty = true;
+          }
+          cloudDevices.set(record.registryKey, record);
+        }
+      }
+    } catch (_error) {
+    }
+  }
+
+  if (dirty) {
+    saveCloudRegistry();
+  }
+
+  for (const [registryKey, record] of Array.from(cloudDevices.entries())) {
+    if (!record) {
+      continue;
+    }
+    if (String(record.clusterId || "").trim() === "default" &&
+        String(record.deviceId || "").trim() === "autoControl" &&
+        String(record.device || "").trim() === "autoControl" &&
+        !String(record.cloudDeviceId || "").trim()) {
+      cloudDevices.delete(registryKey);
+    }
+  }
+}
+
 async function remoteNodeGetJson(nodeId, pathText) {
   const node = resolveKnownNode(nodeId);
   let token;
   let response;
   let data;
 
-  if (!node || !node.ip || !node.online) {
+  if (!node || !node.ip) {
     throw new Error("node_offline");
   }
 
@@ -273,11 +824,13 @@ function knownNodeKey(key, cluster, nodeId) {
 function upsertKnownNode(record) {
   const key = knownNodeKey(record.backendKey, record.cluster, record.nodeId);
   const existing = knownNodes.get(key) || {};
-  knownNodes.set(key, {
-    ...existing,
-    ...record,
-    lastUpdatedAt: nowIso(),
-  });
+  const merged = {
+      ...existing,
+      ...record,
+      lastUpdatedAt: nowIso(),
+    };
+  knownNodes.set(key, merged);
+  syncCloudRegistryFromKnownNode(merged);
 }
 
 function setKnownNodeRelayMask(nodeId, relayMask) {
@@ -293,6 +846,107 @@ function setKnownNodeRelayMask(nodeId, relayMask) {
     deviceState: Number(node.deviceState || 0),
   });
   scheduleStateBroadcast();
+}
+
+function syncCloudRegistryFromKnownNode(node) {
+  const clusterId = cloudClusterKeyOf(node);
+  const reportedDeviceId = String(node?.cloudDeviceId || "").trim();
+  const deviceId = reportedDeviceId || deriveFallbackDeviceId(node);
+  const reportedKeyId = String(node?.cloudKeyId || "").trim();
+  const registryKey = clusterId && deviceId ? `${clusterId}|${deviceId}` : "";
+  const seenAt = node.lastSeenAt || nowIso();
+  const clusterRecord = findCloudClusterRecord(clusterId);
+  let existingDevice;
+  let deviceRecord;
+  let effectiveKeyId;
+
+  if (!clusterId || !deviceId) {
+    return;
+  }
+
+  existingDevice = cloudDevices.get(registryKey) || {};
+  effectiveKeyId = String(reportedKeyId || existingDevice.keyId || "").trim();
+  if (!effectiveKeyId && clusterRecord) {
+    effectiveKeyId = generateCloudKeyId();
+  }
+  if (existingDevice.nodeId && Number(existingDevice.nodeId) !== Number(node.nodeId || 0)) {
+    pushEvent("cloud-device-rebind", {
+      clusterId,
+      deviceId,
+      previousNodeId: Number(existingDevice.nodeId || 0),
+      nextNodeId: Number(node.nodeId || 0),
+      previousDeviceName: existingDevice.device || "",
+      nextDeviceName: node.device || "",
+    });
+  }
+  deviceRecord = {
+    ...existingDevice,
+    registryKey,
+    clusterId,
+    deviceId,
+    keyId: effectiveKeyId,
+    enabled: existingDevice.enabled !== false,
+    transport: Number(node.cloudTransport || 0),
+    nodeId: Number(node.nodeId || 0),
+    device: node.device || existingDevice.device || "",
+    clusterName: node.cluster || existingDevice.clusterName || "",
+    ip: normalizeIp(node.ip),
+    role: Number(node.role || 0),
+    online: Number(node.online ? 1 : 0),
+    deviceState: Number(node.online ? (node.deviceState || 0) : 0),
+    relayMask: Number(node.relayMask || 0) >>> 0,
+    sourceMasterNodeId: Number(node.sourceMasterNodeId || 0),
+    backendKey: node.backendKey || existingDevice.backendKey || "",
+    firstSeenAt: existingDevice.firstSeenAt || seenAt,
+    lastSeenAt: seenAt,
+  };
+
+  if (clusterRecord) {
+    ensureClusterIdentityMaterial(clusterRecord);
+    ensureDeviceIdentityMaterial(clusterRecord, deviceRecord);
+    cloudClusters.set(clusterRecord.clusterId, clusterRecord);
+    if (!existingDevice.registryKey) {
+      pushEvent("cloud-device-auto-enrolled", {
+        clusterId,
+        deviceId,
+        keyId: effectiveKeyId,
+        nodeId: Number(node.nodeId || 0),
+        device: deviceRecord.device || deviceId,
+      });
+    }
+  }
+
+  cloudDevices.set(registryKey, deviceRecord);
+
+  const clusterDevices = Array.from(cloudDevices.values()).filter((item) => item.clusterId === clusterId);
+  const onlineDevices = clusterDevices.filter((item) => Number(item.online) === 1).length;
+  const masterDevice = clusterDevices.find((item) => Number(item.role || 0) === 2 && Number(item.online || 0) === 1)
+    || clusterDevices.find((item) => Number(item.role || 0) === 2)
+    || null;
+  const existingCluster = cloudClusters.get(clusterId) || {};
+
+  cloudClusters.set(clusterId, {
+    ...existingCluster,
+    clusterId,
+    keyId: String(existingCluster.keyId || "").trim() || effectiveKeyId,
+    enabled: existingCluster.enabled !== false,
+    transport: Number(node.cloudTransport || 0),
+    brokerHost: existingCluster.brokerHost || CLOUD_BROKER_HOST,
+    brokerPort: Number(existingCluster.brokerPort || CLOUD_BROKER_PORT),
+    backendKey: node.backendKey || existingCluster.backendKey || "",
+    clusterName: node.cluster || existingCluster.clusterName || "",
+    lastMasterNodeId: masterDevice ? Number(masterDevice.nodeId || 0) : Number(existingCluster.lastMasterNodeId || 0),
+    lastMasterDeviceId: masterDevice ? String(masterDevice.deviceId || "") : String(existingCluster.lastMasterDeviceId || ""),
+    onlineDevices,
+    knownDevices: clusterDevices.length,
+    firstSeenAt: existingCluster.firstSeenAt || seenAt,
+    lastSeenAt: seenAt,
+  });
+
+  scheduleCloudRegistrySave();
+
+  void clusterRecord;
+  void deviceRecord;
 }
 
 async function remoteNodeLogin(node) {
@@ -372,12 +1026,20 @@ async function runRelayStateConfirm(nodeId) {
 function knownNodeSummary(node) {
   const online = Number(node.online ? 1 : 0);
   const deviceState = online ? Number(node.deviceState || 0) : 0;
+  const effectiveMasterNodeId = effectiveMasterNodeIdForGroup(node.backendKey, node.cluster);
   return {
     backendKey: node.backendKey,
     cluster: node.cluster,
     nodeId: node.nodeId,
     device: node.device,
+    cloudTransport: Number(node.cloudTransport || 0),
+    cloudClusterId: node.cloudClusterId || "",
+    cloudDeviceId: node.cloudDeviceId || "",
+    cloudKeyId: node.cloudKeyId || "",
+    cloudClusterCaFingerprint: node.cloudClusterCaFingerprint || "",
+    cloudClusterBindingSecret: node.cloudClusterBindingSecret || "",
     role: node.role,
+    term: Number(node.term || 0),
     online,
     deviceState,
     deviceStateText: deviceStateText(deviceState),
@@ -385,6 +1047,51 @@ function knownNodeSummary(node) {
     ip: normalizeIp(node.ip),
     lastSeenAt: node.lastSeenAt,
     sourceMasterNodeId: node.sourceMasterNodeId,
+    effectiveMasterNodeId,
+  };
+}
+
+function cloudDeviceSummary(record) {
+  return {
+    registryKey: record.registryKey,
+    clusterId: record.clusterId,
+    deviceId: record.deviceId,
+    keyId: record.keyId,
+    enabled: record.enabled !== false,
+    transport: Number(record.transport || 0),
+    nodeId: Number(record.nodeId || 0),
+    device: record.device || "",
+    clusterName: record.clusterName || "",
+    ip: normalizeIp(record.ip),
+    role: Number(record.role || 0),
+    online: Number(record.online ? 1 : 0),
+    deviceState: Number(record.deviceState || 0),
+    deviceStateText: deviceStateText(Number(record.deviceState || 0)),
+    relayMask: Number(record.relayMask || 0) >>> 0,
+    deviceFingerprint: record.deviceFingerprint || "",
+    lastSeenAt: record.lastSeenAt || "",
+    firstSeenAt: record.firstSeenAt || "",
+    sourceMasterNodeId: Number(record.sourceMasterNodeId || 0),
+  };
+}
+
+function cloudClusterSummary(record) {
+  return {
+    clusterId: record.clusterId,
+    keyId: record.keyId,
+    enabled: record.enabled !== false,
+    transport: Number(record.transport || 0),
+    brokerHost: record.brokerHost || "",
+    brokerPort: Number(record.brokerPort || 0),
+    backendKey: record.backendKey || "",
+    clusterName: record.clusterName || "",
+    caFingerprint: record.caFingerprint || "",
+    lastMasterNodeId: Number(record.lastMasterNodeId || 0),
+    lastMasterDeviceId: record.lastMasterDeviceId || "",
+    lastSeenAt: record.lastSeenAt || "",
+    firstSeenAt: record.firstSeenAt || "",
+    onlineDevices: Number(record.onlineDevices || 0),
+    knownDevices: Number(record.knownDevices || 0),
   };
 }
 
@@ -398,6 +1105,8 @@ function buildSummarySnapshot() {
     activeClients: clientList.filter((item) => !isClientStale(item)).length,
     rawClients: clientList.length,
     knownNodes: knownNodes.size,
+    cloudDevices: cloudDevices.size,
+    cloudClusters: cloudClusters.size,
   };
 }
 
@@ -429,11 +1138,36 @@ function buildEventsSnapshot() {
   };
 }
 
+function buildCloudDevicesSnapshot() {
+  return {
+    ok: true,
+    devices: Array.from(cloudDevices.values())
+      .sort((a, b) => {
+        if (a.clusterId !== b.clusterId) {
+          return a.clusterId.localeCompare(b.clusterId);
+        }
+        return a.deviceId.localeCompare(b.deviceId);
+      })
+      .map(cloudDeviceSummary),
+  };
+}
+
+function buildCloudClustersSnapshot() {
+  return {
+    ok: true,
+    clusters: Array.from(cloudClusters.values())
+      .sort((a, b) => a.clusterId.localeCompare(b.clusterId))
+      .map(cloudClusterSummary),
+  };
+}
+
 function buildStatePayload() {
   return {
     summary: buildSummarySnapshot(),
     clients: buildClientsSnapshot(),
     knownNodes: buildKnownNodesSnapshot(),
+    cloudDevices: buildCloudDevicesSnapshot(),
+    cloudClusters: buildCloudClustersSnapshot(),
     events: buildEventsSnapshot(),
   };
 }
@@ -465,12 +1199,19 @@ function updateKnownNodeFromClient(client) {
     return;
   }
   upsertKnownNode({
-    backendKey: client.key,
-    cluster: client.cluster,
-    nodeId: Number(client.nodeId),
-    device: client.device || `Node ${client.nodeId}`,
-    ip: normalizeIp(client.ip),
+      backendKey: client.key,
+      cluster: client.cluster,
+      nodeId: Number(client.nodeId),
+      device: client.device || `Node ${client.nodeId}`,
+      cloudTransport: Number(client.cloudTransport || 0),
+      cloudClusterId: client.cloudClusterId || "",
+      cloudDeviceId: client.cloudDeviceId || "",
+      cloudKeyId: client.cloudKeyId || "",
+      cloudClusterCaFingerprint: client.cloudClusterCaFingerprint || "",
+      cloudClusterBindingSecret: client.cloudClusterBindingSecret || "",
+      ip: normalizeIp(client.ip),
     role: Number(client.role) || 0,
+    term: Number(client.term || 0),
     online: isClientStale(client) ? 0 : 1,
     deviceState: isClientStale(client) ? 0 : Number(client.deviceState || 1),
     relayMask: client.relayMask >>> 0,
@@ -485,12 +1226,17 @@ function markKnownNodeOfflineForClient(client) {
     return;
   }
   upsertKnownNode({
-    backendKey: client.key,
-    cluster: client.cluster,
-    nodeId: Number(client.nodeId),
-    device: client.device || `Node ${client.nodeId}`,
-    ip: normalizeIp(client.ip),
+      backendKey: client.key,
+      cluster: client.cluster,
+      nodeId: Number(client.nodeId),
+      device: client.device || `Node ${client.nodeId}`,
+      cloudTransport: Number(client.cloudTransport || 0),
+      cloudClusterId: client.cloudClusterId || "",
+      cloudDeviceId: client.cloudDeviceId || "",
+      cloudKeyId: client.cloudKeyId || "",
+      ip: normalizeIp(client.ip),
     role: Number(client.role) || 0,
+    term: Number(client.term || 0),
     online: 0,
     deviceState: 0,
     relayMask: Number(client.relayMask || 0) >>> 0,
@@ -507,17 +1253,27 @@ function applyClusterStatusSnapshot(client, message) {
 
   for (const node of nodes) {
     const nodeId = Number(node.node_id || 0);
+    const entryKey = knownNodeKey(client.key, message.cluster || client.cluster || "", nodeId);
+    const existing = knownNodes.get(entryKey) || {};
+    const cloudClusterId = String(node.cloud_cluster_id || message.cloud_cluster_id || client.cloudClusterId || existing.cloudClusterId || "");
+    const cloudDeviceId = String(node.cloud_device_id || ((nodeId === Number(message.node_id || client.nodeId || 0)) ? (message.cloud_device_id || client.cloudDeviceId || "") : existing.cloudDeviceId || ""));
+    const cloudKeyId = String(node.cloud_key_id || ((nodeId === Number(message.node_id || client.nodeId || 0)) ? (message.cloud_key_id || client.cloudKeyId || "") : existing.cloudKeyId || ""));
     if (nodeId === 0) {
       continue;
     }
     seen.add(nodeId);
-    upsertKnownNode({
-      backendKey: client.key,
-      cluster: message.cluster || client.cluster || "",
-      nodeId,
-      device: String(node.name || `Node ${nodeId}`),
-      ip: String(node.ip || ""),
+      upsertKnownNode({
+        backendKey: client.key,
+        cluster: message.cluster || client.cluster || "",
+        nodeId,
+        device: String(node.name || `Node ${nodeId}`),
+        cloudTransport: Number(message.cloud_transport || client.cloudTransport || 0),
+        cloudClusterId,
+        cloudDeviceId,
+        cloudKeyId,
+        ip: String(node.ip || ""),
       role: Number(node.role || 0),
+      term: Number(node.term || 0),
       online: Number(node.online ? 1 : 0),
       deviceState: Number(node.device_state || 0),
       relayMask: Number(node.relay_mask || 0) >>> 0,
@@ -639,13 +1395,20 @@ function scanStaleKnownNodes() {
 const tcpServer = net.createServer((socket) => {
   const id = `${socket.remoteAddress}:${socket.remotePort}`;
   const client = {
-    id,
-    socket,
-    buffer: "",
-    nodeId: null,
-    device: null,
-    cluster: null,
-    ip: socket.remoteAddress,
+      id,
+      socket,
+      buffer: "",
+      nodeId: null,
+      device: null,
+      cluster: null,
+      cloudTransport: 0,
+      cloudClusterId: "",
+      cloudDeviceId: "",
+      cloudKeyId: "",
+      cloudClusterCaFingerprint: "",
+      cloudClusterBindingSecret: "",
+      ip: socket.remoteAddress,
+    term: 0,
     role: null,
     relayMask: 0,
     session: 0,
@@ -684,16 +1447,34 @@ const tcpServer = net.createServer((socket) => {
 
       pushEvent("message", { id, message });
 
-      if (message.type === "hello") {
-        const previousClient = findClientByNodeId(message.node_id);
-        const keyRecord = findKeyRecordBySecret(message.key);
+        if (message.type === "hello") {
+          const previousClient = findClientByNodeId(message.node_id);
+          const keyRecord = findKeyRecordBySecret(message.key);
 
-        client.nodeId = Number(message.node_id) || 0;
-        client.device = message.device || "";
-        client.cluster = message.cluster || "";
-        client.role = message.master ? 2 : 1;
-        client.session = Number(message.session || 0);
-        client.key = message.key || null;
+          client.nodeId = Number(message.node_id) || 0;
+          client.device = message.device || "";
+          client.cluster = message.cluster || "";
+          client.cloudTransport = Number(message.cloud_transport || 0);
+          client.cloudClusterId = message.cloud_cluster_id || "";
+          client.cloudDeviceId = message.cloud_device_id || "";
+          client.cloudKeyId = message.cloud_key_id || "";
+          client.cloudClusterCaFingerprint = message.cloud_cluster_ca_fingerprint || "";
+          client.cloudClusterBindingSecret = message.cloud_cluster_binding_secret || "";
+          client.term = Number(message.term || client.term || 0);
+          client.role = message.master ? 2 : 1;
+          client.session = Number(message.session || 0);
+          client.key = message.key || null;
+
+          if (!client.cloudClusterId || !client.cloudDeviceId || !client.cloudKeyId) {
+            pushEvent("cloud-identity-missing", {
+              nodeId: client.nodeId,
+              device: client.device,
+              cluster: client.cluster,
+              cloudClusterId: client.cloudClusterId || "",
+              cloudDeviceId: client.cloudDeviceId || "",
+              cloudKeyId: client.cloudKeyId || "",
+            });
+          }
 
         if (previousClient && previousClient.id !== client.id) {
           pushEvent("replace-client", {
@@ -705,27 +1486,78 @@ const tcpServer = net.createServer((socket) => {
           previousClient.socket.destroy();
         }
 
-        if (!keyRecord || !keyRecord.enabled) {
-          sendJson(client, { type: "hello_ack", ok: false, error: "bad_key" });
-          socket.end();
-          continue;
-        }
+          if (!keyRecord || !keyRecord.enabled) {
+            rejectHello(client, socket, "bad_key");
+            continue;
+          }
 
-        keyRecord.lastSeenAt = nowIso();
+          {
+            const clusterRecord = findCloudClusterRecord(client.cloudClusterId);
+            const deviceRecord = findCloudDeviceRecord(client.cloudClusterId, client.cloudDeviceId);
+            if (client.cloudClusterId && !clusterRecord) {
+              rejectHello(client, socket, "cloud_cluster_not_found");
+              continue;
+            }
+            if (client.cloudClusterId && client.cloudDeviceId && !deviceRecord) {
+              rejectHello(client, socket, "cloud_device_not_found");
+              continue;
+            }
+            if (clusterRecord && clusterRecord.enabled === false) {
+              rejectHello(client, socket, "cluster_disabled");
+              continue;
+            }
+            if (clusterRecord && clusterRecord.caFingerprint && client.cloudClusterCaFingerprint &&
+                !isFingerprintCompatible(clusterRecord.caFingerprint, client.cloudClusterCaFingerprint)) {
+              rejectHello(client, socket, "bad_cloud_cluster_ca_fingerprint");
+              continue;
+            }
+            if (clusterRecord && clusterRecord.bindingSecret && client.cloudClusterBindingSecret && clusterRecord.bindingSecret !== client.cloudClusterBindingSecret) {
+              rejectHello(client, socket, "bad_cloud_cluster_binding_secret");
+              continue;
+            }
+            if (clusterRecord && clusterRecord.keyId && client.cloudKeyId && clusterRecord.keyId !== client.cloudKeyId) {
+              rejectHello(client, socket, "bad_cloud_cluster_key_id");
+              continue;
+            }
+            if (deviceRecord && deviceRecord.enabled === false) {
+              rejectHello(client, socket, "device_disabled");
+              continue;
+            }
+            if (deviceRecord && deviceRecord.keyId && client.cloudKeyId && deviceRecord.keyId !== client.cloudKeyId) {
+              rejectHello(client, socket, "bad_cloud_device_key_id");
+              continue;
+            }
+          }
+
+          keyRecord.lastSeenAt = nowIso();
         keyRecord.lastNodeId = client.nodeId;
         keyRecord.lastCluster = client.cluster;
         keyRecord.lastDevice = client.device;
         saveKeyStore();
+        pushEvent("hello-ok", {
+          nodeId: client.nodeId,
+          device: client.device,
+          cluster: client.cluster,
+          cloudClusterId: client.cloudClusterId || "",
+          cloudDeviceId: client.cloudDeviceId || "",
+          cloudKeyId: client.cloudKeyId || "",
+        });
         updateKnownNodeFromClient(client);
-        sendJson(client, { type: "hello_ack", ok: true });
+        scheduleProvisioningForClient(client);
         continue;
       }
 
-      if (message.type === "status") {
-        client.nodeId = Number(message.node_id) || client.nodeId;
-        client.device = message.device || client.device;
-        client.cluster = message.cluster || client.cluster;
-        client.role = Number(message.role || client.role || 0);
+        if (message.type === "status") {
+          client.nodeId = Number(message.node_id) || client.nodeId;
+          client.device = message.device || client.device;
+          client.cluster = message.cluster || client.cluster;
+          client.cloudTransport = Number(message.cloud_transport || client.cloudTransport || 0);
+          client.cloudClusterId = message.cloud_cluster_id || client.cloudClusterId || "";
+          client.cloudDeviceId = message.cloud_device_id || client.cloudDeviceId || "";
+          client.cloudKeyId = message.cloud_key_id || client.cloudKeyId || "";
+          client.cloudClusterCaFingerprint = message.cloud_cluster_ca_fingerprint || client.cloudClusterCaFingerprint || "";
+          client.term = Number(message.term || client.term || 0);
+          client.role = Number(message.role || client.role || 0);
         client.deviceState = Number(message.device_state || client.deviceState || 1);
         client.relayMask = Number(message.relay_mask || 0) >>> 0;
         updateKnownNodeFromClient(client);
@@ -735,35 +1567,44 @@ const tcpServer = net.createServer((socket) => {
 
       if (message.type === "heartbeat") {
         client.nodeId = Number(message.node_id) || client.nodeId;
+        client.term = Number(message.term || client.term || 0);
         client.role = Number(message.role || client.role || 0);
         updateKnownNodeFromClient(client);
         continue;
       }
 
-      if (message.type === "fault_report") {
-        console.error("[backend-test] fault-report", JSON.stringify({
-          nodeId: client.nodeId,
-          device: client.device,
-          cluster: client.cluster,
-          fault: message,
-        }));
-        pushEvent("fault-report", {
-          nodeId: client.nodeId,
-          device: client.device,
-          cluster: client.cluster,
-          fault: message,
-        });
-      }
+        if (message.type === "fault_report") {
+          console.error("[backend-test] fault-report", JSON.stringify({
+            nodeId: client.nodeId,
+            device: client.device,
+            cluster: client.cluster,
+            cloudClusterId: client.cloudClusterId || "",
+            cloudDeviceId: client.cloudDeviceId || "",
+            cloudKeyId: client.cloudKeyId || "",
+            fault: message,
+          }));
+          pushEvent("fault-report", {
+            nodeId: client.nodeId,
+            device: client.device,
+            cluster: client.cluster,
+            cloudClusterId: client.cloudClusterId || "",
+            cloudDeviceId: client.cloudDeviceId || "",
+            cloudKeyId: client.cloudKeyId || "",
+            fault: message,
+          });
+        }
     }
   });
 
   socket.on("close", () => {
+    helloProvisionTimers.delete(String(Number(client.nodeId || 0)));
     markKnownNodeOfflineForClient(client);
     clients.delete(id);
     pushEvent("tcp-close", { id });
   });
 
   socket.on("error", (error) => {
+    helloProvisionTimers.delete(String(Number(client.nodeId || 0)));
     markKnownNodeOfflineForClient(client);
     pushEvent("tcp-error", { id, error: error.message });
   });
@@ -825,14 +1666,41 @@ function renderHtml() {
       </div>
       <table id="clientTable"></table>
     </section>
-    <section class="card">
-      <h2>已知裝置</h2>
-      <table id="knownNodeTable"></table>
-    </section>
-    <section class="card">
-      <h2>裝置名稱設定</h2>
-      <div id="deviceNamePanels" class="muted">沒有可用裝置</div>
-    </section>
+      <section class="card">
+        <h2>已知裝置</h2>
+        <table id="knownNodeTable"></table>
+      </section>
+      <section class="card">
+        <h2>雲端叢集身份</h2>
+        <div class="row" style="margin-bottom:12px">
+          <input id="newCloudClusterName" placeholder="叢集名稱">
+          <input id="newCloudClusterId" placeholder="Cloud Cluster ID，可留空">
+          <input id="newCloudClusterKeyId" placeholder="Cloud Key ID，可留空">
+          <input id="newCloudClusterBrokerHost" placeholder="Broker Host，可留空">
+          <input id="newCloudClusterBrokerPort" placeholder="Broker Port，可留空">
+          <button onclick="createCloudCluster()">建立叢集身份</button>
+        </div>
+        <table id="cloudClusterTable"></table>
+      </section>
+      <section class="card">
+        <h2>雲端裝置身份</h2>
+        <div class="row" style="margin-bottom:12px">
+          <input id="newCloudDeviceClusterId" placeholder="Cloud Cluster ID">
+          <input id="newCloudDeviceName" placeholder="裝置名稱">
+          <input id="newCloudDeviceId" placeholder="Cloud Device ID，可留空">
+          <input id="newCloudDeviceKeyId" placeholder="Cloud Key ID，可留空">
+          <button onclick="createCloudDevice()">建立裝置身份</button>
+        </div>
+        <table id="cloudDeviceTable"></table>
+      </section>
+      <section class="card">
+        <h2>Provisioning 輸出</h2>
+        <pre id="provisionOutput">尚未選擇 cluster / device provisioning。</pre>
+      </section>
+      <section class="card">
+        <h2>裝置名稱設定</h2>
+        <div id="deviceNamePanels" class="muted">沒有可用裝置</div>
+      </section>
     <section class="card">
       <h2>Relay 設定</h2>
       <div id="relayConfigPanels" class="muted">沒有可用裝置</div>
@@ -878,6 +1746,8 @@ function renderHtml() {
     let currentSummary = null;
     let currentClients = [];
     let currentKnownNodes = [];
+    let currentCloudDevices = [];
+    let currentCloudClusters = [];
     let currentEvents = [];
     const deviceNameDirtyMap = {};
     const deviceNameRenderSignatureMap = {};
@@ -970,7 +1840,7 @@ function renderHtml() {
       return '<span class="pill ' + (online ? 'on' : 'off') + '">' + text + '</span>';
     }
     function sourceNodeId(item) {
-      return Number(item.sourceMasterNodeId || item.nodeId || 0);
+      return Number(item.effectiveMasterNodeId || item.sourceMasterNodeId || item.nodeId || 0);
     }
     function relayOn(mask, channel) {
       return (((Number(mask) >>> 0) >>> (channel - 1)) & 1) === 1;
@@ -1048,6 +1918,15 @@ function renderHtml() {
         );
       }
       return '<div style="display:flex;flex-wrap:wrap;gap:4px">' + buttons.join('') + '</div>';
+    }
+    function renderKnownNodeActions(item) {
+      const actions = [renderRelayButtons(item)];
+      const hasClusterIdentity = !!String(item.cloudClusterId || '').trim();
+      const hasDeviceIdentity = !!String(item.cloudDeviceId || '').trim();
+      if (hasClusterIdentity && !hasDeviceIdentity) {
+        actions.push('<button class="secondary" ' + (item.online ? '' : 'disabled ') + 'onclick="createCloudDeviceFromNode(' + Number(item.nodeId) + ')">建立雲端身份</button>');
+      }
+      return actions.join(' ');
     }
     function markDeviceNameDirty(nodeId) {
       deviceNameDirtyMap[String(nodeId)] = true;
@@ -1222,7 +2101,6 @@ function renderHtml() {
       }
 
       const summary = currentSummary;
-      currentSummary = summary;
       reconcilePendingRelays(currentKnownNodes);
 
       document.getElementById('summary').innerHTML =
@@ -1231,14 +2109,19 @@ function renderHtml() {
         ' / 金鑰 ' + summary.keyCount +
         ' 把 / 活躍鏈路 ' + summary.activeClients +
         ' 條 / 原始 socket ' + summary.rawClients +
-        ' 條 / 已知裝置 ' + summary.knownNodes + ' 台';
+        ' 條 / 已知裝置 ' + summary.knownNodes +
+        ' 台 / 雲端裝置身份 ' + (summary.cloudDevices || 0) +
+        ' 筆 / 雲端叢集身份 ' + (summary.cloudClusters || 0) + ' 筆';
 
       document.getElementById('clientTable').innerHTML =
-        '<tr><th>nodeId</th><th>裝置</th><th>叢集</th><th>角色</th><th>鏈路狀態</th><th>relayMask</th><th>session</th><th>最後更新</th></tr>' +
+        '<tr><th>nodeId</th><th>裝置</th><th>叢集</th><th>Cloud Cluster</th><th>Cloud Device</th><th>Cloud Key</th><th>角色</th><th>鏈路狀態</th><th>relayMask</th><th>session</th><th>最後更新</th></tr>' +
         currentClients.map((item) => '<tr>' +
           '<td>' + esc(item.nodeId) + '</td>' +
           '<td>' + esc(item.device) + '</td>' +
           '<td>' + esc(item.cluster) + '</td>' +
+          '<td>' + esc(item.cloudClusterId) + '</td>' +
+          '<td>' + esc(item.cloudDeviceId) + '</td>' +
+          '<td>' + esc(item.cloudKeyId) + '</td>' +
           '<td>' + esc(item.role) + '</td>' +
           '<td>' + (item.stale ? pill('stale', false) : pill('active', true)) + '</td>' +
           '<td>' + esc(item.relayMask) + '</td>' +
@@ -1247,29 +2130,74 @@ function renderHtml() {
         '</tr>').join('');
 
       renderDeviceNamePanels(currentKnownNodes);
+
       if (!hasPendingRelayWork()) {
         document.getElementById('knownNodeTable').innerHTML =
-          '<tr><th>nodeId</th><th>裝置</th><th>叢集</th><th>角色</th><th>在線</th><th>狀態</th><th>relayMask</th><th>控制</th><th>最後同步</th></tr>' +
+          '<tr><th>nodeId</th><th>裝置</th><th>叢集</th><th>Cloud Cluster</th><th>Cloud Device</th><th>Cloud Key</th><th>角色</th><th>在線</th><th>狀態</th><th>relayMask</th><th>控制</th><th>最後同步</th></tr>' +
           currentKnownNodes.map((item) => '<tr>' +
             '<td>' + esc(item.nodeId) + '</td>' +
             '<td>' + esc(item.device) + '</td>' +
             '<td>' + esc(item.cluster) + '</td>' +
+            '<td>' + esc(item.cloudClusterId) + '</td>' +
+            '<td>' + esc(item.cloudDeviceId) + '</td>' +
+            '<td>' + esc(item.cloudKeyId) + '</td>' +
             '<td>' + esc(item.role) + '</td>' +
             '<td>' + (item.online ? pill('在線', true) : pill('離線', false)) + '</td>' +
             '<td>' + esc(item.deviceStateText) + '</td>' +
             '<td>' + esc(item.relayMask) + '</td>' +
-            '<td>' + renderRelayButtons(item) + '</td>' +
+            '<td>' + renderKnownNodeActions(item) + '</td>' +
             '<td>' + esc(item.lastSeenAt) + '</td>' +
           '</tr>').join('');
       }
 
+      document.getElementById('cloudClusterTable').innerHTML =
+        '<tr><th>Cloud Cluster</th><th>Cloud Key</th><th>CA 指紋</th><th>狀態</th><th>Transport</th><th>Broker</th><th>叢集名稱</th><th>最後 master device</th><th>最後 master node</th><th>在線裝置</th><th>已知裝置</th><th>最後更新</th><th>操作</th></tr>' +
+        currentCloudClusters.map((item) => '<tr>' +
+          '<td>' + esc(item.clusterId) + '</td>' +
+          '<td>' + esc(item.keyId) + '</td>' +
+          '<td><code>' + esc(item.caFingerprint) + '</code></td>' +
+          '<td>' + (item.enabled ? pill('啟用', true) : pill('停用', false)) + '</td>' +
+          '<td>' + esc(item.transport) + '</td>' +
+          '<td>' + esc(item.brokerHost) + ':' + esc(item.brokerPort) + '</td>' +
+          '<td>' + esc(item.clusterName) + '</td>' +
+          '<td>' + esc(item.lastMasterDeviceId) + '</td>' +
+          '<td>' + esc(item.lastMasterNodeId) + '</td>' +
+          '<td>' + esc(item.onlineDevices) + '</td>' +
+          '<td>' + esc(item.knownDevices) + '</td>' +
+          '<td>' + esc(item.lastSeenAt) + '</td>' +
+          '<td class="row"><button class="secondary" onclick="showClusterProvision(\\'' + esc(item.clusterId) + '\\')">輸出</button><button class="secondary" onclick="applyCloudClusterOnline(\\'' + esc(item.clusterId) + '\\')">套用在線節點</button><button class="secondary" onclick="rotateClusterCa(\\'' + esc(item.clusterId) + '\\')">重發 CA</button><button class="secondary" onclick="toggleCloudCluster(\\'' + esc(item.clusterId) + '\\',' + (!item.enabled) + ')">' + (item.enabled ? '停用' : '啟用') + '</button></td>' +
+        '</tr>').join('');
+
+      document.getElementById('cloudDeviceTable').innerHTML =
+        '<tr><th>Cloud Cluster</th><th>Cloud Device</th><th>Cloud Key</th><th>Device 指紋</th><th>狀態</th><th>nodeId</th><th>裝置</th><th>叢集</th><th>角色</th><th>在線</th><th>狀態</th><th>relayMask</th><th>最後同步</th><th>操作</th></tr>' +
+        currentCloudDevices.map((item) => '<tr>' +
+          '<td>' + esc(item.clusterId) + '</td>' +
+          '<td>' + esc(item.deviceId) + '</td>' +
+          '<td>' + esc(item.keyId) + '</td>' +
+          '<td><code>' + esc(item.deviceFingerprint) + '</code></td>' +
+          '<td>' + (item.enabled ? pill('啟用', true) : pill('停用', false)) + '</td>' +
+          '<td>' + esc(item.nodeId) + '</td>' +
+          '<td>' + esc(item.device) + '</td>' +
+          '<td>' + esc(item.clusterName) + '</td>' +
+          '<td>' + esc(item.role) + '</td>' +
+          '<td>' + (item.online ? pill('在線', true) : pill('離線', false)) + '</td>' +
+          '<td>' + esc(item.deviceStateText) + '</td>' +
+          '<td>' + esc(item.relayMask) + '</td>' +
+          '<td>' + esc(item.lastSeenAt) + '</td>' +
+          '<td class="row"><button class="secondary" onclick="showDeviceProvision(\\'' + esc(item.clusterId) + '\\',\\'' + esc(item.deviceId) + '\\')">輸出</button><button class="secondary" onclick="rotateCloudDevice(\\'' + esc(item.clusterId) + '\\',\\'' + esc(item.deviceId) + '\\')">重發裝置憑證</button>' +
+          (Number(item.nodeId || 0) > 0 ? '<button class="secondary" onclick="applyCloudProvision(' + Number(item.nodeId) + ',\\'' + esc(item.clusterId) + '\\',\\'' + esc(item.deviceId) + '\\')">套用到裝置</button>' : '') +
+          '<button class="secondary" onclick="toggleCloudDevice(\\'' + esc(item.clusterId) + '\\',\\'' + esc(item.deviceId) + '\\',' + (!item.enabled) + ')">' + (item.enabled ? '停用' : '啟用') + '</button></td>' +
+        '</tr>').join('');
+
       renderRelayConfigPanels(currentKnownNodes, relayConfigCache);
       document.getElementById('events').textContent = JSON.stringify(currentEvents.slice(-40), null, 2);
     }
-    function renderLiveState(summary, clients, knownNodes, events) {
+    function renderLiveState(summary, clients, knownNodes, cloudDevices, cloudClusters, events) {
       currentSummary = summary;
       currentClients = clients.clients || [];
       currentKnownNodes = knownNodes.nodes || [];
+      currentCloudDevices = cloudDevices.devices || [];
+      currentCloudClusters = cloudClusters.clusters || [];
       currentEvents = events.events || [];
       reconcilePendingRelays(currentKnownNodes);
       if (renderTimer) {
@@ -1282,7 +2210,14 @@ function renderHtml() {
     }
     function refreshBurst() {
       if (currentSummary) {
-        renderLiveState(currentSummary, { clients: currentClients }, { nodes: currentKnownNodes }, { events: currentEvents });
+        renderLiveState(
+          currentSummary,
+          { clients: currentClients },
+          { nodes: currentKnownNodes },
+          { devices: currentCloudDevices },
+          { clusters: currentCloudClusters },
+          { events: currentEvents }
+        );
       }
     }
     function connectStream() {
@@ -1290,7 +2225,7 @@ function renderHtml() {
       es.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data);
-          renderLiveState(payload.summary, payload.clients, payload.knownNodes, payload.events);
+          renderLiveState(payload.summary, payload.clients, payload.knownNodes, payload.cloudDevices, payload.cloudClusters, payload.events);
         } catch (_error) {
         }
       };
@@ -1301,11 +2236,13 @@ function renderHtml() {
     }
     async function refresh() {
       try {
-        const [summary, keys, clients, knownNodes, events] = await Promise.all([
+        const [summary, keys, clients, knownNodes, cloudDevices, cloudClusters, events] = await Promise.all([
           api('/api/summary'),
           api('/api/keys'),
           api('/clients'),
           api('/api/known-nodes'),
+          api('/api/cloud/devices'),
+          api('/api/cloud/clusters'),
           api('/events')
         ]);
 
@@ -1315,7 +2252,9 @@ function renderHtml() {
           ' / 金鑰 ' + summary.keyCount +
           ' 把 / 活躍鏈路 ' + summary.activeClients +
           ' 條 / 原始 socket ' + summary.rawClients +
-          ' 條 / 已知裝置 ' + summary.knownNodes + ' 台';
+          ' 條 / 已知裝置 ' + summary.knownNodes +
+          ' 台 / 雲端裝置身份 ' + (summary.cloudDevices || 0) +
+          ' 筆 / 雲端叢集身份 ' + (summary.cloudClusters || 0) + ' 筆';
 
         document.getElementById('keyTable').innerHTML =
           '<tr><th>標籤</th><th>金鑰</th><th>狀態</th><th>最近使用</th><th>操作</th></tr>' +
@@ -1330,11 +2269,11 @@ function renderHtml() {
             '</td>' +
           '</tr>').join('');
 
-        renderLiveState(summary, clients, knownNodes, events);
+        renderLiveState(summary, clients, knownNodes, cloudDevices, cloudClusters, events);
         refreshRelayConfigs(knownNodes.nodes, false);
         return;
       } catch (error) {
-        document.getElementById('summary').textContent = '霈?仃?? ' + error.message;
+        document.getElementById('summary').textContent = '讀取失敗: ' + error.message;
       }
     }
     async function createKey() {
@@ -1358,6 +2297,114 @@ function renderHtml() {
     async function deleteKey(id) {
       await api('/api/keys/' + id, { method: 'DELETE' });
       refresh();
+    }
+    async function toggleCloudCluster(clusterId, enabled) {
+      await api('/api/cloud/clusters/' + encodeURIComponent(clusterId), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled })
+      });
+      refresh();
+    }
+    async function createCloudCluster() {
+      const result = await api('/api/cloud/clusters', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clusterName: document.getElementById('newCloudClusterName').value.trim(),
+          clusterId: document.getElementById('newCloudClusterId').value.trim(),
+          keyId: document.getElementById('newCloudClusterKeyId').value.trim(),
+          brokerHost: document.getElementById('newCloudClusterBrokerHost').value.trim(),
+          brokerPort: document.getElementById('newCloudClusterBrokerPort').value.trim()
+        })
+      });
+      document.getElementById('newCloudClusterName').value = '';
+      document.getElementById('newCloudClusterId').value = '';
+      document.getElementById('newCloudClusterKeyId').value = '';
+      document.getElementById('newCloudClusterBrokerHost').value = '';
+      document.getElementById('newCloudClusterBrokerPort').value = '';
+      refresh();
+      if (result && result.cluster) {
+        await showClusterProvision(result.cluster.clusterId);
+      }
+    }
+    async function showClusterProvision(clusterId) {
+      const result = await api('/api/cloud/clusters/' + encodeURIComponent(clusterId) + '/provision');
+      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
+    }
+    async function rotateClusterCa(clusterId) {
+      const result = await api('/api/cloud/clusters/' + encodeURIComponent(clusterId) + '/rotate-ca', {
+        method: 'POST'
+      });
+      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
+      refresh();
+    }
+    async function applyCloudClusterOnline(clusterId) {
+      const result = await api('/api/cloud/clusters/' + encodeURIComponent(clusterId) + '/apply-online', {
+        method: 'POST'
+      });
+      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
+      refresh();
+    }
+    async function toggleCloudDevice(clusterId, deviceId, enabled) {
+      await api('/api/cloud/devices/' + encodeURIComponent(clusterId) + '/' + encodeURIComponent(deviceId), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled })
+      });
+      refresh();
+    }
+    async function showDeviceProvision(clusterId, deviceId) {
+      const result = await api('/api/cloud/devices/' + encodeURIComponent(clusterId) + '/' + encodeURIComponent(deviceId) + '/provision');
+      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
+    }
+    async function rotateCloudDevice(clusterId, deviceId) {
+      const result = await api('/api/cloud/devices/' + encodeURIComponent(clusterId) + '/' + encodeURIComponent(deviceId) + '/rotate-credential', {
+        method: 'POST'
+      });
+      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
+      refresh();
+    }
+    async function applyCloudProvision(nodeId, clusterId, deviceId) {
+      const result = await api('/api/cloud/apply/' + encodeURIComponent(String(nodeId)), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clusterId, deviceId })
+      });
+      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
+      refresh();
+    }
+    async function createCloudDeviceFromNode(nodeId) {
+      const result = await api('/api/cloud/devices/from-node', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nodeId: Number(nodeId) })
+      });
+      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
+      refresh();
+      if (result && result.device) {
+        await showDeviceProvision(result.device.clusterId, result.device.deviceId);
+      }
+    }
+    async function createCloudDevice() {
+      const result = await api('/api/cloud/devices', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clusterId: document.getElementById('newCloudDeviceClusterId').value.trim(),
+          deviceName: document.getElementById('newCloudDeviceName').value.trim(),
+          deviceId: document.getElementById('newCloudDeviceId').value.trim(),
+          keyId: document.getElementById('newCloudDeviceKeyId').value.trim()
+        })
+      });
+      document.getElementById('newCloudDeviceClusterId').value = '';
+      document.getElementById('newCloudDeviceName').value = '';
+      document.getElementById('newCloudDeviceId').value = '';
+      document.getElementById('newCloudDeviceKeyId').value = '';
+      refresh();
+      if (result && result.device) {
+        await showDeviceProvision(result.device.clusterId, result.device.deviceId);
+      }
     }
     async function sendCommand() {
       const nodeId = document.getElementById('commandNodeId').value.trim();
@@ -1477,6 +2524,10 @@ app.get("/", (_req, res) => {
   res.type("html").send(renderHtml());
 });
 
+app.get("/favicon.ico", (_req, res) => {
+  res.status(204).end();
+});
+
 app.get("/api/stream", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -1501,16 +2552,7 @@ app.get("/api/stream", (req, res) => {
 });
 
 app.get("/api/summary", (_req, res) => {
-  const clientList = Array.from(clients.values());
-  res.json({
-    ok: true,
-    httpPort: HTTP_PORT,
-    tcpPort: TCP_PORT,
-    keyCount: keyStore.length,
-    activeClients: clientList.filter((item) => !isClientStale(item)).length,
-    rawClients: clientList.length,
-    knownNodes: knownNodes.size,
-  });
+  res.json(buildSummarySnapshot());
 });
 
 app.get("/api/keys", (_req, res) => {
@@ -1562,9 +2604,444 @@ app.get("/api/known-nodes", (_req, res) => {
         return a.cluster.localeCompare(b.cluster);
       }
       return a.nodeId - b.nodeId;
-    })
-    .map(knownNodeSummary);
+      })
+      .map(knownNodeSummary);
   res.json({ ok: true, nodes });
+});
+
+app.get("/api/cloud/devices", (_req, res) => {
+  res.json(buildCloudDevicesSnapshot());
+});
+
+app.get("/api/cloud/clusters", (_req, res) => {
+  res.json(buildCloudClustersSnapshot());
+});
+
+app.post("/api/cloud/clusters", (req, res) => {
+  const clusterId = String(req.body.clusterId || generateClusterIdentityId()).trim();
+  const clusterName = String(req.body.clusterName || clusterId).trim();
+  const keyId = String(req.body.keyId || generateCloudKeyId()).trim();
+  const brokerHost = String(req.body.brokerHost || CLOUD_BROKER_HOST).trim();
+  const brokerPort = Number(req.body.brokerPort || CLOUD_BROKER_PORT);
+  const caBundle = buildClusterCaBundle(clusterId, keyId);
+
+  if (!clusterId) {
+    return res.status(400).json({ ok: false, error: "bad_cluster_id" });
+  }
+  if (cloudClusters.has(clusterId)) {
+    return res.status(409).json({ ok: false, error: "cloud_cluster_exists" });
+  }
+
+  cloudClusters.set(clusterId, {
+    clusterId,
+    keyId,
+    enabled: true,
+    transport: CLOUD_TRANSPORT,
+    brokerHost,
+    brokerPort,
+    backendKey: "",
+    clusterName,
+    caPublicPem: caBundle.caPublicPem,
+    caPrivatePem: caBundle.caPrivatePem,
+    caFingerprint: caBundle.caFingerprint,
+    bindingSecret: caBundle.bindingSecret,
+    lastMasterNodeId: 0,
+    lastMasterDeviceId: "",
+    onlineDevices: 0,
+    knownDevices: 0,
+    firstSeenAt: nowIso(),
+    lastSeenAt: nowIso(),
+    lastUpdatedAt: nowIso(),
+  });
+  scheduleCloudRegistrySave();
+  scheduleStateBroadcast();
+  return res.json({ ok: true, cluster: cloudClusterSummary(cloudClusters.get(clusterId)) });
+});
+
+app.get("/api/cloud/clusters/:clusterId/provision", (req, res) => {
+  const clusterRecord = findCloudClusterRecord(req.params.clusterId);
+  if (!clusterRecord) {
+    return res.status(404).json({ ok: false, error: "cloud_cluster_not_found" });
+  }
+  const provisioning = buildClusterProvisioning(clusterRecord);
+  return res.json({
+    ok: true,
+    cluster: cloudClusterSummary(clusterRecord),
+    provisioning,
+    formFields: buildProvisioningFormFields(provisioning),
+    trustBundle: {
+      clusterCaPublicPem: clusterRecord.caPublicPem || "",
+      clusterCaFingerprint: clusterRecord.caFingerprint || "",
+      clusterBindingSecret: clusterRecord.bindingSecret || "",
+    },
+  });
+});
+
+app.post("/api/cloud/clusters/:clusterId/rotate-ca", (req, res) => {
+  const clusterRecord = findCloudClusterRecord(req.params.clusterId);
+  if (!clusterRecord) {
+    return res.status(404).json({ ok: false, error: "cloud_cluster_not_found" });
+  }
+  rotateClusterCa(clusterRecord);
+  cloudClusters.set(clusterRecord.clusterId, clusterRecord);
+  scheduleCloudRegistrySave();
+  pushEvent("cloud-cluster-ca-rotated", {
+    clusterId: clusterRecord.clusterId,
+    keyId: clusterRecord.keyId,
+    caFingerprint: clusterRecord.caFingerprint || "",
+  });
+  return res.json({
+    ok: true,
+    cluster: cloudClusterSummary(clusterRecord),
+    provision: {
+      cluster: buildClusterProvisioning(clusterRecord),
+      devices: Array.from(cloudDevices.values())
+        .filter((item) => item.clusterId === clusterRecord.clusterId)
+        .map((item) => buildDeviceProvisioningBundle(clusterRecord, item)),
+    },
+  });
+});
+
+app.post("/api/cloud/clusters/:clusterId/apply-online", async (req, res) => {
+  const clusterRecord = findCloudClusterRecord(req.params.clusterId);
+  const targetNodes = Array.from(knownNodes.values()).filter((node) =>
+    cloudClusterKeyOf(node) === String(req.params.clusterId || "").trim() &&
+    node.ip);
+  const results = [];
+
+  if (!clusterRecord) {
+    return res.status(404).json({ ok: false, error: "cloud_cluster_not_found" });
+  }
+
+  for (const node of targetNodes) {
+    try {
+      const derivedDeviceId = String(node.cloudDeviceId || "").trim() ||
+        deriveFallbackDeviceId(node);
+      if (!String(node.cloudDeviceId || "").trim()) {
+        syncCloudRegistryFromKnownNode({
+          ...node,
+          cloudClusterId: clusterRecord.clusterId,
+          cloudDeviceId: derivedDeviceId,
+          cloudKeyId: String(node.cloudKeyId || "").trim(),
+        });
+      }
+      const deviceRecord = findCloudDeviceRecord(clusterRecord.clusterId, derivedDeviceId);
+      if (!deviceRecord) {
+        throw new Error("cloud_device_materialize_failed");
+      }
+      await applyProvisioningToNode(node, clusterRecord, deviceRecord);
+      results.push({
+        nodeId: Number(node.nodeId || 0),
+        device: node.device || "",
+        deviceId: derivedDeviceId,
+        ok: true,
+      });
+      pushEvent("cloud-cluster-apply-online-ok", {
+        clusterId: clusterRecord.clusterId,
+        nodeId: Number(node.nodeId || 0),
+        deviceId: derivedDeviceId,
+      });
+    } catch (error) {
+      results.push({
+        nodeId: Number(node.nodeId || 0),
+        device: node.device || "",
+        deviceId: String(node.cloudDeviceId || "").trim(),
+        ok: false,
+        error: String(error?.message || error),
+      });
+      pushEvent("cloud-cluster-apply-online-failed", {
+        clusterId: clusterRecord.clusterId,
+        nodeId: Number(node.nodeId || 0),
+        error: String(error?.message || error),
+      });
+    }
+  }
+
+  scheduleCloudRegistrySave();
+  scheduleStateBroadcast();
+  return res.json({
+    ok: true,
+    clusterId: clusterRecord.clusterId,
+    totalOnlineNodes: targetNodes.length,
+    results,
+  });
+});
+
+app.post("/api/cloud/devices", (req, res) => {
+  const clusterId = String(req.body.clusterId || "").trim();
+  const deviceId = String(req.body.deviceId || generateDeviceIdentityId()).trim();
+  const deviceName = String(req.body.deviceName || deviceId).trim();
+  const keyId = String(req.body.keyId || generateCloudKeyId()).trim();
+  const registryKey = `${clusterId}|${deviceId}`;
+  const clusterRecord = findCloudClusterRecord(clusterId);
+  let deviceBundle;
+
+  if (!clusterId) {
+    return res.status(400).json({ ok: false, error: "bad_cluster_id" });
+  }
+  if (!clusterRecord) {
+    return res.status(404).json({ ok: false, error: "cloud_cluster_not_found" });
+  }
+  if (cloudDevices.has(registryKey)) {
+    return res.status(409).json({ ok: false, error: "cloud_device_exists" });
+  }
+
+  deviceBundle = buildDeviceCredentialBundle(clusterRecord, deviceId, deviceName, keyId);
+
+  cloudDevices.set(registryKey, {
+    registryKey,
+    clusterId,
+    deviceId,
+    keyId,
+    enabled: true,
+    transport: 1,
+    nodeId: 0,
+    device: deviceName,
+    clusterName: clusterRecord.clusterName || clusterId,
+    ip: "",
+    role: 0,
+    online: 0,
+    deviceState: 0,
+    relayMask: 0,
+    sourceMasterNodeId: 0,
+    backendKey: clusterRecord.backendKey || "",
+    devicePublicPem: deviceBundle.devicePublicPem,
+    devicePrivatePem: deviceBundle.devicePrivatePem,
+    deviceFingerprint: deviceBundle.deviceFingerprint,
+    certificatePayload: deviceBundle.certificatePayload,
+    certificateSignature: deviceBundle.certificateSignature,
+    firstSeenAt: nowIso(),
+    lastSeenAt: "",
+    lastUpdatedAt: nowIso(),
+  });
+
+  clusterRecord.knownDevices = Array.from(cloudDevices.values()).filter((item) => item.clusterId === clusterId).length;
+  clusterRecord.lastUpdatedAt = nowIso();
+  cloudClusters.set(clusterId, clusterRecord);
+
+  scheduleCloudRegistrySave();
+  scheduleStateBroadcast();
+  return res.json({ ok: true, device: cloudDeviceSummary(cloudDevices.get(registryKey)) });
+});
+
+app.get("/api/cloud/devices/:clusterId/:deviceId/provision", (req, res) => {
+  const clusterRecord = findCloudClusterRecord(req.params.clusterId);
+  const deviceRecord = findCloudDeviceRecord(req.params.clusterId, req.params.deviceId);
+  if (!clusterRecord) {
+    return res.status(404).json({ ok: false, error: "cloud_cluster_not_found" });
+  }
+  if (!deviceRecord) {
+    return res.status(404).json({ ok: false, error: "cloud_device_not_found" });
+  }
+  const provisioning = buildDeviceProvisioning(clusterRecord, deviceRecord);
+  const bundle = buildDeviceProvisioningBundle(clusterRecord, deviceRecord);
+  return res.json({
+    ok: true,
+    cluster: bundle.cluster,
+    device: bundle.device,
+    provisioning,
+    formFields: buildProvisioningFormFields(provisioning),
+    trustBundle: bundle.trustBundle,
+    deviceBundle: bundle.deviceBundle,
+  });
+});
+
+app.post("/api/cloud/devices/:clusterId/:deviceId/rotate-credential", (req, res) => {
+  const clusterRecord = findCloudClusterRecord(req.params.clusterId);
+  const deviceRecord = findCloudDeviceRecord(req.params.clusterId, req.params.deviceId);
+  if (!clusterRecord) {
+    return res.status(404).json({ ok: false, error: "cloud_cluster_not_found" });
+  }
+  if (!deviceRecord) {
+    return res.status(404).json({ ok: false, error: "cloud_device_not_found" });
+  }
+  rotateDeviceCredential(clusterRecord, deviceRecord);
+  cloudDevices.set(deviceRecord.registryKey, deviceRecord);
+  scheduleCloudRegistrySave();
+  pushEvent("cloud-device-credential-rotated", {
+    clusterId: deviceRecord.clusterId,
+    deviceId: deviceRecord.deviceId,
+    keyId: deviceRecord.keyId,
+    deviceFingerprint: deviceRecord.deviceFingerprint || "",
+  });
+  return res.json({
+    ok: true,
+    bundle: buildDeviceProvisioningBundle(clusterRecord, deviceRecord),
+  });
+});
+
+app.post("/api/cloud/apply/:nodeId", async (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const clusterId = String(req.body.clusterId || "").trim();
+  const deviceId = String(req.body.deviceId || "").trim();
+  const node = resolveKnownNode(nodeId);
+  const clusterRecord = findCloudClusterRecord(clusterId);
+  const deviceRecord = findCloudDeviceRecord(clusterId, deviceId);
+
+  if (!node || !node.ip || !node.online) {
+    return res.status(404).json({ ok: false, error: "node_offline" });
+  }
+  if (!clusterRecord) {
+    return res.status(404).json({ ok: false, error: "cloud_cluster_not_found" });
+  }
+  if (!deviceRecord) {
+    return res.status(404).json({ ok: false, error: "cloud_device_not_found" });
+  }
+
+  try {
+    await applyProvisioningToNode(node, clusterRecord, deviceRecord);
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: "remote_apply_failed", detail: String(error.message || error) });
+  }
+
+  pushEvent("cloud-provision-applied", {
+    nodeId,
+    ip: node.ip,
+    clusterId,
+    deviceId,
+  });
+  return res.json({
+    ok: true,
+    nodeId,
+    clusterId,
+    deviceId,
+    appliedFields: buildDeviceProvisioning(clusterRecord, deviceRecord),
+  });
+});
+
+app.patch("/api/cloud/devices/:clusterId/:deviceId", (req, res) => {
+  const record = findCloudDeviceRecord(req.params.clusterId, req.params.deviceId);
+  if (!record) {
+    return res.status(404).json({ ok: false, error: "cloud_device_not_found" });
+  }
+  if (typeof req.body.enabled === "boolean") {
+    record.enabled = req.body.enabled;
+  }
+  record.lastUpdatedAt = nowIso();
+  cloudDevices.set(record.registryKey, record);
+  if (record.enabled === false) {
+    for (const client of Array.from(clients.values())) {
+      if ((client.cloudClusterId || "") === record.clusterId && (client.cloudDeviceId || "") === record.deviceId) {
+        pushEvent("cloud-device-disabled-disconnect", {
+          nodeId: client.nodeId,
+          device: client.device,
+          clusterId: record.clusterId,
+          deviceId: record.deviceId,
+        });
+        client.socket.destroy();
+      }
+    }
+  }
+  scheduleCloudRegistrySave();
+  scheduleStateBroadcast();
+  return res.json({ ok: true, device: cloudDeviceSummary(record) });
+});
+
+app.post("/api/cloud/devices/from-node", (req, res) => {
+  const nodeId = Number(req.body.nodeId || 0);
+  const node = resolveKnownNode(nodeId);
+  const requestedClusterId = String(req.body.clusterId || "").trim();
+  const clusterId = requestedClusterId || String(node?.cloudClusterId || "").trim() || String(node?.cluster || "").trim();
+  const clusterRecord = findCloudClusterRecord(clusterId);
+  const requestedDeviceId = String(req.body.deviceId || "").trim();
+  const deviceId = requestedDeviceId || deriveFallbackDeviceId(node || { nodeId });
+  const registryKey = `${clusterId}|${deviceId}`;
+  const existing = cloudDevices.get(registryKey) || {};
+  const keyId = String(req.body.keyId || existing.keyId || generateCloudKeyId()).trim();
+  const seenAt = nowIso();
+  let record;
+  let deviceBundle;
+
+  if (!node || !node.nodeId) {
+    return res.status(404).json({ ok: false, error: "node_not_found" });
+  }
+  if (!clusterId) {
+    return res.status(400).json({ ok: false, error: "bad_cluster_id" });
+  }
+  if (!clusterRecord) {
+    return res.status(404).json({ ok: false, error: "cloud_cluster_not_found" });
+  }
+  if (!deviceId) {
+    return res.status(400).json({ ok: false, error: "bad_device_id" });
+  }
+
+  deviceBundle = existing.devicePrivatePem ? {
+    devicePublicPem: existing.devicePublicPem || "",
+    devicePrivatePem: existing.devicePrivatePem || "",
+    deviceFingerprint: existing.deviceFingerprint || "",
+    certificatePayload: existing.certificatePayload || null,
+    certificateSignature: existing.certificateSignature || "",
+  } : buildDeviceCredentialBundle(clusterRecord, deviceId, node?.device || deviceId, keyId);
+
+  record = {
+    ...existing,
+    registryKey,
+    clusterId,
+    deviceId,
+    keyId,
+    enabled: existing.enabled !== false,
+    transport: Number(node.cloudTransport || clusterRecord.transport || CLOUD_TRANSPORT),
+    nodeId: Number(node.nodeId || 0),
+    device: node.device || existing.device || deviceId,
+    clusterName: node.cluster || clusterRecord.clusterName || clusterId,
+    ip: normalizeIp(node.ip),
+    role: Number(node.role || 0),
+    online: Number(node.online ? 1 : 0),
+    deviceState: Number(node.deviceState || 0),
+    relayMask: Number(node.relayMask || 0) >>> 0,
+    sourceMasterNodeId: Number(node.sourceMasterNodeId || 0),
+    backendKey: node.backendKey || clusterRecord.backendKey || "",
+    devicePublicPem: deviceBundle.devicePublicPem,
+    devicePrivatePem: deviceBundle.devicePrivatePem,
+    deviceFingerprint: deviceBundle.deviceFingerprint,
+    certificatePayload: deviceBundle.certificatePayload,
+    certificateSignature: deviceBundle.certificateSignature,
+    firstSeenAt: existing.firstSeenAt || seenAt,
+    lastSeenAt: node.lastSeenAt || seenAt,
+  };
+
+  cloudDevices.set(registryKey, record);
+  syncCloudRegistryFromKnownNode({
+    ...node,
+    cloudClusterId: clusterId,
+    cloudDeviceId: deviceId,
+    cloudKeyId: keyId,
+  });
+  scheduleCloudRegistrySave();
+  pushEvent("cloud-device-created-from-node", {
+    nodeId: Number(node.nodeId || 0),
+    clusterId,
+    deviceId,
+    keyId,
+  });
+  return res.json({ ok: true, device: cloudDeviceSummary(record) });
+});
+
+app.patch("/api/cloud/clusters/:clusterId", (req, res) => {
+  const record = findCloudClusterRecord(req.params.clusterId);
+  if (!record) {
+    return res.status(404).json({ ok: false, error: "cloud_cluster_not_found" });
+  }
+  if (typeof req.body.enabled === "boolean") {
+    record.enabled = req.body.enabled;
+  }
+  record.lastUpdatedAt = nowIso();
+  cloudClusters.set(record.clusterId, record);
+  if (record.enabled === false) {
+    for (const client of Array.from(clients.values())) {
+      if ((client.cloudClusterId || "") === record.clusterId) {
+        pushEvent("cloud-cluster-disabled-disconnect", {
+          nodeId: client.nodeId,
+          device: client.device,
+          clusterId: record.clusterId,
+        });
+        client.socket.destroy();
+      }
+    }
+  }
+  scheduleCloudRegistrySave();
+  scheduleStateBroadcast();
+  return res.json({ ok: true, cluster: cloudClusterSummary(record) });
 });
 
 app.get("/clients", (_req, res) => {
@@ -1772,6 +3249,7 @@ app.post("/broadcast/ping", (_req, res) => {
 });
 
 loadKeyStore();
+loadCloudRegistry();
 
 tcpServer.listen(TCP_PORT, () => {
   console.log(`[backend-test] tcp listening on ${TCP_PORT}`);

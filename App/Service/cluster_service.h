@@ -53,6 +53,9 @@ typedef struct
   uint32_t auth_tag;
   char node_name[CLUSTER_SERVICE_DEVICE_NAME_LEN];
   char cluster_name[CLUSTER_SERVICE_CLUSTER_NAME_LEN];
+  char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+  char cloud_device_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+  char cloud_key_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
   uint8_t mac[6];
 } cluster_node_t;
 

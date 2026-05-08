@@ -3,11 +3,13 @@
 #include "cluster_service.h"
 #include "control_queue.h"
 #include "control_proto.h"
+#include "discovery_service.h"
 #include "fault_service.h"
 #include "../Config/device_config.h"
 #include "../Platform/board_relay.h"
 
 #include "cmsis_os.h"
+#include "task.h"
 
 #include "lwip/ip4_addr.h"
 #include "lwip/netif.h"
@@ -26,7 +28,7 @@
 #define BACKEND_LINK_MASTER_STABLE_DELAY_MS    2000UL
 #define BACKEND_LINK_STALE_RECONNECT_MS        12000UL
 #define BACKEND_LINK_RX_BUFFER_SIZE            512U
-#define BACKEND_LINK_TX_BUFFER_SIZE            2048U
+#define BACKEND_LINK_TX_BUFFER_SIZE            4096U
 
 extern struct netif gnetif;
 
@@ -35,6 +37,8 @@ typedef struct
   uint8_t started;
   uint8_t connected;
   uint8_t status_dirty;
+  uint8_t last_should_run;
+  uint8_t last_should_run_reason;
   int sock;
   uint32_t last_connect_attempt_ms;
   uint32_t last_heartbeat_ms;
@@ -43,6 +47,7 @@ typedef struct
   uint32_t last_rx_ms;
   uint32_t session_id;
   uint32_t master_since_ms;
+  uint32_t last_loop_log_ms;
   osThreadId task_handle;
   backend_link_stats_t stats;
   char rx_buffer[BACKEND_LINK_RX_BUFFER_SIZE];
@@ -51,6 +56,10 @@ typedef struct
 } backend_link_context_t;
 
 static backend_link_context_t g_backend_link_context;
+
+static void backend_link_log(const char *text);
+static void backend_link_log_reason(const char *prefix, uint32_t value);
+static uint8_t backend_link_should_run_reason(void);
 
 void backend_link_service_mark_status_dirty(void)
 {
@@ -102,6 +111,181 @@ static void backend_link_json_escape_copy(char *dst, size_t dst_size, const char
   }
 
   dst[di] = '\0';
+}
+
+static uint8_t backend_link_extract_json_string(const char *line, const char *key, char *buffer, size_t buffer_size)
+{
+  char pattern[64];
+  const char *match;
+  const char *value;
+  size_t index = 0U;
+
+  if ((line == NULL) || (key == NULL) || (buffer == NULL) || (buffer_size == 0U))
+  {
+    return 0U;
+  }
+
+  (void)snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+  match = strstr(line, pattern);
+  if (match == NULL)
+  {
+    return 0U;
+  }
+
+  value = match + strlen(pattern);
+  while ((*value != '\0') && (*value != '\"') && (index < (buffer_size - 1U)))
+  {
+    buffer[index++] = *value++;
+  }
+  buffer[index] = '\0';
+  return (index > 0U) ? 1U : 0U;
+}
+
+static uint8_t backend_link_extract_json_u32(const char *line, const char *key, uint32_t *value_out)
+{
+  char pattern[64];
+  const char *match;
+  char *end_ptr;
+  unsigned long parsed;
+
+  if ((line == NULL) || (key == NULL) || (value_out == NULL))
+  {
+    return 0U;
+  }
+
+  (void)snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+  match = strstr(line, pattern);
+  if (match == NULL)
+  {
+    return 0U;
+  }
+
+  parsed = strtoul(match + strlen(pattern), &end_ptr, 10);
+  if (end_ptr == (match + strlen(pattern)))
+  {
+    return 0U;
+  }
+
+  *value_out = (uint32_t)parsed;
+  return 1U;
+}
+
+static void backend_link_apply_cloud_config(const char *line)
+{
+  device_config_t config;
+  const device_config_t *current_config = device_config_get();
+  char text_buffer[DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN];
+  uint32_t value;
+  uint8_t updated = 0U;
+
+  if (line == NULL)
+  {
+    return;
+  }
+
+  config = *current_config;
+
+  if (backend_link_extract_json_string(line, "device_name", text_buffer, sizeof(text_buffer)) != 0U)
+  {
+    if (strncmp(config.device_name, text_buffer, sizeof(config.device_name)) != 0)
+    {
+      memset(config.device_name, 0, sizeof(config.device_name));
+      strncpy(config.device_name, text_buffer, sizeof(config.device_name) - 1U);
+      updated = 1U;
+    }
+  }
+  if (backend_link_extract_json_u32(line, "cloud_enabled", &value) != 0U)
+  {
+    uint8_t next_value = (uint8_t)(value & 0xFFU);
+    if (config.cloud_enabled != next_value)
+    {
+      config.cloud_enabled = next_value;
+      updated = 1U;
+    }
+  }
+  if (backend_link_extract_json_u32(line, "cloud_transport", &value) != 0U)
+  {
+    uint8_t next_value = (uint8_t)(value & 0xFFU);
+    if (config.cloud_transport != next_value)
+    {
+      config.cloud_transport = next_value;
+      updated = 1U;
+    }
+  }
+  if (backend_link_extract_json_string(line, "cloud_broker_host", text_buffer, sizeof(text_buffer)) != 0U)
+  {
+    if (strncmp(config.cloud_broker_host, text_buffer, sizeof(config.cloud_broker_host)) != 0)
+    {
+      memset(config.cloud_broker_host, 0, sizeof(config.cloud_broker_host));
+      strncpy(config.cloud_broker_host, text_buffer, sizeof(config.cloud_broker_host) - 1U);
+      updated = 1U;
+    }
+  }
+  if (backend_link_extract_json_u32(line, "cloud_broker_port", &value) != 0U)
+  {
+    uint16_t next_value = (uint16_t)(value & 0xFFFFU);
+    if (config.cloud_broker_port != next_value)
+    {
+      config.cloud_broker_port = next_value;
+      updated = 1U;
+    }
+  }
+  if (backend_link_extract_json_string(line, "cloud_cluster_id", text_buffer, sizeof(text_buffer)) != 0U)
+  {
+    if (strncmp(config.cloud_cluster_id, text_buffer, sizeof(config.cloud_cluster_id)) != 0)
+    {
+      memset(config.cloud_cluster_id, 0, sizeof(config.cloud_cluster_id));
+      strncpy(config.cloud_cluster_id, text_buffer, sizeof(config.cloud_cluster_id) - 1U);
+      updated = 1U;
+    }
+  }
+  if (backend_link_extract_json_string(line, "cloud_device_id", text_buffer, sizeof(text_buffer)) != 0U)
+  {
+    if (strncmp(config.cloud_device_id, text_buffer, sizeof(config.cloud_device_id)) != 0)
+    {
+      memset(config.cloud_device_id, 0, sizeof(config.cloud_device_id));
+      strncpy(config.cloud_device_id, text_buffer, sizeof(config.cloud_device_id) - 1U);
+      updated = 1U;
+    }
+  }
+  if (backend_link_extract_json_string(line, "cloud_key_id", text_buffer, sizeof(text_buffer)) != 0U)
+  {
+    if (strncmp(config.cloud_key_id, text_buffer, sizeof(config.cloud_key_id)) != 0)
+    {
+      memset(config.cloud_key_id, 0, sizeof(config.cloud_key_id));
+      strncpy(config.cloud_key_id, text_buffer, sizeof(config.cloud_key_id) - 1U);
+      updated = 1U;
+    }
+  }
+  if (backend_link_extract_json_string(line, "cloud_cluster_ca_fingerprint", text_buffer, sizeof(text_buffer)) != 0U)
+  {
+    if (strncmp(config.cloud_cluster_ca_fingerprint, text_buffer, sizeof(config.cloud_cluster_ca_fingerprint)) != 0)
+    {
+      memset(config.cloud_cluster_ca_fingerprint, 0, sizeof(config.cloud_cluster_ca_fingerprint));
+      strncpy(config.cloud_cluster_ca_fingerprint, text_buffer, sizeof(config.cloud_cluster_ca_fingerprint) - 1U);
+      updated = 1U;
+    }
+  }
+  if (backend_link_extract_json_string(line, "cloud_cluster_binding_secret", text_buffer, sizeof(text_buffer)) != 0U)
+  {
+    if (strncmp(config.cloud_cluster_binding_secret, text_buffer, sizeof(config.cloud_cluster_binding_secret)) != 0)
+    {
+      memset(config.cloud_cluster_binding_secret, 0, sizeof(config.cloud_cluster_binding_secret));
+      strncpy(config.cloud_cluster_binding_secret, text_buffer, sizeof(config.cloud_cluster_binding_secret) - 1U);
+      updated = 1U;
+    }
+  }
+
+  if ((updated != 0U) && (device_config_update_and_save(&config) != 0U))
+  {
+    backend_link_log("[backend] config_cloud applied\r\n");
+    backend_link_service_mark_status_dirty();
+    discovery_service_force_announce();
+  }
+  else if (updated != 0U)
+  {
+    backend_link_log("[backend] config_cloud save failed\r\n");
+  }
 }
 
 static uint8_t backend_link_network_ready(void)
@@ -170,7 +354,15 @@ static void backend_link_log(const char *text)
   }
 }
 
-static uint8_t backend_link_should_run(void)
+static void backend_link_log_reason(const char *prefix, uint32_t value)
+{
+  char buffer[96];
+
+  (void)snprintf(buffer, sizeof(buffer), "%s%lu\r\n", (prefix != NULL) ? prefix : "[backend] ", (unsigned long)value);
+  backend_link_log(buffer);
+}
+
+static uint8_t backend_link_should_run_reason(void)
 {
   cluster_service_state_t cluster_state;
   uint32_t now;
@@ -178,32 +370,49 @@ static uint8_t backend_link_should_run(void)
   if (backend_link_network_ready() == 0U)
   {
     g_backend_link_context.master_since_ms = 0U;
-    return 0U;
+    return 1U;
   }
 
   cluster_service_get_state(&cluster_state);
-  if ((cluster_state.cluster_enabled == 0U) ||
-      (cluster_state.role != CLUSTER_ROLE_MASTER) ||
-      (cluster_state.master_node_id != cluster_state.self_node_id) ||
-      (backend_link_key()[0] == '\0'))
+  if (cluster_state.cluster_enabled == 0U)
   {
     g_backend_link_context.master_since_ms = 0U;
-    return 0U;
+    return 2U;
+  }
+  if (cluster_state.role != CLUSTER_ROLE_MASTER)
+  {
+    g_backend_link_context.master_since_ms = 0U;
+    return 3U;
+  }
+  if (cluster_state.master_node_id != cluster_state.self_node_id)
+  {
+    g_backend_link_context.master_since_ms = 0U;
+    return 4U;
+  }
+  if (backend_link_key()[0] == '\0')
+  {
+    g_backend_link_context.master_since_ms = 0U;
+    return 5U;
   }
 
   now = HAL_GetTick();
   if (g_backend_link_context.master_since_ms == 0U)
   {
     g_backend_link_context.master_since_ms = now;
-    return 0U;
+    return 6U;
   }
 
   if ((int32_t)(now - g_backend_link_context.master_since_ms) < (int32_t)BACKEND_LINK_MASTER_STABLE_DELAY_MS)
   {
-    return 0U;
+    return 7U;
   }
 
-  return 1U;
+  return 0U;
+}
+
+static uint8_t backend_link_should_run(void)
+{
+  return (backend_link_should_run_reason() == 0U) ? 1U : 0U;
 }
 
 static void backend_link_build_ip_text(char *buffer, size_t buffer_size)
@@ -250,6 +459,7 @@ static int backend_link_send_json(const char *json_text)
   if (send_len != (int)len)
   {
     g_backend_link_context.stats.last_error = 1U;
+    backend_link_log_reason("[backend] send fail=", (uint32_t)((send_len < 0) ? (1000 - send_len) : (uint32_t)send_len));
     backend_link_close_socket();
     return -1;
   }
@@ -262,22 +472,38 @@ static int backend_link_send_json(const char *json_text)
 static int backend_link_send_hello(void)
 {
   char ip_text[16];
-  char message[320];
+  char message[512];
+  char cloud_cluster_id_json[DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U];
+  char cloud_device_id_json[DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U];
+  char cloud_key_id_json[DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U];
+  char cloud_cluster_ca_fingerprint_json[DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 2U];
+  char cloud_cluster_binding_secret_json[DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN * 2U];
   cluster_service_state_t cluster_state;
   const device_config_t *config = device_config_get();
 
   cluster_service_get_state(&cluster_state);
   backend_link_build_ip_text(ip_text, sizeof(ip_text));
+  backend_link_json_escape_copy(cloud_cluster_id_json, sizeof(cloud_cluster_id_json), config->cloud_cluster_id);
+  backend_link_json_escape_copy(cloud_device_id_json, sizeof(cloud_device_id_json), config->cloud_device_id);
+  backend_link_json_escape_copy(cloud_key_id_json, sizeof(cloud_key_id_json), config->cloud_key_id);
+  backend_link_json_escape_copy(cloud_cluster_ca_fingerprint_json, sizeof(cloud_cluster_ca_fingerprint_json), config->cloud_cluster_ca_fingerprint);
+  backend_link_json_escape_copy(cloud_cluster_binding_secret_json, sizeof(cloud_cluster_binding_secret_json), config->cloud_cluster_binding_secret);
 
   (void)snprintf(message, sizeof(message),
-                 "{\"type\":\"hello\",\"key\":\"%s\",\"device\":\"%s\",\"cluster\":\"%s\",\"node_id\":%lu,\"master\":%u,\"ip\":\"%s\",\"session\":%lu}\n",
+                 "{\"type\":\"hello\",\"key\":\"%s\",\"device\":\"%s\",\"cluster\":\"%s\",\"node_id\":%lu,\"master\":%u,\"ip\":\"%s\",\"session\":%lu,\"cloud_transport\":%u,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\",\"cloud_cluster_ca_fingerprint\":\"%s\",\"cloud_cluster_binding_secret\":\"%s\"}\n",
                  backend_link_key(),
                  config->device_name,
                  config->cluster_name,
                  (unsigned long)cluster_state.self_node_id,
                  (unsigned int)((cluster_state.role == CLUSTER_ROLE_MASTER) ? 1U : 0U),
                  ip_text,
-                 (unsigned long)g_backend_link_context.session_id);
+                 (unsigned long)g_backend_link_context.session_id,
+                 (unsigned int)config->cloud_transport,
+                 cloud_cluster_id_json,
+                 cloud_device_id_json,
+                 cloud_key_id_json,
+                 cloud_cluster_ca_fingerprint_json,
+                 cloud_cluster_binding_secret_json);
 
   if (backend_link_send_json(message) != 0)
   {
@@ -306,6 +532,7 @@ static int backend_link_send_heartbeat(void)
   }
 
   g_backend_link_context.stats.sent_heartbeat++;
+  backend_link_log("[backend] heartbeat sent\r\n");
   return 0;
 }
 
@@ -316,6 +543,10 @@ static int backend_link_send_status(void)
   char device_json[DEVICE_CONFIG_NAME_MAX_LEN * 2U];
   char cluster_json[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN * 2U];
   char node_name_json[DEVICE_CONFIG_NAME_MAX_LEN * 2U];
+  char cloud_cluster_id_json[DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U];
+  char cloud_device_id_json[DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U];
+  char cloud_key_id_json[DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U];
+  char cloud_cluster_ca_fingerprint_json[DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 2U];
   cluster_service_state_t cluster_state;
   const cluster_node_t *nodes;
   const device_config_t *config = device_config_get();
@@ -329,10 +560,14 @@ static int backend_link_send_status(void)
   backend_link_build_ip_text(ip_text, sizeof(ip_text));
   backend_link_json_escape_copy(device_json, sizeof(device_json), config->device_name);
   backend_link_json_escape_copy(cluster_json, sizeof(cluster_json), config->cluster_name);
+  backend_link_json_escape_copy(cloud_cluster_id_json, sizeof(cloud_cluster_id_json), config->cloud_cluster_id);
+  backend_link_json_escape_copy(cloud_device_id_json, sizeof(cloud_device_id_json), config->cloud_device_id);
+  backend_link_json_escape_copy(cloud_key_id_json, sizeof(cloud_key_id_json), config->cloud_key_id);
+  backend_link_json_escape_copy(cloud_cluster_ca_fingerprint_json, sizeof(cloud_cluster_ca_fingerprint_json), config->cloud_cluster_ca_fingerprint);
 
   used = (size_t)snprintf(g_backend_link_context.tx_buffer,
                           sizeof(g_backend_link_context.tx_buffer),
-                          "{\"type\":\"status\",\"device\":\"%s\",\"cluster\":\"%s\",\"node_id\":%lu,\"master_node_id\":%lu,\"role\":%u,\"term\":%lu,\"relay_mask\":%lu,\"device_state\":%u,\"ip\":\"%s\",\"nodes\":[{\"node_id\":%lu,\"name\":\"%s\",\"ip\":\"%s\",\"role\":%u,\"online\":1,\"device_state\":%u,\"relay_mask\":%lu}",
+                          "{\"type\":\"status\",\"device\":\"%s\",\"cluster\":\"%s\",\"node_id\":%lu,\"master_node_id\":%lu,\"role\":%u,\"term\":%lu,\"relay_mask\":%lu,\"device_state\":%u,\"ip\":\"%s\",\"cloud_transport\":%u,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\",\"cloud_cluster_ca_fingerprint\":\"%s\",\"nodes\":[{\"node_id\":%lu,\"name\":\"%s\",\"ip\":\"%s\",\"role\":%u,\"online\":1,\"device_state\":%u,\"relay_mask\":%lu,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
                           device_json,
                           cluster_json,
                           (unsigned long)cluster_state.self_node_id,
@@ -342,12 +577,20 @@ static int backend_link_send_status(void)
                           (unsigned long)relay_mask,
                           (unsigned int)CLUSTER_DEVICE_STATE_RUNNING,
                           ip_text,
+                          (unsigned int)config->cloud_transport,
+                          cloud_cluster_id_json,
+                          cloud_device_id_json,
+                          cloud_key_id_json,
+                          cloud_cluster_ca_fingerprint_json,
                           (unsigned long)cluster_state.self_node_id,
                           device_json,
                           ip_text,
                           (unsigned int)cluster_state.role,
                           (unsigned int)CLUSTER_DEVICE_STATE_RUNNING,
-                          (unsigned long)relay_mask);
+                          (unsigned long)relay_mask,
+                          cloud_cluster_id_json,
+                          cloud_device_id_json,
+                          cloud_key_id_json);
   if (used >= sizeof(g_backend_link_context.tx_buffer))
   {
     return -1;
@@ -356,6 +599,9 @@ static int backend_link_send_status(void)
   for (index = 0U; index < CLUSTER_SERVICE_NODE_CAPACITY; ++index)
   {
     int written;
+    char node_cloud_cluster_id_json[DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U];
+    char node_cloud_device_id_json[DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U];
+    char node_cloud_key_id_json[DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U];
 
     if (nodes[index].valid == 0U)
     {
@@ -363,18 +609,24 @@ static int backend_link_send_status(void)
     }
 
     backend_link_json_escape_copy(node_name_json, sizeof(node_name_json), nodes[index].node_name);
+    backend_link_json_escape_copy(node_cloud_cluster_id_json, sizeof(node_cloud_cluster_id_json), nodes[index].cloud_cluster_id);
+    backend_link_json_escape_copy(node_cloud_device_id_json, sizeof(node_cloud_device_id_json), nodes[index].cloud_device_id);
+    backend_link_json_escape_copy(node_cloud_key_id_json, sizeof(node_cloud_key_id_json), nodes[index].cloud_key_id);
     backend_link_build_node_ip_text(nodes[index].ip_addr, node_ip_text, sizeof(node_ip_text));
 
     written = snprintf(g_backend_link_context.tx_buffer + used,
                        sizeof(g_backend_link_context.tx_buffer) - used,
-                       ",{\"node_id\":%lu,\"name\":\"%s\",\"ip\":\"%s\",\"role\":%u,\"online\":%u,\"device_state\":%u,\"relay_mask\":%lu}",
+                       ",{\"node_id\":%lu,\"name\":\"%s\",\"ip\":\"%s\",\"role\":%u,\"online\":%u,\"device_state\":%u,\"relay_mask\":%lu,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
                        (unsigned long)nodes[index].node_id,
                        node_name_json,
                        node_ip_text,
                        (unsigned int)nodes[index].role,
                        (unsigned int)nodes[index].online,
                        (unsigned int)nodes[index].device_state,
-                       (unsigned long)nodes[index].relay_mask);
+                       (unsigned long)nodes[index].relay_mask,
+                       node_cloud_cluster_id_json,
+                       node_cloud_device_id_json,
+                       node_cloud_key_id_json);
     if ((written < 0) || ((size_t)written >= (sizeof(g_backend_link_context.tx_buffer) - used)))
     {
       return -1;
@@ -397,6 +649,7 @@ static int backend_link_send_status(void)
   }
 
   g_backend_link_context.stats.sent_status++;
+  backend_link_log("[backend] status sent\r\n");
   return 0;
 }
 
@@ -468,6 +721,13 @@ static void backend_link_handle_command_line(const char *line)
   if (strstr(line, "\"type\":\"ping\"") != NULL)
   {
     (void)backend_link_send_heartbeat();
+    return;
+  }
+
+  if (strstr(line, "\"type\":\"config_cloud\"") != NULL)
+  {
+    backend_link_apply_cloud_config(line);
+    (void)backend_link_send_status();
     return;
   }
 
@@ -593,6 +853,7 @@ static void backend_link_process_rx(void)
 
   if (recv_len == 0)
   {
+    backend_link_log("[backend] recv closed\r\n");
     backend_link_close_socket();
     return;
   }
@@ -606,6 +867,7 @@ static void backend_link_process_rx(void)
     }
 
     g_backend_link_context.stats.last_error = (uint32_t)(1000 + recv_errno);
+    backend_link_log_reason("[backend] recv err=", (uint32_t)recv_errno);
     backend_link_close_socket();
     return;
   }
@@ -655,6 +917,7 @@ static void backend_link_try_connect(void)
   {
     g_backend_link_context.stats.connect_failures++;
     g_backend_link_context.stats.last_error = 2U;
+    backend_link_log_reason("[backend] socket fail=", (uint32_t)errno);
     return;
   }
 
@@ -672,6 +935,7 @@ static void backend_link_try_connect(void)
   {
     g_backend_link_context.stats.connect_failures++;
     g_backend_link_context.stats.last_error = 4U;
+    backend_link_log_reason("[backend] nonblock fail=", (uint32_t)errno);
     backend_link_close_socket();
     return;
   }
@@ -680,6 +944,7 @@ static void backend_link_try_connect(void)
   {
     g_backend_link_context.stats.connect_failures++;
     g_backend_link_context.stats.last_error = 3U;
+    backend_link_log_reason("[backend] connect fail=", (uint32_t)errno);
     backend_link_close_socket();
     return;
   }
@@ -712,9 +977,32 @@ static void backend_link_task(void const *argument)
   for (;;)
   {
     const uint32_t now = HAL_GetTick();
-    const uint8_t should_run = backend_link_should_run();
+    const uint8_t reason = backend_link_should_run_reason();
+    const uint8_t should_run = (reason == 0U) ? 1U : 0U;
 
     g_backend_link_context.stats.should_run = should_run;
+    if ((g_backend_link_context.last_loop_log_ms == 0U) ||
+        ((int32_t)(now - g_backend_link_context.last_loop_log_ms) >= 5000))
+    {
+      char loop_msg[96];
+      (void)snprintf(loop_msg, sizeof(loop_msg),
+                     "[backend] loop connected=%u dirty=%u rx=%lu txh=%lu txs=%lu hw=%lu\r\n",
+                     (unsigned int)g_backend_link_context.connected,
+                     (unsigned int)g_backend_link_context.status_dirty,
+                     (unsigned long)g_backend_link_context.rx_length,
+                     (unsigned long)g_backend_link_context.stats.sent_heartbeat,
+                     (unsigned long)g_backend_link_context.stats.sent_status,
+                     (unsigned long)uxTaskGetStackHighWaterMark(NULL));
+      backend_link_log(loop_msg);
+      g_backend_link_context.last_loop_log_ms = now;
+    }
+    if ((g_backend_link_context.last_should_run != should_run) ||
+        (g_backend_link_context.last_should_run_reason != reason))
+    {
+      backend_link_log_reason("[backend] should_run_reason=", reason);
+      g_backend_link_context.last_should_run = should_run;
+      g_backend_link_context.last_should_run_reason = reason;
+    }
     if (should_run == 0U)
     {
       if (g_backend_link_context.connected != 0U)
@@ -785,12 +1073,16 @@ void backend_link_service_init(void)
   g_backend_link_context.started = 1U;
   g_backend_link_context.sock = -1;
 
-  osThreadDef(BackendLinkTask, backend_link_task, osPriorityBelowNormal, 0, 1024);
+  osThreadDef(BackendLinkTask, backend_link_task, osPriorityBelowNormal, 0, 2048);
   g_backend_link_context.task_handle = osThreadCreate(osThread(BackendLinkTask), NULL);
 }
 
 void backend_link_service_poll(void)
 {
+  if (netif_is_link_up(&gnetif) == 0)
+  {
+    return;
+  }
   backend_link_service_init();
 }
 

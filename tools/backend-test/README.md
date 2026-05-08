@@ -1,18 +1,18 @@
 # backend-test
 
-這是一個給 `autoControl` 韌體測試 TCP 長連線用的簡單後端。
+`backend-test` 目前同時扮演三個角色：
 
-它提供兩個面向：
+1. 現有韌體的 backend 長連線對接端
+2. 未來 cloud / registry / control plane 的本地模擬器
+3. 給瀏覽器操作的管理與控制 UI
 
-- TCP 連線端
-  - 讓叢集 `master` 主動連入
-  - 接收 `hello / heartbeat / status`
-  - 下發 `set_relay / set_mask / set_all`
-- HTTP 管理端
-  - 顯示已連線節點
-  - 顯示事件紀錄
-  - 管理真正的後端金鑰
-  - 手動送控制命令
+目前通訊分成兩層：
+
+- `browser -> backend-test`
+  - `HTTP + SSE`
+- `master device -> backend-test`
+  - 目前是 `plain TCP long link`
+  - 未來預計升級成 `MQTT over TLS`
 
 ## 啟動
 
@@ -22,93 +22,195 @@ npm install
 npm start
 ```
 
-啟動後：
+預設：
 
-- HTTP UI: `http://127.0.0.1:4300/`
-- TCP listener: `42001`
+- UI / HTTP API: `http://127.0.0.1:4300/`
+- TCP backend link: `42001`
 
-## 金鑰機制
+## 已有功能
 
-這版已經不是單一硬編碼金鑰。
+### 1. TCP 長連線接入
 
-- 金鑰會保存在：
-  - `tools/backend-test/data/keys.json`
-- 可在後端 UI 直接：
-  - 產生新金鑰
-  - 啟用 / 停用金鑰
-  - 刪除金鑰
-- 韌體端 `hello.key` 必須對應到這裡某一把已啟用金鑰，否則會收到：
-  - `hello_ack { ok:false, error:"bad_key" }`
+接受來自韌體 master 的：
 
-首次啟動時，如果 `keys.json` 不存在，會自動建立一把：
+- `hello`
+- `heartbeat`
+- `status`
+- `fault_report`
 
-- label: `bootstrap`
-- key: `BACKEND_KEY` 環境變數
-- 若未提供 `BACKEND_KEY`，則預設為：
-  - `dev-key`
+並可下發：
 
-## 環境變數
+- `set_relay`
+- `set_mask`
+- `set_all`
 
-- `HTTP_PORT`
-- `TCP_PORT`
-- `BACKEND_KEY`
-- `DUPLICATE_MASTER_GRACE_MS`
-- `DUPLICATE_MASTER_SCAN_MS`
-- `CLIENT_STALE_MS`
+### 2. 金鑰管理
 
-預設值：
+金鑰資料持久化於：
 
-- `HTTP_PORT=4300`
-- `TCP_PORT=42001`
-- `BACKEND_KEY=dev-key`
-- `DUPLICATE_MASTER_GRACE_MS=15000`
-- `DUPLICATE_MASTER_SCAN_MS=2000`
-- `CLIENT_STALE_MS=12000`
+- `tools/backend-test/data/keys.json`
+
+UI 與 API 支援：
+
+- 新增金鑰
+- 啟用 / 停用金鑰
+- 刪除金鑰
+
+若資料檔不存在，會自動建立一把 bootstrap key：
+
+- `label = bootstrap`
+- `key = BACKEND_KEY` 環境變數
+- 若未設定 `BACKEND_KEY`，預設為 `dev-key`
+
+### 3. 已知裝置與 relay 控制
+
+backend 會維護：
+
+- 目前 TCP 鏈路
+- 已知裝置
+- relay 設定快取
+
+UI 可直接操作：
+
+- master 本機 relay
+- backend -> master -> member relay
+- relay 名稱
+- relay enabled
+- relay remember_state
+- relay boot_default_on
+- 裝置名稱
+
+### 4. cloud identity registry
+
+backend 會從 master 上報的 payload 裡整理出兩份 registry：
+
+- `cloud cluster identity`
+- `cloud device identity`
+
+資料持久化於：
+
+- `tools/backend-test/data/cloud-clusters.json`
+- `tools/backend-test/data/cloud-devices.json`
+
+目前 registry 會記錄：
+
+- `cloud_cluster_id`
+- `cloud_device_id`
+- `cloud_key_id`
+- `cloud_transport`
+- 對應 `nodeId`
+- 對應裝置名稱 / 叢集名稱
+- `online`
+- `role`
+- `relayMask`
+- `lastSeenAt`
+
+並支援：
+
+- 預建 cluster identity
+- 預建 device identity
+- 啟用 / 停用 cluster identity
+- 啟用 / 停用 device identity
+
+當 cluster/device 被停用時：
+
+- 現有 TCP client 會立即斷線
+- 後續 `hello` 也會被拒絕
+
+### 5. fault / crash 接收
+
+韌體發生 fault 後會：
+
+1. 將 fault 詳細資訊存到 RTC backup registers
+2. 自動 reset
+3. 開機重連 backend 後送出 `fault_report`
+
+backend 目前會：
+
+- 在 UI `事件紀錄` 顯示
+- 在 console 直接 `console.error(...)`
 
 ## HTTP API
 
+### UI 與狀態
+
 - `GET /`
-  - 後端管理 UI
+- `GET /api/stream`
 - `GET /api/summary`
+- `GET /clients`
+- `GET /api/clients`
+- `GET /api/known-nodes`
+- `GET /events`
+
+### 金鑰
+
 - `GET /api/keys`
 - `POST /api/keys`
 - `PATCH /api/keys/:id`
 - `DELETE /api/keys/:id`
-- `GET /clients`
-- `GET /events`
-- `POST /broadcast/ping`
+
+### cloud registry
+
+- `GET /api/cloud/devices`
+- `GET /api/cloud/clusters`
+- `POST /api/cloud/clusters`
+- `POST /api/cloud/devices`
+- `PATCH /api/cloud/devices/:clusterId/:deviceId`
+- `PATCH /api/cloud/clusters/:clusterId`
+
+### 裝置設定 / relay 設定
+
+- `POST /api/config/:nodeId/device-name`
+- `GET /api/config/:nodeId/relays`
+- `POST /api/config/:nodeId/relay`
+
+### 控制命令
+
 - `POST /send/:nodeId/relay`
 - `POST /send/:nodeId/mask`
 - `POST /send/:nodeId/all`
+- `POST /broadcast/ping`
 
-## 範例
+## relay 控制策略
 
-控制 master 本機 relay：
+目前 backend UI 為了減少 request 洪水，策略是：
 
-```powershell
-curl.exe -X POST http://127.0.0.1:4300/send/579948958/relay ^
-  -H "Content-Type: application/json" ^
-  --data "{\"channel\":1,\"value\":1}"
-```
+1. 按下按鈕先進入 pending
+2. 同一台節點 `500ms` 內的多次切換合併成一個 `mask`
+3. 命令送出後，不再先假改 server 狀態
+4. 由 backend 背景做狀態確認
+5. 真實狀態一致後才解凍
 
-透過 master 轉送控制 member：
+另外：
 
-```powershell
-curl.exe -X POST http://127.0.0.1:4300/send/579948958/relay ^
-  -H "Content-Type: application/json" ^
-  --data "{\"targetNodeId\":1165657530,\"channel\":1,\"value\":1}"
-```
+- 同一台節點只保留一個 in-flight confirm
+- remote login token 會快取 `60s`
+- stale client 不再假裝 `200 OK`
 
-## 容錯邏輯
+## stale / offline 規則
 
-- 同一組 `key + cluster` 若出現多個 master：
-  - 先進入 grace period
-  - 超時後只記：
-    - `duplicate-master-warning`
-  - 不主動斷線
-- stale client：
-  - 只記：
-    - `stale-client-warning`
-  - 不主動斷線
-- 同一個 `nodeId` 若有新連線進來：
-  - 新連線取代舊連線
+預設：
+
+- `CLIENT_STALE_MS = 12000`
+- `DUPLICATE_MASTER_SCAN_MS = 2000`
+
+backend 會在下列情況把裝置標成離線：
+
+- TCP socket `close`
+- TCP socket `error`
+- 超過 stale 時間沒有新訊息
+
+## 未來方向
+
+這個 backend-test 已開始承擔未來 cloud 的資料模型，但目前真正的 cloud transport 還沒切到 MQTT/TLS。
+
+後續規劃：
+
+1. `master -> cloud` 從 raw TCP 過渡到 `MQTT over TLS`
+2. 保留：
+   - 每台裝置獨立 `device identity`
+   - 每個叢集獨立 `cluster identity`
+3. backend-test 從目前 TCP emulator 逐步演進成：
+   - MQTT broker bridge
+   - cloud registry UI
+   - control plane simulator

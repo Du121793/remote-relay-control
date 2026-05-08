@@ -15,6 +15,9 @@ int discovery_proto_build_announce(char *buffer,
                                    const char *service,
                                    const char *cluster,
                                    const char *device,
+                                   const char *cloud_cluster_id,
+                                   const char *cloud_device_id,
+                                   const char *cloud_key_id,
                                    uint32_t node_id,
                                    uint8_t role,
                                    uint32_t term,
@@ -42,6 +45,9 @@ typedef struct
   uint32_t relay_mask;
   uint32_t enabled_mask;
   uint8_t auto_join;
+  char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+  char cloud_device_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+  char cloud_key_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
   uint32_t ip_addr;
   uint16_t port;
   uint8_t mac[6];

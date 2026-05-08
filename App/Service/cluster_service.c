@@ -1,11 +1,15 @@
 #include "cluster_service.h"
 #include "backend_link_service.h"
+#include "mqtt_link_service.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
+#include "lwip/netif.h"
 #include <string.h>
 
 #include "stm32f7xx_hal.h"
+
+extern struct netif gnetif;
 
 #define CLUSTER_SERVICE_STALE_TIMEOUT_MS   6000UL
 #define CLUSTER_SERVICE_BAN_CAPACITY       16U
@@ -40,11 +44,13 @@ typedef struct
 static cluster_service_context_t g_cluster_context;
 
 static void cluster_service_health_task(void *argument);
+static void cluster_service_ensure_health_task(void);
 static uint32_t cluster_service_health_score_from_lateness(uint32_t lateness_ms);
 
 static void cluster_service_mark_backend_dirty(void)
 {
   backend_link_service_mark_status_dirty();
+  mqtt_link_service_mark_status_dirty();
 }
 
 static uint8_t cluster_service_device_state_from_relay_mask(uint32_t relay_mask)
@@ -590,13 +596,25 @@ void cluster_service_init(void)
   g_cluster_context.health_bad_since_ms = 0U;
   g_cluster_context.health_good_since_ms = 0U;
   memset(g_cluster_context.banned_node_ids, 0, sizeof(g_cluster_context.banned_node_ids));
+  g_cluster_context.initialized = 1U;
+}
+
+static void cluster_service_ensure_health_task(void)
+{
+  if (g_cluster_context.health_task_handle != NULL)
+  {
+    return;
+  }
+  if (xTaskGetSchedulerState() != taskSCHEDULER_RUNNING)
+  {
+    return;
+  }
   (void)xTaskCreate(cluster_service_health_task,
                     "ClusterHealth",
-                    256U,
+                    1024U,
                     NULL,
                     tskIDLE_PRIORITY + 1U,
                     &g_cluster_context.health_task_handle);
-  g_cluster_context.initialized = 1U;
 }
 
 void cluster_service_poll(void)
@@ -605,6 +623,10 @@ void cluster_service_poll(void)
   uint32_t previous_master_node_id;
 
   cluster_service_init();
+  if (netif_is_link_up(&gnetif) != 0)
+  {
+    cluster_service_ensure_health_task();
+  }
   previous_role = g_cluster_context.state.role;
   previous_master_node_id = g_cluster_context.state.master_node_id;
   cluster_service_drop_stale_nodes(HAL_GetTick());

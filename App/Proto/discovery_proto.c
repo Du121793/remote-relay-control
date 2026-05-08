@@ -60,6 +60,9 @@ int discovery_proto_build_announce(char *buffer,
                                    const char *service,
                                    const char *cluster,
                                    const char *device,
+                                   const char *cloud_cluster_id,
+                                   const char *cloud_device_id,
+                                   const char *cloud_key_id,
                                    uint32_t node_id,
                                    uint8_t role,
                                    uint32_t term,
@@ -73,10 +76,13 @@ int discovery_proto_build_announce(char *buffer,
                                    const uint8_t mac[6])
 {
   return snprintf(buffer, buffer_size,
-                  "type=announce ver=2 service=%s cluster=%s device=%s node=%lu role=%u term=%lu load=%lu auth=%lu relay=%lu enabled=%lu auto=%u ip=%s port=%u mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                  "type=announce ver=3 service=%s cluster=%s device=%s cloud_cluster=%s cloud_device=%s cloud_key=%s node=%lu role=%u term=%lu load=%lu auth=%lu relay=%lu enabled=%lu auto=%u ip=%s port=%u mac=%02X:%02X:%02X:%02X:%02X:%02X",
                   service,
                   cluster,
                   device,
+                  cloud_cluster_id,
+                  cloud_device_id,
+                  cloud_key_id,
                   (unsigned long)node_id,
                   (unsigned int)role,
                   (unsigned long)term,
@@ -106,8 +112,8 @@ uint8_t discovery_proto_parse_announce(const void *payload,
                                        uint16_t length,
                                        discovery_proto_announce_t *announce)
 {
-  char text[256];
-  char value[40];
+  char text[512];
+  char value[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
   ip4_addr_t ip_addr;
   unsigned int mac[6];
   uint32_t parsed_u32;
@@ -126,7 +132,7 @@ uint8_t discovery_proto_parse_announce(const void *payload,
   text[length] = '\0';
   memset(announce, 0, sizeof(*announce));
 
-  if ((strstr(text, "type=announce") == NULL) || (strstr(text, "ver=2") == NULL))
+  if ((strstr(text, "type=announce") == NULL) || (strstr(text, "ver=3") == NULL))
   {
     return 0U;
   }
@@ -140,6 +146,18 @@ uint8_t discovery_proto_parse_announce(const void *payload,
     return 0U;
   }
   if (!discovery_proto_extract_value(text, "device=", announce->device, sizeof(announce->device)))
+  {
+    return 0U;
+  }
+  if (!discovery_proto_extract_value(text, "cloud_cluster=", announce->cloud_cluster_id, sizeof(announce->cloud_cluster_id)))
+  {
+    return 0U;
+  }
+  if (!discovery_proto_extract_value(text, "cloud_device=", announce->cloud_device_id, sizeof(announce->cloud_device_id)))
+  {
+    return 0U;
+  }
+  if (!discovery_proto_extract_value(text, "cloud_key=", announce->cloud_key_id, sizeof(announce->cloud_key_id)))
   {
     return 0U;
   }

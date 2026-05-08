@@ -13,8 +13,12 @@ extern "C" {
 #define DEVICE_CONFIG_PASSWORD_HASH_LEN      32U
 #define DEVICE_CONFIG_BACKEND_HOST_MAX_LEN   64U
 #define DEVICE_CONFIG_BACKEND_KEY_MAX_LEN    64U
+#define DEVICE_CONFIG_CLOUD_ID_MAX_LEN       64U
+#define DEVICE_CONFIG_CLOUD_HOST_MAX_LEN     64U
+#define DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN 96U
+#define DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN   128U
 #define DEVICE_CONFIG_MAGIC                  0x43464731UL
-#define DEVICE_CONFIG_VERSION                3U
+#define DEVICE_CONFIG_VERSION                5U
 
 typedef struct
 {
@@ -41,6 +45,17 @@ typedef struct
   uint16_t backend_port;
   uint16_t reserved1;
   char backend_key[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
+  uint8_t cloud_enabled;
+  uint8_t cloud_transport;
+  uint8_t reserved2[2];
+  char cloud_broker_host[DEVICE_CONFIG_CLOUD_HOST_MAX_LEN];
+  uint16_t cloud_broker_port;
+  uint16_t reserved3;
+  char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+  char cloud_device_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+  char cloud_key_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+  char cloud_cluster_ca_fingerprint[DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN];
+  char cloud_cluster_binding_secret[DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN];
   uint32_t saved_relay_mask;
   device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
 } device_config_t;

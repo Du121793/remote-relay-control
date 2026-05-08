@@ -1,57 +1,71 @@
-# mem
+﻿# mem
 
-## 2026-05-06 最新接手重點
+## 2026-05-09 http-backpressure-debug branch summary
 
-- HTTP 現況已重新判斷：目前不是先前 `GET /` 首頁 body 截斷，而是 listener 沒穩定建立，症狀是瀏覽器連 port 80 被拒絕，且 UART 沒有 `[http] up 80`。
-- 已檢查 [FINISH.md](/C:/Users/Public/Code/stm32/f767/autoControl/FINISH.md) 以前的 HTTP 問題：
-  - 舊問題：首頁過大、close 太早、body 截斷
-  - 目前問題：更前面，HTTP listener 建立路徑不穩
-- 已將 [App/Service/http_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/http_service.c) 改成不再依賴獨立 `HttpService` task：
-  - 移除 task create 路徑
-  - `http_service_poll()` 改為直接 `tcpip_try_callback(http_service_tcpip_step, NULL)`
-- 已在 [Core/Src/main.c](/C:/Users/Public/Code/stm32/f767/autoControl/Core/Src/main.c) 的 `StartDefaultTask()` 主迴圈中加入 `http_service_poll();`
-- 最新 build：
-  - `Program Size: Code=107366 RO-data=13426 RW-data=15940 ZI-data=50852`
+- This branch captures the unstable cloud/backend/http investigation after commit `41a16e8`.
+- Main code changes on this branch:
+  - delayed background task bring-up until link-up for `backend_link_service`, `discovery_service`, and `ClusterHealth`
+  - enlarged several task stacks: `defaultTask`, `BackendLinkTask`, `CfgSave`, `DiscoveryService`, `ClusterHealth`
+  - added backend runtime diagnostics: `should_run_reason`, periodic backend loop counters, send/recv diagnostics
+  - changed HTTP request parsing to per-connection buffering with `Content-Length` accumulation
+  - changed dynamic HTTP responses to per-connection response buffers instead of one shared global buffer
+  - reduced backend cloud auto-provision side effects; backend now mostly observes instead of aggressively pushing config
+  - added cloud registry / identity WIP files and backend tooling for future MQTT/TLS migration
+  - added hard HTTP backpressure experiment with low connection pool and single-flight accept pause/resume
+
+- Problems observed on this branch:
+  - HTTP service can still stall under repeated browser/API access.
+  - `GET /api/config/cluster` is the most reproducible trigger: request enters handler and prints `cfg len=...`, but close completion often never happens.
+  - local frontend/browser access can still wedge the board even when backend heartbeat is otherwise stable.
+  - cluster election is still not fully converged; duplicate-master condition is still possible.
+  - cloud identity / provisioning work is incomplete and not production-safe yet.
+
+- What was confirmed:
+  - startup MemManage / HardFault regression was improved by delaying early task creation.
+  - backend long link can stay alive much longer than earlier failing versions.
+  - the newest instability is concentrated in MCU-side HTTP handling, not only frontend polling pressure.
+
+- Recommendation:
+  - do not merge this branch into `master` yet.
+  - keep it as a WIP diagnostic branch for HTTP / cloud / cluster convergence work.
+## 2026-05-06 ??唳??暺?
+- HTTP ?暹?撌脤??啣?瘀??桀?銝?? `GET /` 擐? body ?芣嚗 listener 瘝帘摰遣蝡????舐汗?券?port 80 鋡急?蝯?銝?UART 瘝? `[http] up 80`??- 撌脫炎??[FINISH.md](/C:/Users/Public/Code/stm32/f767/autoControl/FINISH.md) 隞亙???HTTP ??嚗?  - ??憿?擐??之?lose 憭芣?ody ?芣
+  - ?桀???嚗?嚗TTP listener 撱箇?頝臬?銝帘
+- 撌脣? [App/Service/http_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/http_service.c) ?寞?銝?靘陷?函? `HttpService` task嚗?  - 蝘駁 task create 頝臬?
+  - `http_service_poll()` ?寧?湔 `tcpip_try_callback(http_service_tcpip_step, NULL)`
+- 撌脣 [Core/Src/main.c](/C:/Users/Public/Code/stm32/f767/autoControl/Core/Src/main.c) ??`StartDefaultTask()` 銝餉艘?葉? `http_service_poll();`
+- ???build嚗?  - `Program Size: Code=107366 RO-data=13426 RW-data=15940 ZI-data=50852`
   - `0 Error(s), 0 Warning(s)`
 
-## 2026-05-06 Web relay 延遲新結論
-
-- 使用者最新回報：首頁已經能打開，但 Web UI 控制 relay 回應極慢，久了網頁又會變不穩。
-- 重新審查後確認：HTTP 與 TCP control 都是在 lwIP `tcpip` thread 裡處理請求，原本又同步呼叫 `control_queue_submit()` 等 worker 完成，這會阻塞整個 lwIP thread。
-- 已改成：
-  - [App/Service/http_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/http_service.c)：HTTP relay API 直接 `relay_domain_execute(...)`
-  - [App/Service/control_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/control_service.c)：TCP control 也直接 `relay_domain_execute(...)`
-- 另外已放寬 HTTP 連線資源：
-  - `HTTP_CONN_POOL_SIZE: 4 -> 8`
+## 2026-05-06 Web relay 撱園?啁?隢?
+- 雿輻???啣??梧?擐?撌脩??賣???雿?Web UI ?批 relay ??璆菜嚗?鈭雯????銝帘??- ?撖拇敺Ⅱ隤?HTTP ??TCP control ?賣??lwIP `tcpip` thread 鋆∟???瘙????甇亙??`control_queue_submit()` 蝑?worker 摰?嚗??餃??游?lwIP thread??- 撌脫??
+  - [App/Service/http_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/http_service.c)嚗TTP relay API ?湔 `relay_domain_execute(...)`
+  - [App/Service/control_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/control_service.c)嚗CP control 銋??`relay_domain_execute(...)`
+- ?血?撌脫撖?HTTP ???鞈?嚗?  - `HTTP_CONN_POOL_SIZE: 4 -> 8`
   - `tcp_listen_with_backlog(...): 2 -> 4`
-- 最新 build：
-  - `Program Size: Code=107038 RO-data=13426 RW-data=15940 ZI-data=50932`
+- ???build嚗?  - `Program Size: Code=107038 RO-data=13426 RW-data=15940 ZI-data=50932`
   - `0 Error(s), 0 Warning(s)`
 
-## 2026-05-06 全面審查補充
+## 2026-05-06 ?券撖拇鋆?
 
-- 沒有看到 thread / queue 被無限重建的直接問題；主要 task/queue 都有單次建立守門。
-- 但發現一個更可能讓「久了整體變慢」的點：
-  - [App/Service/control_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/control_service.c) 原本送完 response 就立即 `tcp_close()`
-  - 這對短連線高頻控制很危險，因為 send queue 未清空時會產生未乾淨回收的 PCB 風險
-- 已修正 `control_service` 關閉時序：
-  - 改為 `tcp_sent` / `tcp_poll` 等待 queue 清空後才 close
-  - 拿掉共享 `static client_ctx`
+- 瘝?? thread / queue 鋡怎??撱箇??湔??嚗蜓閬?task/queue ?賣??格活撱箇?摰???- 雿?曆???航霈?鈭擃??Ｕ?暺?
+  - [App/Service/control_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/control_service.c) ??? response 撠梁???`tcp_close()`
+  - ???剝??擃?批敺?迎?? send queue ?芣?蝛箸???銋暹楊???PCB 憸券
+- 撌脖耨甇?`control_service` ????嚗?  - ?寧 `tcp_sent` / `tcp_poll` 蝑? queue 皜征敺? close
+  - ?踵??曹澈 `static client_ctx`
 
-## 專案現況
+## 撠??暹?
 
-- 專案：`STM32F767ZI + FreeRTOS + lwIP + Keil/ARMCLANG`
-- 主要功能：
-  - 乙太網路 DHCP
+- 撠?嚗STM32F767ZI + FreeRTOS + lwIP + Keil/ARMCLANG`
+- 銝餉??嚗?  - 銋云蝬脰楝 DHCP
   - TCP control service
   - UDP discovery service
   - HTTP service / Web UI
-  - 16 路 relay 控制
+  - 16 頝?relay ?批
 
-## 已完成的重要基線
+## 撌脣??????箇?
 
-- 大量 lwIP `UNALIGNED HardFault` 已處理
-  - `ip4.c`
+- 憭折? lwIP `UNALIGNED HardFault` 撌脰???  - `ip4.c`
   - `dhcp.c`
   - `etharp.c`
   - `icmp.c`
@@ -59,285 +73,231 @@
   - `pbuf.c`
   - `tcp_in.c`
   - `cc.h`
-- ETH RX custom pbuf 初始化已改成安全手動路徑
-- `HAL_ETH_ReleaseTxPacket()` 已改成只在有 pending TX 時才呼叫
-- PHY fallback 已改成：
+- ETH RX custom pbuf ???歇?寞?摰??頝臬?
+- `HAL_ETH_ReleaseTxPacket()` 撌脫??冽? pending TX ???澆
+- PHY fallback 撌脫??
   - `100HD`
   - `10HD`
-- `control_service` / `discovery_service` / `http_service` 都已 RTOS 化
+- `control_service` / `discovery_service` / `http_service` ?賢歇 RTOS ??
+## ?桀?甇?餈賜???
 
-## 目前正在追的問題
-
-- 目前不是 HardFault
-- 不是 scheduler 卡死
-- 不是 `osDelay(100)` 卡死
-- 不是 `HAL_ETH_Start()` 前的 PHY/MAC bring-up
-- 最新卡點收斂在：
-  - `ethlink start mac ok`
+- ?桀?銝 HardFault
+- 銝 scheduler ?⊥香
+- 銝 `osDelay(100)` ?⊥香
+- 銝 `HAL_ETH_Start()` ?? PHY/MAC bring-up
+- ??啣暺?嚗?  - `ethlink start mac ok`
   - `ethlink netif link up`
-  - 之後沒有更多 log
+  - 銋?瘝??游? log
 
-## 最新技術判讀
+## ??唳?銵霈
 
-### 第一階段判讀
+### 蝚砌??挾?方?
 
-- 原先懷疑：
-  - `tcpip_mbox` 被 service tasks 的 `tcpip_callback()` 塞滿
-- 已做修正：
-  - `control_service_task()` 改成 `tcpip_try_callback()`
-  - `discovery_service_task()` 改成 `tcpip_try_callback()`
-  - `http_service_task()` 改成 `tcpip_try_callback()`
-  - `ethernetif_schedule_netif_callback()` 改成 `tcpip_try_callback()`
-  - `TCPIP_MBOX_SIZE` 從 `6` 拉到 `16`
-- 但使用者最新 log 顯示，問題仍停在：
-  - `ethlink netif link up`
+- ???瑞?嚗?  - `tcpip_mbox` 鋡?service tasks ??`tcpip_callback()` 憛遛
+- 撌脣?靽格迤嚗?  - `control_service_task()` ?寞? `tcpip_try_callback()`
+  - `discovery_service_task()` ?寞? `tcpip_try_callback()`
+  - `http_service_task()` ?寞? `tcpip_try_callback()`
+  - `ethernetif_schedule_netif_callback()` ?寞? `tcpip_try_callback()`
+  - `TCPIP_MBOX_SIZE` 敺?`6` ? `16`
+- 雿蝙?刻???log 憿舐內嚗?憿??嚗?  - `ethlink netif link up`
 
-### 第二階段判讀
+### 蝚砌??挾?方?
 
-- `netif_set_link_up()` 內部會先跑：
+- `netif_set_link_up()` ?折??頝?
   - `dhcp_network_changed(netif)`
-- 專案原本在 [lwip.c](/C:/Users/Public/Code/stm32/f767/autoControl/LWIP/App/lwip.c) 的 `MX_LWIP_Init()` 裡就先 `dhcp_start(&gnetif)`
-- 這可能讓 `netif_set_link_up()` 在 link up 路徑裡背到 DHCP 狀態轉換
+- 撠????[lwip.c](/C:/Users/Public/Code/stm32/f767/autoControl/LWIP/App/lwip.c) ??`MX_LWIP_Init()` 鋆∪停??`dhcp_start(&gnetif)`
+- ??質? `netif_set_link_up()` ??link up 頝臬?鋆∟???DHCP ?????
+## ??唬耨甇?
+### 1. 撱嗅? DHCP ????
 
-## 最新修正
-
-### 1. 延後 DHCP 啟動時機
-
-- 已從 [lwip.c](/C:/Users/Public/Code/stm32/f767/autoControl/LWIP/App/lwip.c) 移除：
-  - `dhcp_start(&gnetif);`
-- 改成在 [ethernetif.c](/C:/Users/Public/Code/stm32/f767/autoControl/LWIP/Target/ethernetif.c) 的 `ethernetif_netif_up_callback()` 裡：
+- 撌脣? [lwip.c](/C:/Users/Public/Code/stm32/f767/autoControl/LWIP/App/lwip.c) 蝘駁嚗?  - `dhcp_start(&gnetif);`
+- ?寞???[ethernetif.c](/C:/Users/Public/Code/stm32/f767/autoControl/LWIP/Target/ethernetif.c) ??`ethernetif_netif_up_callback()` 鋆∴?
   1. `netif_set_up()`
   2. `netif_set_link_up()`
   3. `dhcp_start(netif)`
 
-### 2. 加入 callback 內部最小定位 log
+### 2. ? callback ?折?撠?雿?log
 
-- 新 log：
-  - `netif cb up a`
+- ??log嚗?  - `netif cb up a`
   - `netif cb up b`
   - `netif cb up c`
   - `netif cb dhcp start`
   - `netif cb up d`
 
-## 下一輪要怎麼判讀
+## 銝?頛芾??獐?方?
 
-- 如果只看到：
+- 憒??芰??堆?
   - `netif cb up a`
   - `netif cb up b`
-  - 然後停住
-  - 代表卡在 `netif_set_link_up()`
+  - ?嗅???
+  - 隞?”?∪ `netif_set_link_up()`
 
-- 如果看到：
-  - `netif cb up c`
-  - 但沒有 `netif cb dhcp start`
-  - 代表卡在 `dhcp_start()`
+- 憒??嚗?  - `netif cb up c`
+  - 雿???`netif cb dhcp start`
+  - 隞?”?∪ `dhcp_start()`
 
-- 如果全部都有：
-  - 下一步就看：
+- 憒??券?賣?嚗?  - 銝?甇亙停??
     - `[net] tx ok ...`
-    - DHCP Discover 抓包
-    - DHCP state 是否從 `selecting` 前進
-
-## 使用者最新實測結論
-
-- 抓包目前看不到任何 DHCP request
-- 最新幾輪 log 都停在：
+    - DHCP Discover ??
+    - DHCP state ?臬敺?`selecting` ??
+## 雿輻???啣祕皜祉?隢?
+- ???桀????唬遙雿?DHCP request
+- ??啣嗾頛?log ?賢??剁?
   - `ethlink start mac ok`
   - `ethlink netif link up`
 
-## 最新 build
+## ???build
 
 - `Program Size: Code=108350 RO-data=14082 RW-data=15940 ZI-data=33508`
 - `0 Error(s), 0 Warning(s)`
 
-## 2026-05-06 重新審查後的接手摘要
+## 2026-05-06 ?撖拇敺??交???
 
-### 這一輪真正確認的問題點
-
-- 先前的診斷程式碼已經過度入侵送包路徑，不能再拿那些 log 當根因
-- 兩個最明顯的回歸：
-  - `HardFault_Handler()` 被改成空死循環，真 fault 會完全無聲
-  - DHCP / lwIP / HAL ETH TX 內被插入大量同步 `HAL_UART_Transmit()`，這會直接污染第一個封包的發送路徑
-
-### 這一輪已做的事
-
-- 恢復 [Core/Src/stm32f7xx_it.c](/C:/Users/Public/Code/stm32/f767/autoControl/Core/Src/stm32f7xx_it.c) 的 `HardFault_Handler()`：
-  - 改回進入既有 `hardfault_dump()` 的 naked wrapper
-- 移除深層同步診斷：
-  - [Middlewares/Third_Party/LwIP/src/core/ipv4/dhcp.c](/C:/Users/Public/Code/stm32/f767/autoControl/Middlewares/Third_Party/LwIP/src/core/ipv4/dhcp.c)
+### ??頛芰?甇?Ⅱ隤???暺?
+- ???那?瑞?撘Ⅳ撌脩??漲?乩噩??頝臬?嚗??賢??輸鈭?log ?嗆??- ?拙??＊??甇賂?
+  - `HardFault_Handler()` 鋡急?征甇餃儐?堆???fault ???函??  - DHCP / lwIP / HAL ETH TX ?扯◤?憭折??郊 `HAL_UART_Transmit()`嚗??湔瘙⊥?蝚砌??????潮楝敺?
+### ??頛芸歇??鈭?
+- ?Ｗ儔 [Core/Src/stm32f7xx_it.c](/C:/Users/Public/Code/stm32/f767/autoControl/Core/Src/stm32f7xx_it.c) ??`HardFault_Handler()`嚗?  - ?孵??脣?Ｘ? `hardfault_dump()` ??naked wrapper
+- 蝘駁瘛勗惜?郊閮箸嚗?  - [Middlewares/Third_Party/LwIP/src/core/ipv4/dhcp.c](/C:/Users/Public/Code/stm32/f767/autoControl/Middlewares/Third_Party/LwIP/src/core/ipv4/dhcp.c)
   - [LWIP/Target/ethernetif.c](/C:/Users/Public/Code/stm32/f767/autoControl/LWIP/Target/ethernetif.c)
   - [Drivers/STM32F7xx_HAL_Driver/Src/stm32f7xx_hal_eth.c](/C:/Users/Public/Code/stm32/f767/autoControl/Drivers/STM32F7xx_HAL_Driver/Src/stm32f7xx_hal_eth.c)
-- 保留高層狀態：
+- 靽?擃惜???
   - link up/down
-  - DHCP 狀態摘要
-  - 必要的 PHY fallback 訊息
+  - DHCP ???閬?  - 敹???PHY fallback 閮
 
-### 為什麼這樣改
-
-- 使用者最後看到停在：
-  - `dhcp_discover()` 之後
-  - 或 `ethlink netif link up` 一帶
-- 但那時 code 已經在：
+### ?箔?暻潮見??
+- 雿輻??敺??啣??剁?
+  - `dhcp_discover()` 銋?
+  - ??`ethlink netif link up` 銝撣?- 雿??code 撌脩??剁?
   - lwIP core
   - ethernetif TX path
   - HAL ETH driver
-  內部都插了 blocking UART
-- 這會讓「沒看到封包」和「真的沒送到 MAC/DMA」兩件事失去可分辨性
-
-### 最新 build
+  ?折?賣?鈭?blocking UART
+- ??霈??撠???????? MAC/DMA?隞嗡?憭勗?臬?颲冽?
+### ???build
 
 - `Program Size: Code=107366 RO-data=14066 RW-data=15940 ZI-data=33500`
 - `0 Error(s), 0 Warning(s)`
 
-### 下一步應該怎麼測
+### 銝?甇交?閰脫獐皜?
+1. ???圈?擃?2. ??佗?
+   - ?亙?甈?fault嚗?冽???啣 `[fault] HardFault ... PC=...`
+   - ?乩? fault嚗?阡?憪????DHCP Discover
+3. ?郊??蝣箄?嚗?   - `DHCP Discover` ?臬銝?
+   - ?仿??舀???銝?甇亦?亙??剔? `udp_sendto_if_src -> ip4_output_if_src -> ethernet_output -> low_level_output`
 
-1. 燒最新韌體
-2. 看是否：
-   - 若再次 fault，現在會重新印出 `[fault] HardFault ... PC=...`
-   - 若不 fault，是否開始真的出現 DHCP Discover
-3. 同步抓包確認：
-   - `DHCP Discover` 是否上線
-   - 若還是沒有，下一步直接回頭看 `udp_sendto_if_src -> ip4_output_if_src -> ethernet_output -> low_level_output`
+### ?交???
 
-### 接手重點
-
-- 不要再把同步 UART log 插進：
+- 銝????郊 UART log ?莎?
   - `dhcp.c`
   - `udp.c`
   - `ip4.c`
   - `ethernet_output()`
   - `HAL_ETH_Transmit()`
-- 如果下一輪還要定位，優先用：
-  - 恢復後的 HardFault dump
-  - 高層摘要 log
-  - 抓包
+- 憒?銝?頛芷?閬?雿??芸??剁?
+  - ?Ｗ儔敺? HardFault dump
+  - 擃惜?? log
+  - ??
 
-## 2026-05-06 新確認的真 fault 點
-
-- 使用者重燒這版後終於拿到真正 fault：
-  - `PC=0x0800EBE8`
+## 2026-05-06 ?啁Ⅱ隤???fault 暺?
+- 雿輻????敺??潭?啁?甇?fault嚗?  - `PC=0x0800EBE8`
   - `LR=0x0800EB2F`
   - `CFSR=0x01000000`
-- 反組譯對回 [LWIP/Target/ethernetif.c](/C:/Users/Public/Code/stm32/f767/autoControl/LWIP/Target/ethernetif.c) 的 `low_level_output()`
-- 不是 DHCP state machine 本身炸掉，而是：
-  - `low_level_output()` 在真正送包前先解析 `tx_dma_buffer`
-  - 讀了像 `tx_dma_buffer + 2`、`+26`、`+30` 這種非 4-byte 對齊位置的 32-bit 值
-  - `armclang` 產生的 `LDR` 直接觸發 `UNALIGNED UsageFault`
+- ??霅臬???[LWIP/Target/ethernetif.c](/C:/Users/Public/Code/stm32/f767/autoControl/LWIP/Target/ethernetif.c) ??`low_level_output()`
+- 銝 DHCP state machine ?祈澈?豢?嚗嚗?  - `low_level_output()` ?函?甇????閫?? `tx_dma_buffer`
+  - 霈鈭? `tx_dma_buffer + 2`?+26`?+30` ?車??4-byte 撠?雿蔭??32-bit ??  - `armclang` ?Ｙ???`LDR` ?湔閫貊 `UNALIGNED UsageFault`
 
-### 這次已修正
-
-- 移除 `low_level_output()` 內部那段非必要的 TX frame 解析/統計
-- 保留真正必要的：
-  - TX pbuf 複製到 DMA buffer
+### ?活撌脖耨甇?
+- 蝘駁 `low_level_output()` ?折??挾??閬? TX frame 閫??/蝯梯?
+- 靽??迤敹???
+  - TX pbuf 銴ˊ??DMA buffer
   - `SCB_CleanDCache_by_Addr(...)`
   - `HAL_ETH_Transmit(...)`
 
-### 這代表什麼
+### ?誨銵其?暻?
+- 銋??HCP ?寞瘝?颯撠?銝?典??臬??箇洵銝??TX 頝臬??券?停??fault
+- 銝?頛芸???fault 瘨仃嚗????潛匱蝥?瘀?
+  - DHCP ?臬???
+  - ?交??雿???嚗????PHY/duplex/?嗅?
 
-- 之前「DHCP 根本沒送出去」至少有一部分是因為第一個 TX 路徑在送出前就先 fault
-- 下一輪如果這個 fault 消失，才有資格繼續判斷：
-  - DHCP 是否真的送出
-  - 若有送出但沒回包，再回頭看 PHY/duplex/收包
-
-### 最新 build
+### ???build
 
 - `Program Size: Code=107142 RO-data=14066 RW-data=15940 ZI-data=33452`
 - `0 Error(s), 0 Warning(s)`
 
-## 下一步
-
-1. 燒錄最新韌體
-2. 觀察 `netif cb up a/b/c/d`
-3. 若看到 `dhcp start`，再看是否出現：
+## 銝?甇?
+1. ????圈?擃?2. 閫撖?`netif cb up a/b/c/d`
+3. ?亦???`dhcp start`嚗???血?橘?
    - `[net] tx ok ...`
-4. 同時用抓包確認 DHCP Discover 是否真的上線
-## 2026-05-06 接手摘要：DHCP packed header fault
+4. ???冽??Ⅱ隤?DHCP Discover ?臬??銝?
+## 2026-05-06 ?交???嚗HCP packed header fault
 
-### 這次已確認的真根因
-
-- 目前這條線不是單一 DHCP 邏輯錯誤，而是多個 lwIP packed header 在 `armclang + Cortex-M7` 下的未對齊 32-bit 存取
-- 已確認並修掉的 fault 類型：
-  - `low_level_output()` 內對 TX frame 緩衝區做非必要解析時的未對齊讀取
-  - `igmp_input()` 對 packed `igmp_group_address` 的直接讀取
-  - `dhcp_recv()` 對 packed `reply_msg->xid` 的直接讀取
-
-### 這一輪實際修改
-
+### ?活撌脩Ⅱ隤????
+- ?桀???蝺??臬銝 DHCP ?摩?航炊嚗憭?lwIP packed header ??`armclang + Cortex-M7` 銝??芸?朣?32-bit 摮?
+- 撌脩Ⅱ隤蒂靽格???fault 憿?嚗?  - `low_level_output()` ?批? TX frame 蝺抵????敹?閫?????芸?朣???  - `igmp_input()` 撠?packed `igmp_group_address` ??亥???  - `dhcp_recv()` 撠?packed `reply_msg->xid` ??亥???
+### ??頛芸祕?耨??
 - [dhcp.c](/C:/Users/Public/Code/stm32/f767/autoControl/Middlewares/Third_Party/LwIP/src/core/ipv4/dhcp.c)
-  - 新增 bytewise safe helper
-  - 改掉：
-    - `reply_msg->xid`
+  - ?啣? bytewise safe helper
+  - ?寞?嚗?    - `reply_msg->xid`
     - `msg_in->yiaddr`
     - `msg_in->siaddr`
     - `msg_out->xid`
     - `msg_out->ciaddr`
     - `msg_out->cookie`
-- 最新 build：
-  - `Program Size: Code=107614 RO-data=14046 RW-data=15940 ZI-data=33452`
+- ???build嚗?  - `Program Size: Code=107614 RO-data=14046 RW-data=15940 ZI-data=33452`
   - `0 Error(s), 0 Warning(s)`
 
-### 使用者下一步要測什麼
-
-1. 燒錄最新韌體
-2. 確認 `PC=0x08007974` 的 HardFault 不再出現
-3. 觀察 DHCP 是否能從 `selecting` 前進到 `checking` 或 `bound`
-4. 若還有新的 `CFSR=0x01000000`，保留完整：
+### 雿輻??銝甇亥?皜砌?暻?
+1. ????圈?擃?2. 蝣箄? `PC=0x08007974` ??HardFault 銝??箇
+3. 閫撖?DHCP ?臬?賢? `selecting` ?脣 `checking` ??`bound`
+4. ?仿????`CFSR=0x01000000`嚗????湛?
    - `PC`
    - `LR`
    - `CFSR`
 
-### 下一步工作建議
+### 銝?甇亙極雿遣霅?
+- 憒???敺?DHCP ?賢??莎?
+  - ???嗆?憭?蝬脰楝 log
+  - ???剖? HTTP / discovery / control ?飛
+- 憒??歲?啁? unaligned fault嚗?  - ?湔??`PC/LR` 撠?銝???lwIP packed header 頝臬?
+  - 銝??蝣????? log 餈賣
+## 2026-05-06 ?交?鋆?嚗THARP packed header fault
 
-- 如果這版後 DHCP 能前進：
-  - 開始收斂多餘網路 log
-  - 再回頭做 HTTP / discovery / control 回歸
-- 如果又跳新的 unaligned fault：
-  - 直接用 `PC/LR` 對回下一個 lwIP packed header 路徑
-  - 不再回到碎片化的逐行 log 追查
-## 2026-05-06 接手補充：ETHARP packed header fault
-
-- DHCP 目前已經能走到 `bound`
-- 新的真 fault：
-  - `PC=0x0800992E`
+- DHCP ?桀?撌脩??質粥??`bound`
+- ?啁???fault嚗?  - `PC=0x0800992E`
   - `CFSR=0x01000000`
-- 已對回 [etharp.c](/C:/Users/Public/Code/stm32/f767/autoControl/Middlewares/Third_Party/LwIP/src/core/ipv4/etharp.c) 的 `etharp_output()`
-- 問題點是 `LWIP_AUTOIP` 分支直接讀 packed `ip_hdr.src`
-- 已修正成：
-  - bytewise 複製 packed `src`
-  - 再用 aligned `ip4_addr_t` 做 `ip4_addr_islinklocal()`
-- 最新 build：
-  - `0 Error(s), 0 Warning(s)`
+- 撌脣???[etharp.c](/C:/Users/Public/Code/stm32/f767/autoControl/Middlewares/Third_Party/LwIP/src/core/ipv4/etharp.c) ??`etharp_output()`
+- ??暺 `LWIP_AUTOIP` ??湔霈 packed `ip_hdr.src`
+- 撌脖耨甇??嚗?  - bytewise 銴ˊ packed `src`
+  - ? aligned `ip4_addr_t` ??`ip4_addr_islinklocal()`
+- ???build嚗?  - `0 Error(s), 0 Warning(s)`
 # mem
 
-## 2026-05-06 接手摘要
+## 2026-05-06 ?交???
 
-- 當前實機狀態：
-  - DHCP 已可 `bound`
-  - `ping` 正常
-  - TCP control `PING` 正常
-  - Web/HTTP 仍未確認啟動成功
-- 本輪已將大量暫時 debug log 收斂，只保留：
-  - `boot`
+- ?嗅?撖行????
+  - DHCP 撌脣 `bound`
+  - `ping` 甇?虜
+  - TCP control `PING` 甇?虜
+  - Web/HTTP 隞蝣箄?????
+- ?祈憚撌脣?憭折??急? debug log ?嗆?嚗靽?嚗?  - `boot`
   - `link up/down`
   - `dhcp ...`
   - `http up/err`
   - `fault`
-- HTTP 啟動路徑已改：
-  - [App/Service/http_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/http_service.c)
+- HTTP ??頝臬?撌脫嚗?  - [App/Service/http_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/http_service.c)
   - `tcpip_try_callback()` -> `tcpip_callback()`
-  - 新增最小狀態：
+  - ?啣??撠???
     - `[http] up 80`
     - `[http] pcb err`
     - `[http] bind err`
     - `[http] listen err`
     - `[http] cb err=...`
-- 最新 build：
-  - `Program Size: Code=107502 RO-data=13482 RW-data=15940 ZI-data=50852`
+- ???build嚗?  - `Program Size: Code=107502 RO-data=13482 RW-data=15940 ZI-data=50852`
   - `0 Error(s), 0 Warning(s)`
 
-- 另已修正：
-  - [Core/Inc/FreeRTOSConfig.h](/C:/Users/Public/Code/stm32/f767/autoControl/Core/Inc/FreeRTOSConfig.h)
-    - `configTOTAL_HEAP_SIZE` 回升到 `32768`
+- ?血歇靽格迤嚗?  - [Core/Inc/FreeRTOSConfig.h](/C:/Users/Public/Code/stm32/f767/autoControl/Core/Inc/FreeRTOSConfig.h)
+    - `configTOTAL_HEAP_SIZE` ????`32768`
   - [App/Service/http_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/http_service.c)
     - HTTP task stack `384 -> 256`
   - [App/Service/discovery_service.c](/C:/Users/Public/Code/stm32/f767/autoControl/App/Service/discovery_service.c)
@@ -577,49 +537,28 @@
   - `C:\\Users\\a5522\\AppData\\Local\\Keil_v5\\UV4\\UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0`
   - exit code `0`
 
-# 2026-05-07 前端 pending 疑似 session/輪詢重疊
-- 使用者指出：新版頁面殼存在，但每個分頁內容仍空白，且瀏覽器 network 長時間 pending，懷疑和 session 機制有關。
-- 檢查 `Web/index.html` 後確認：
-  - `refreshAll()` 每 3 秒由 `setInterval` 無條件觸發
-  - 多個按鈕操作也會 `await refreshAll()`
-  - 沒有任何 in-flight guard，請求很容易重疊堆積
-- 已修改前端：
+# 2026-05-07 ?垢 pending ?撮 session/頛芾岷??
+- 雿輻???綽??啁??畾澆??剁?雿????摰嫣?蝛箇嚗??汗??network ?瑟???pending嚗?? session 璈????- 瑼Ｘ `Web/index.html` 敺Ⅱ隤?
+  - `refreshAll()` 瘥?3 蝘 `setInterval` ?⊥?隞嗉孛??  - 憭???雿???`await refreshAll()`
+  - 瘝?隞颱? in-flight guard嚗?瘙?摰寞?????
+- 撌脖耨?孵?蝡荔?
   - `state.refreshInFlight`
   - `state.refreshPending`
-  - `apiFetch()` 加入 4 秒 timeout / abort
-  - 自動輪詢改為 5 秒，且 `document.hidden` 時不主動刷
-- 已重新生成 `Web/web_assets.h`
-- 待驗證：新版韌體燒入後，`/api/config/relays`、`/api/cluster/nodes` 是否不再 pending，主畫面與設定頁內容是否正常顯示。
+  - `apiFetch()` ? 4 蝘?timeout / abort
+  - ?芸?頛芾岷?寧 5 蝘?銝?`document.hidden` ??銝餃???- 撌脤??啁???`Web/web_assets.h`
+- 敺?霅??啁????敺?`/api/config/relays`?/api/cluster/nodes` ?臬銝? pending嚗蜓?恍?身摰??批捆?臬甇?虜憿舐內??
 
-# 2026-05-07 後端 tcpip callback 維護節流
-- 直接本機 curl 測試 `192.168.0.245` 與 `192.168.0.157` 的 `/`、`/api/session`、`/api/config/relays`、`/api/cluster/nodes`，全部 6 秒 timeout。
-- 這表示問題已不是單純前端畫面，而是 HTTP listener / tcpip thread 在實機上又進入不回應狀態。
-- 已先修前端：
-  - refresh 鎖
-  - pending 合併
-  - 4 秒 fetch timeout
-  - 5 秒輪詢
-- 進一步懷疑 `defaultTask` 每 100ms 呼叫 `http_service_poll()` / `control_service_poll()`，持續用 `tcpip_callback()` 向 lwIP thread 塞維護工作，負載下會擠壓真正 TCP 處理。
-- 已先在 `http_service.c` 加入 `g_http_poll_pending` 節流，避免重複排入 callback。
-- 下一步正在對 `control_service.c` 做同樣節流。
+# 2026-05-07 敺垢 tcpip callback 蝬剛風蝭瘚?- ?湔?祆? curl 皜祈岫 `192.168.0.245` ??`192.168.0.157` ??`/`?/api/session`?/api/config/relays`?/api/cluster/nodes`嚗??6 蝘?timeout??- ?”蝷箏?憿歇銝?桃??垢?恍嚗 HTTP listener / tcpip thread ?典祕璈??脣銝?????- 撌脣?靽桀?蝡荔?
+  - refresh ??  - pending ?蔥
+  - 4 蝘?fetch timeout
+  - 5 蝘憚閰?- ?脖?甇交??`defaultTask` 瘥?100ms ?澆 `http_service_poll()` / `control_service_poll()`嚗?蝥 `tcpip_callback()` ??lwIP thread 憛雁霅瑕極雿?鞎?銝????迤 TCP ????- 撌脣???`http_service.c` ? `g_http_poll_pending` 蝭瘚??踹???? callback??- 銝?甇交迤?典? `control_service.c` ??璅??瘚?
 
-# 2026-05-07 HTTP 全面 timeout 與 poll 節流
-- 直接本機 `curl` 測 `192.168.0.245`、`192.168.0.157` 的 `/`、`/api/session`、`/api/config/relays`、`/api/cluster/nodes`，全部在 6 秒內 connection timeout。
-- 這表示當前問題已不是單純前端 DOM，而是板子上的 HTTP listener / tcpip thread 實際上進入不回應狀態。
-- 進一步檢查發現：
-  - `Web/index.html` 原本雖已加 `refreshInFlight`，但仍用固定輪詢；已改成 `setTimeout` 串行輪詢與 4 秒 fetch timeout。
-  - `Core/Src/main.c` 每 100ms 呼叫 `http_service_poll()` / `control_service_poll()`。
-  - 兩者都直接 `tcpip_callback(...)`，沒有任何 pending 節流，負載下可能持續把 maintenance callback 塞進 lwIP thread，擠壓真正的 TCP 處理。
-- 已修改：
-  - `Web/index.html`：串行 refresh、pending 合併、5 秒輪詢、頁面 hidden 不輪詢。
-  - `App/Service/http_service.c`：新增 `g_http_poll_pending`。
-  - `App/Service/control_service.c`：新增 `g_control_poll_pending`。
-- 已重新生成 `Web/web_assets.h` 並用 Keil CLI build 驗證成功。
+# 2026-05-07 HTTP ?券 timeout ??poll 蝭瘚?- ?湔?祆? `curl` 皜?`192.168.0.245`?192.168.0.157` ??`/`?/api/session`?/api/config/relays`?/api/cluster/nodes`嚗?典 6 蝘 connection timeout??- ?”蝷箇??憿歇銝?桃??垢 DOM嚗?踹?銝? HTTP listener / tcpip thread 撖阡?銝脣銝?????- ?脖?甇交炎?亦?橘?
+  - `Web/index.html` ??歇??`refreshInFlight`嚗?隞?箏?頛芾岷嚗歇?寞? `setTimeout` 銝脰?頛芾岷??4 蝘?fetch timeout??  - `Core/Src/main.c` 瘥?100ms ?澆 `http_service_poll()` / `control_service_poll()`??  - ?抵?湔 `tcpip_callback(...)`嚗??遙雿?pending 蝭瘚?鞎?銝?賣?蝥? maintenance callback 憛?lwIP thread嚗?憯?甇?? TCP ????- 撌脖耨?對?
+  - `Web/index.html`嚗葡銵?refresh?ending ?蔥?? 蝘憚閰Ｕ???hidden 銝憚閰Ｕ?  - `App/Service/http_service.c`嚗憓?`g_http_poll_pending`??  - `App/Service/control_service.c`嚗憓?`g_control_poll_pending`??- 撌脤??啁???`Web/web_assets.h` 銝衣 Keil CLI build 撽?????
 
-# 2026-05-07 HTTP 診斷 log 強化
-- 使用者要求直接加 log 測試，不再猜測。
-- 已在 `App/Service/http_service.c` 加入最小必要 log：
-  - `[http] listener down`
+# 2026-05-07 HTTP 閮箸 log 撘瑕?
+- 雿輻??瘙?亙? log 皜祈岫嚗???皜研?- 撌脣 `App/Service/http_service.c` ??撠?閬?log嚗?  - `[http] listener down`
   - `[http] accept active=...`
   - `[http] accept full`
   - `[http] close ok active=...`
@@ -627,25 +566,19 @@
   - `[http] err=... active=...`
   - `[http] poll skip=...`
   - `[http] poll err=...`
-- 目的：判斷 HTTP 整體 timeout 時，是 listener 被關掉、連線數吃滿不回收、還是 poll callback 堆積。
+- ?桃?嚗??HTTP ?湧? timeout ????listener 鋡恍?????詨?皛蹂??????poll callback ????
 
-# 2026-05-07 HTTP request/send 路徑直接加 log
-- 根據目前 log：
-  - 有 `accept`
-  - 多數也有 `close ok`
-  - 沒有 `accept full` / `close defer` / `poll skip`
-- 這表示前一輪懷疑的 connection pool 卡死與 callback 堆積，不是目前最直接的主因。
-- 比對 `81c776a` 後，最大的風險點是：
-  - 新頁面 HTML 約 25KB
-  - 新增 `/api/config/cluster`、`/api/config/relays`、`/api/cluster/nodes` 等較大 JSON
-  - 但 `http_service_recv()` 仍直接忽略 `http_service_handle_request()` 的回傳值
-- 已修改 `http_service.c`：
-  - `recv()` 現在會印 request first line：`[http] req ...`
-  - 若 `http_service_handle_request()` 回傳非 `ERR_OK`，會印：`[http] send err=...`
-  - 並立即關閉該連線，避免 request 靜默卡住
-- 這一版能直接分辨：
-  - request 根本沒進來
-  - 或 request 進來了，但 send/tcp_write/tcp_output 失敗
+# 2026-05-07 HTTP request/send 頝臬??湔??log
+- ?寞??桀? log嚗?  - ??`accept`
+  - 憭銋? `close ok`
+  - 瘝? `accept full` / `close defer` / `poll skip`
+- ?”蝷箏?銝頛芣?? connection pool ?⊥香??callback ??嚗??舐???湔?蜓??- 瘥? `81c776a` 敺??憭抒?憸券暺嚗?  - ?圈???HTML 蝝?25KB
+  - ?啣? `/api/config/cluster`?/api/config/relays`?/api/cluster/nodes` 蝑?憭?JSON
+  - 雿?`http_service_recv()` 隞?亙蕭??`http_service_handle_request()` ???喳?- 撌脖耨??`http_service.c`嚗?  - `recv()` ?曉? request first line嚗[http] req ...`
+  - ??`http_service_handle_request()` ???`ERR_OK`嚗??堆?`[http] send err=...`
+  - 銝衣??喲??府???嚗??request ???∩?
+- ????湔?儘嚗?  - request ?寞瘝脖?
+  - ??request ?脖?鈭?雿?send/tcp_write/tcp_output 憭望?
 
 ## 2026-05-07 / api-config-relays pending
 - UART log confirmed GET /api/config/relays enters http_service_recv but never closes.
@@ -888,12 +821,8 @@
 - Frontend change:
   - replaced the previous corrupted/mojibake `Web/index.html`
   - new page is Chinese and split into:
-    - 主畫面
-    - 叢集與節點
-    - 設定
-    - 系統狀態
-  - 本機 relay and same-cluster remote relay are both on 主畫面
-  - member nodes see state but cannot control, and get a "前往 Master" button
+    - 銝餌??    - ?ａ???暺?    - 閮剖?
+    - 蝟餌絞???  - ?祆? relay and same-cluster remote relay are both on 銝餌??  - member nodes see state but cannot control, and get a "?? Master" button
   - relay controls now use switch-style buttons
   - local/remote control buttons enter pending/disabled state until refreshed state matches
   - polling is reduced to a single 4s loop with per-tab selective fetches
@@ -930,17 +859,17 @@
 - Additional live verification:
   - both boards are serving the new HTML asset
   - HTML markers verified from `/`:
-    - `主畫面`
-    - `同叢集其他節點`
-    - `前往 Master`
-    - `等待節點狀態回報`
+    - `銝餌?瓩
+    - `??隞?暺
+    - `?? Master`
+    - `蝑?蝭暺????常
 - Frontend changes applied:
   - polling interval reduced from one heavy 4s cycle to a lighter 1.5s tick scheduler
   - per-resource polling cadence:
-    - relay state: high frequency on `主畫面`
+    - relay state: high frequency on `銝餌?瓩
     - node list: lower frequency
     - session / cluster config: lowest frequency
-    - no auto polling on `設定`
+    - no auto polling on `閮剖?`
   - local relay:
     - immediately mutates displayed `relay_mask`
     - marks the control pending
@@ -955,55 +884,25 @@
   - Keil CLI build passed:
     - `C:\\Users\\a5522\\AppData\\Local\\Keil_v5\\UV4\\UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0`
 
-## 2026-05-07 前端首頁重構與輪詢降載
-- 使用者明確要求不要再區分本機 / 叢集兩大區塊，而是以「設備名稱（本地 / 同叢集）」為主，下面直接列該設備可用繼電器。
-- 重新整份改寫 `Web/index.html`：
-  - `主畫面` 改成單一 `deviceList`
-  - 每個設備卡片顯示名稱、角色、IP 與 16 路繼電器
-  - 本機與遠端都改用同一種開關卡片樣式
-- 輪詢策略同步降載：
-  - `session / clusterConfig` 降頻
-  - `relay` 只在主畫面高頻抓
-  - `nodes` 主畫面降頻、叢集頁較高頻
-  - `設定` 頁不再自動抓 relay config
-- 本機與遠端控制保留 pending 鎖定，但不加入短延遲重試，等待後端狀態同步解除。
-- 重新生成 `Web/web_assets.h` 並用 `UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0` 驗證編譯通過。
-## 2026-05-07 首頁單一設備清單與 enabled_mask
-- 使用者要求主畫面不要再分成本機 / 叢集兩塊，而是依設備名稱（本地 / 同叢集）一張卡一張卡排列。
-- 後端補上 discovery announce 的 `enabled_mask`：
-  - `cluster_node_t` 新增 `enabled_mask`
-  - `discovery_proto_build_announce()` / `parse_announce()` 帶 `enabled=...`
-  - `discovery_service` 由本地 `device_config.relay[].enabled` 組出位元遮罩
-  - `/api/cluster/nodes` 現在回傳 `enabled_mask`
-- 前端 `Web/index.html` 整份重寫：
-  - 主畫面改成單一 `deviceList`
-  - 未啟用 relay 直接隱藏
-  - 每顆按鈕單獨 pending，不再整台卡一起凍結
-  - 每顆 relay 旁新增紅色「停」按鈕做緊急停止
-- `Web/web_assets.h` 已重新生成，並用 `UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0` 驗證編譯通過。
-- 遠端 relay 名稱同步 / 修改尚未做，因 discovery 協定目前只帶 mask 與 enabled 狀態，尚未帶名稱資料。
-## 2026-05-07 編譯修正：main.c 殘留字元
-- `Core/Src/main.c` 的 `main()` 開頭殘留了一個裸 `0`，造成 `expected ';' after expression`。
-- 已移除，並用 `UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0` 驗證編譯恢復成功。
-## 2026-05-07 本地叢集設定權限與緊急停止按鈕
-- 使用者澄清：本地裝置一定可以修改自己的叢集加入資訊，即使目前是 member，也要能主動退出、改密碼、改叢集名稱。
-- 因此移除 `http_service.c` 中對：
-  - `POST /api/config/cluster`
+## 2026-05-07 ?垢擐????憚閰ａ?頛?- 雿輻??蝣箄?瘙?閬???璈?/ ?ａ??拙之?憛??隞乓身??蝔梧??砍 / ????銝鳴?銝?湔?府閮剖??舐蝜潮?具?- ??港遢?孵神 `Web/index.html`嚗?  - `銝餌?瓩 ?寞??桐? `deviceList`
+  - 瘥身??＊蝷箏?蝔晞??脯P ??16 頝舐匱?餃
+  - ?祆???蝡舫?寧??蝔桅???見撘?- 頛芾岷蝑?郊??嚗?  - `session / clusterConfig` ?
+  - `relay` ?芸銝餌?ａ??餅?
+  - `nodes` 銝餌?ａ??颯??頛???  - `閮剖?` ????? relay config
+- ?祆???蝡舀?嗡???pending ??嚗?銝??亦撱園?岫嚗?敺?蝡舐???甇亥圾?扎?- ??? `Web/web_assets.h` 銝衣 `UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0` 撽?蝺刻陌????## 2026-05-07 擐??桐?閮剖?皜??enabled_mask
+- 雿輻??瘙蜓?恍銝????璈?/ ?ａ??拙?嚗靘身??蝔梧??砍 / ???銝撘萄銝撘萄????- 敺垢鋆? discovery announce ??`enabled_mask`嚗?  - `cluster_node_t` ?啣? `enabled_mask`
+  - `discovery_proto_build_announce()` / `parse_announce()` 撣?`enabled=...`
+  - `discovery_service` ?望??`device_config.relay[].enabled` 蝯雿??桃蔗
+  - `/api/cluster/nodes` ?曉? `enabled_mask`
+- ?垢 `Web/index.html` ?港遢?神嚗?  - 銝餌?Ｘ?銝 `deviceList`
+  - ?芸???relay ?湔?梯?
+  - 瘥????桃 pending嚗???啣銝韏瑕?蝯?  - 瘥? relay ?憓??脯?????蝺亙?甇?- `Web/web_assets.h` 撌脤??啁???銝衣 `UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0` 撽?蝺刻陌????- ?垢 relay ?迂?郊 / 靽格撠????discovery ???桀??芸葆 mask ??enabled ???撠撣嗅?蝔梯???## 2026-05-07 蝺刻陌靽格迤嚗ain.c 畾?摮?
+- `Core/Src/main.c` ??`main()` ?畾?鈭??ㄧ `0`嚗? `expected ';' after expression`??- 撌脩宏?歹?銝衣 `UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0` 撽?蝺刻陌?Ｗ儔????## 2026-05-07 ?砍?ａ?閮剖?甈????亙?甇Ｘ???- 雿輻??皜??砍鋆蔭銝摰隞乩耨?寡撌梁??ａ??鞈?嚗雿輻? member嚗?閬銝餃???箝撖Ⅳ??ａ??迂??- ?迨蝘駁 `http_service.c` 銝剖?嚗?  - `POST /api/config/cluster`
   - `POST /api/config/relay`
-  的 `not_master` 限制，改為只要求登入即可。
-- 前端 `Web/index.html` 再次整份重寫：
-  - 設定頁新增「偵測到的叢集」下拉選單與套用按鈕
-  - kick UI 移除
-  - 主畫面每顆 relay 的一般開關與紅色「停」按鈕分離
-  - 一般開關 pending 時只鎖自己
-  - 緊急停止按鈕不跟著一般 pending 一起凍結
-- 說明：
-  - `remember_state` 的語意是：若啟用，裝置重開後恢復該路最後一次實際狀態；若停用，則走 `boot_default_on`。
-## 2026-05-07 編譯修正：main.c 殘留 `{0`
-- `Core/Src/main.c` 的 `main()` 開頭又被插入 `{0`，導致 `expected ';' after expression`。
-- 已修正回正常的 `int main(void) {`。
-- 重新用 `UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0` 驗證編譯成功。
-## 2026-05-07 16:25 build gate
+  ??`not_master` ?嚗?箏閬??餃?喳??- ?垢 `Web/index.html` ?活?港遢?神嚗?  - 閮剖??憓皜砍?????株?憟??
+  - kick UI 蝘駁
+  - 銝餌?Ｘ?憿?relay ???祇???蝝????????  - 銝?祇???pending ??撌?  - 蝺亙?甇Ｘ???頝?銝??pending 銝韏瑕?蝯?- 隤芣?嚗?  - `remember_state` ???嚗?嚗?蝵桅????Ｗ儔閰脰楝?敺?甈∪祕?????亙??剁??粥 `boot_default_on`??## 2026-05-07 蝺刻陌靽格迤嚗ain.c 畾? `{0`
+- `Core/Src/main.c` ??`main()` ??◤? `{0`嚗???`expected ';' after expression`??- 撌脖耨甇??甇?虜??`int main(void) {`??- ???`UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0` 撽?蝺刻陌????## 2026-05-07 16:25 build gate
 
 - User build error came from `main.c` around `main()` opening brace, but current workspace file is already clean:
   - `int main(void)`
@@ -1037,7 +936,7 @@
     - fully rebuilt as clean UTF-8 Chinese UI
     - single device list on home
     - only clicked toggle freezes itself
-    - red `停` remains usable
+    - red `? remains usable
     - remote state applied immediately on queued success
     - settings tab now includes remote member relay config panels fetched directly from member HTTP APIs using CORS + per-node login token cache
   - regenerated `Web/web_assets.h`
@@ -1066,7 +965,7 @@
 
 - User reported current remote control behavior was faster, but unsafe:
   - button unfreezes before member relay actually changes
-  - frequent clicks can leave UI showing `開` while actual member relay is `關`
+  - frequent clicks can leave UI showing `? while actual member relay is `?
 - Root cause:
   - frontend `setRemoteRelay()` immediately mutated cached `node.relay_mask`
   - then immediately deleted `pendingRemote[key]`
@@ -1140,7 +1039,7 @@
   - after save completes, dirty state is only cleared if `saved_relay_mask` still matches the saved snapshot
   - if another relay change happened during the save window, dirty remains set and save is rescheduled
 - Fixed settings page checkbox alignment:
-  - `啟用叢集` now uses dedicated `.checkline` layout in `Web/index.html`
+  - `??ａ?` now uses dedicated `.checkline` layout in `Web/index.html`
 - Keil CLI build after these changes:
   - `UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0`
   - exit code `0`
@@ -1185,3 +1084,136 @@
 - Final result:
   - `all_ok = true`
 - This run is the basis for allowing the final commit
+
+## 2026-05-07 backend long-link phase started
+
+- User selected the next phase as backend long-lived connection before ADC/CT work.
+- Added `tools/backend-test/` with:
+  - `package.json`
+  - `server.js`
+  - `README.md`
+- Test backend design:
+  - Express HTTP server for inspection/command injection
+  - TCP server for the firmware long link
+  - shared key check on `hello`
+- Added `App/Service/backend_link_service.[hc]`
+  - only cluster master should keep the outbound TCP session
+  - current minimal messages:
+    - `hello`
+    - `heartbeat`
+    - `status`
+  - basic inbound command handling:
+    - `set_relay`
+    - `set_mask`
+    - `set_all`
+- Current defaults are compile-time only:
+  - host `192.168.0.10`
+  - port `42001`
+  - key `dev-key`
+- Service was wired into `StartDefaultTask()` through `backend_link_service_poll()`
+- Keil project updated to include `backend_link_service.c`
+- Keil CLI rebuild passed after this slice:
+  - `UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0`
+  - exit code `0`
+
+## 2026-05-07 backend config wiring
+
+- Added backend persistence fields into `device_config`:
+  - `backend_host`
+  - `backend_port`
+  - `backend_key`
+- Migrated `device_config_load()` so old v1/v2 flash layouts are promoted into v3 and receive backend defaults:
+  - host `192.168.0.10`
+  - port `42001`
+  - key `dev-key`
+- Updated `backend_link_service` to read runtime host/port/key from `device_config_get()` instead of compile-time constants.
+- Added backend fields to `/api/config/cluster`:
+  - GET now returns `backend_host`, `backend_port`, `backend_key_configured`
+  - POST now saves `backend_host`, `backend_port`, `backend_key`
+- Updated `Web/index.html` settings page with Chinese fields for:
+  - 敺垢銝餅?
+  - 敺垢??
+  - 敺垢?
+- Regenerated `Web/web_assets.h` from the updated `Web/index.html`.
+- Verified local backend-test service is running:
+  - `GET http://127.0.0.1:4300/` returned `{"ok":true,"httpPort":4300,"tcpPort":42001,"backendKey":"dev-key","clients":[]}`
+- Confirmed current PC LAN IP is `192.168.0.139`, so boards must be configured to connect to:
+  - host `192.168.0.139`
+  - port `42001`
+  - key `dev-key`
+- Keil CLI rebuild passed after backend config wiring:
+  - `UV4.exe -b MDK-ARM\\autoControl.uvprojx -j0`
+  - exit code `0`
+
+## 2026-05-07 backend long-link live test
+
+- User started the local backend-test service.
+- Verified backend-test HTTP endpoints locally:
+  - `GET http://127.0.0.1:4300/` returned:
+    - `{"ok":true,"httpPort":4300,"tcpPort":42001,"backendKey":"dev-key","clients":[]}`
+  - `GET http://127.0.0.1:4300/clients` returned `{"ok":true,"clients":[]}`
+- Verified current PC LAN IP is `192.168.0.139`, so boards were updated via `/api/config/cluster` to:
+  - `backend_host = 192.168.0.139`
+  - `backend_port = 42001`
+  - `backend_key = dev-key`
+- After a short convergence delay:
+  - `192.168.0.157` became `master`
+  - `192.168.0.245` remained `member`
+  - `/clients` showed exactly one backend connection from the master only
+- Confirmed `backend_link_service` live behavior:
+  - master connected successfully to backend-test
+  - backend-test `/clients` showed:
+    - `nodeId = 579948958`
+    - `device = autoControl`
+    - `cluster = default`
+    - `role = 2`
+    - `relayMask` updates
+- Confirmed backend downlink commands to master local relay:
+  - `POST /send/579948958/relay` with `{"channel":1,"value":1}` turned `ch1` on
+  - `POST /send/579948958/mask` with `{"mask":3}` produced `relay_mask = 3`
+  - `POST /send/579948958/all` with `{"value":0}` turned all relays off
+- Current scope is now validated for:
+  - master-only outbound long link
+  - hello / heartbeat / status uplink
+  - local relay control downlink through backend-test
+- Not yet implemented in this slice:
+  - backend command routing to member via master
+  - UI display of backend link state
+## 2026-05-07 backend long-link boot fault triage
+- User reported boot log stops after `[net] dhcp off` with bare `[fault] MemManage`.
+- Compared current worktree vs stable commit `58c4ebf`; high-risk new boot-path changes were backend link poll and config worker init behavior.
+- Applied three mitigations:
+  1. `backend_link_should_run()` now requires network ready (`netif up`, `link up`, non-zero IPv4) before backend task attempts any socket work.
+  2. `BackendLinkTask` stack increased from 768 to 1024.
+  3. `device_config_init()` no longer creates queue/task before scheduler when flash config is invalid; it only writes defaults directly.
+- Improved `MemManage_Handler` to print `CFSR/HFSR/MMFAR/BFAR` instead of only `[fault] MemManage`.
+- Keil CLI rebuild passed after patch.
+## 2026-05-07 MemManage root cause and fix
+- User provided detailed fault after boot: bare `[fault] MemManage` followed by HardFault with `PC=0x080093D6`, `MMFAR/BFAR=0x20080000`.
+- Disassembly showed `PC=0x080093D6` inside `device_config_is_valid()` CRC validation path.
+- Root cause: config CRC helpers (`device_config_is_valid`, v1/v2 validators, `device_config_compute_crc32`) created full struct temporaries on stack; during early boot `main()` stack/local layout put the temp buffer right at top of SRAM and optimized CRC code read past `0x2007FFFF` to `0x20080000`, triggering MemManage.
+- Fix: replaced temp-copy CRC approach with in-place CRC computation that zeroes `config_crc32` logically during iteration (`device_config_crc32_zeroed_range`). This removes large stack temporaries from config validation.
+- Earlier mitigations retained: backend only runs after network ready, backend task stack increased, MemManage handler prints register context.
+- Keil CLI rebuild passed after fix.
+2026-05-07
+
+- backend ?琿???啗???
+  - ??箏???砍???寡??ａ?頨思遢嚗??蝔?撖Ⅳ嚗?嚗TTP ?脣??摩???蝛?`backend_key`
+  - backend host/port 靽?嚗靘蹂?敺??啗撓?仿???  - `backend_link_should_run()` ?曉閬? `backend_key` ?征嚗??蝛箏?隞?fallback ??`dev-key` 撠????
+- backend-test `server.js` ?啣? duplicate master ??嚗?  - 隞?`key|cluster` ??
+  - grace period 15 蝘?  - 頞?敺閮?`duplicate-master-warning` event嚗?銝餃??瑞?
+- live 皜祈岫鋆?嚗?  - `245` ??箏??嚗/api/config/cluster` 撌脩Ⅱ隤?`backend_key_configured=0`
+  - routed backend control ?隞???master ?祆?嚗??? parser ???唳璈?`set_relay` ?嚗歇?寞??芾? payload ??`node_id` 撠勗?粥 routed path
+  - backend-test ???拙祕?冽??塚?
+    - ??`nodeId` ?圈????`replace-client` 銝阡??? socket
+    - `CLIENT_STALE_MS=12000` 敺??`stale-client-close`
+  - 隞乩? server 霈?閬???backend-test ????
+- 撌脫?圈?霅?
+  - Keil CLI build ??
+  - `node --check tools/backend-test/server.js` ??
+2026-05-07
+- backend status uplink ?啣? dirty push 璈
+- backend_link_service 憓? `backend_link_service_mark_status_dirty()`
+- local relay change?emote relay change?ode online/offline?ole/master change ?賣?璅? dirty
+- backend task ???摮暑??瘥?200ms loop ?????dirty status嚗像撣訾?靽? 3 蝘望? status
+

@@ -31,6 +31,7 @@
 #include "http_service.h"
 #include "control_service.h"
 #include "backend_link_service.h"
+#include "mqtt_link_service.h"
 #include "discovery_service.h"
 #include "lwip/stats.h"
 #include "lwip/dhcp.h"
@@ -381,7 +382,7 @@ int main(void)
   /* definition and creation of defaultTask */
   /* CMSIS-RTOS V1 in this repo forwards stacksz directly to FreeRTOS xTaskCreate(),
      so the effective unit here behaves like StackType_t words, not bytes. */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 1024);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 2048);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
@@ -630,6 +631,7 @@ void StartDefaultTask(void const * argument)
   for(;;)
   {
     uint32_t now = HAL_GetTick();
+    static uint32_t last_stack_log_ms = 0U;
     struct dhcp *dhcp = netif_dhcp_data(&gnetif);
     uint8_t link_up = netif_is_link_up(&gnetif) ? 1U : 0U;
     uint8_t dhcp_bound = dhcp_supplied_address(&gnetif) ? 1U : 0U;
@@ -659,9 +661,19 @@ void StartDefaultTask(void const * argument)
       HAL_ETH_ReleaseTxPacket(&heth);
     }
 
+    if ((last_stack_log_ms == 0U) || ((int32_t)(now - last_stack_log_ms) >= 5000))
+    {
+      char stack_msg[64];
+      (void)snprintf(stack_msg, sizeof(stack_msg), "[rtos] default hw=%lu\r\n",
+                     (unsigned long)uxTaskGetStackHighWaterMark(NULL));
+      uart3_write(stack_msg);
+      last_stack_log_ms = now;
+    }
+
     control_service_poll();
     discovery_service_poll();
     backend_link_service_poll();
+    mqtt_link_service_poll();
     http_service_poll();
     cluster_service_poll();
     device_config_poll();

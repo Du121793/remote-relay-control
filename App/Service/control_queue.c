@@ -1,5 +1,6 @@
 #include "control_queue.h"
 #include "backend_link_service.h"
+#include "mqtt_link_service.h"
 #include "cluster_service.h"
 
 #include "cmsis_os.h"
@@ -20,8 +21,15 @@ typedef struct
 {
   char backend_host[DEVICE_CONFIG_BACKEND_HOST_MAX_LEN];
   uint16_t backend_port;
-  uint16_t reserved;
+  uint8_t cloud_enabled;
+  uint8_t cloud_transport;
   char backend_key[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
+  char cloud_broker_host[DEVICE_CONFIG_CLOUD_HOST_MAX_LEN];
+  uint16_t cloud_broker_port;
+  uint16_t reserved;
+  char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+  char cloud_cluster_ca_fingerprint[DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN];
+  char cloud_cluster_binding_secret[DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN];
 } control_queue_backend_sync_t;
 
 typedef struct
@@ -155,11 +163,15 @@ static HAL_StatusTypeDef control_queue_sync_remote_backend_config(uint32_t ip_ad
 {
   char login_request[256];
   char login_response[512];
-  char config_request[768];
+  char config_request[1280];
   char config_response[512];
   char encoded_host[(DEVICE_CONFIG_BACKEND_HOST_MAX_LEN * 3U) + 1U];
   char encoded_key[(DEVICE_CONFIG_BACKEND_KEY_MAX_LEN * 3U) + 1U];
-  char body[320];
+  char encoded_cloud_host[(DEVICE_CONFIG_CLOUD_HOST_MAX_LEN * 3U) + 1U];
+  char encoded_cloud_cluster_id[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 3U) + 1U];
+  char encoded_cloud_cluster_ca_fingerprint[(DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 3U) + 1U];
+  char encoded_cloud_cluster_binding_secret[(DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN * 3U) + 1U];
+  char body[1152];
   uint32_t token = 0U;
   char *token_text;
   char *endptr = NULL;
@@ -200,11 +212,30 @@ static HAL_StatusTypeDef control_queue_sync_remote_backend_config(uint32_t ip_ad
 
   control_queue_url_encode(config->backend_host, encoded_host, sizeof(encoded_host));
   control_queue_url_encode(config->backend_key, encoded_key, sizeof(encoded_key));
+  control_queue_url_encode(config->cloud_broker_host, encoded_cloud_host, sizeof(encoded_cloud_host));
+  control_queue_url_encode(config->cloud_cluster_id, encoded_cloud_cluster_id, sizeof(encoded_cloud_cluster_id));
+  control_queue_url_encode(config->cloud_cluster_ca_fingerprint,
+                           encoded_cloud_cluster_ca_fingerprint,
+                           sizeof(encoded_cloud_cluster_ca_fingerprint));
+  control_queue_url_encode(config->cloud_cluster_binding_secret,
+                           encoded_cloud_cluster_binding_secret,
+                           sizeof(encoded_cloud_cluster_binding_secret));
   (void)snprintf(body, sizeof(body),
-                 "backend_host=%s&backend_port=%u&backend_key=%s",
+                 "backend_host=%s&backend_port=%u&backend_key=%s"
+                 "&cloud_enabled=%u&cloud_transport=%u"
+                 "&cloud_broker_host=%s&cloud_broker_port=%u"
+                 "&cloud_cluster_id=%s&cloud_cluster_ca_fingerprint=%s"
+                 "&cloud_cluster_binding_secret=%s&cloud_cluster_sync_only=1",
                  encoded_host,
                  (unsigned int)config->backend_port,
-                 encoded_key);
+                 encoded_key,
+                 (unsigned int)config->cloud_enabled,
+                 (unsigned int)config->cloud_transport,
+                 encoded_cloud_host,
+                 (unsigned int)config->cloud_broker_port,
+                 encoded_cloud_cluster_id,
+                 encoded_cloud_cluster_ca_fingerprint,
+                 encoded_cloud_cluster_binding_secret);
   (void)snprintf(config_request, sizeof(config_request),
                  "POST /api/config/cluster HTTP/1.1\r\n"
                  "Host: remote\r\n"
@@ -574,6 +605,7 @@ static void control_queue_worker_task(void const *argument)
         {
           device_config_runtime_relay_mask_set(request.result->relay_mask);
           backend_link_service_mark_status_dirty();
+          mqtt_link_service_mark_status_dirty();
         }
         g_control_queue_stats.executed++;
       }
@@ -758,6 +790,17 @@ HAL_StatusTypeDef control_queue_submit_backend_sync_async(uint32_t ip_addr,
   strncpy(request.backend_sync.backend_host, config->backend_host, sizeof(request.backend_sync.backend_host) - 1U);
   request.backend_sync.backend_port = config->backend_port;
   strncpy(request.backend_sync.backend_key, config->backend_key, sizeof(request.backend_sync.backend_key) - 1U);
+  request.backend_sync.cloud_enabled = config->cloud_enabled;
+  request.backend_sync.cloud_transport = config->cloud_transport;
+  strncpy(request.backend_sync.cloud_broker_host, config->cloud_broker_host, sizeof(request.backend_sync.cloud_broker_host) - 1U);
+  request.backend_sync.cloud_broker_port = config->cloud_broker_port;
+  strncpy(request.backend_sync.cloud_cluster_id, config->cloud_cluster_id, sizeof(request.backend_sync.cloud_cluster_id) - 1U);
+  strncpy(request.backend_sync.cloud_cluster_ca_fingerprint,
+          config->cloud_cluster_ca_fingerprint,
+          sizeof(request.backend_sync.cloud_cluster_ca_fingerprint) - 1U);
+  strncpy(request.backend_sync.cloud_cluster_binding_secret,
+          config->cloud_cluster_binding_secret,
+          sizeof(request.backend_sync.cloud_cluster_binding_secret) - 1U);
 
   if (xQueueSend(g_control_queue_handle, &request, 0U) != pdPASS)
   {

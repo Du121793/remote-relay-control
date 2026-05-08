@@ -86,6 +86,9 @@ static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t por
                                                DISCOVERY_SERVICE_TYPE,
                                                cluster_state.cluster_name,
                                                config->device_name,
+                                               config->cloud_cluster_id,
+                                               config->cloud_device_id,
+                                               config->cloud_key_id,
                                                cluster_state.self_node_id,
                                                cluster_state.role,
                                                cluster_state.term,
@@ -164,7 +167,7 @@ static void discovery_service_ensure_multicast_membership(void)
 
 static void discovery_service_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port)
 {
-  char payload[256];
+  char payload[DISCOVERY_ANNOUNCE_BUFFER_SIZE];
   u16_t copy_len;
   discovery_proto_announce_t announce;
   cluster_node_t node;
@@ -209,6 +212,9 @@ static void discovery_service_udp_recv(void *arg, struct udp_pcb *pcb, struct pb
       node.auth_tag = announce.auth_tag;
       memcpy(node.node_name, announce.device, sizeof(node.node_name));
       memcpy(node.cluster_name, announce.cluster, sizeof(node.cluster_name));
+      memcpy(node.cloud_cluster_id, announce.cloud_cluster_id, sizeof(node.cloud_cluster_id));
+      memcpy(node.cloud_device_id, announce.cloud_device_id, sizeof(node.cloud_device_id));
+      memcpy(node.cloud_key_id, announce.cloud_key_id, sizeof(node.cloud_key_id));
       memcpy(node.mac, announce.mac, sizeof(node.mac));
       cluster_service_note_remote_node(&node);
     }
@@ -227,13 +233,17 @@ void discovery_service_init(void)
 
   if (g_discovery_task_handle == NULL)
   {
-    osThreadDef(DiscoveryService, discovery_service_task, osPriorityBelowNormal, 0, 256);
+    osThreadDef(DiscoveryService, discovery_service_task, osPriorityBelowNormal, 0, 1024);
     g_discovery_task_handle = osThreadCreate(osThread(DiscoveryService), NULL);
   }
 }
 
 void discovery_service_poll(void)
 {
+  if (netif_is_link_up(&gnetif) == 0)
+  {
+    return;
+  }
   discovery_service_init();
 }
 
