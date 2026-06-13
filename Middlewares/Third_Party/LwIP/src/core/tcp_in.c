@@ -1494,7 +1494,8 @@ tcp_receive(struct tcp_pcb *pcb)
       }
       /* cannot fail... */
       pbuf_remove_header(p, off);
-      inseg.tcphdr->seqno = seqno = pcb->rcv_nxt;
+      seqno = pcb->rcv_nxt;
+      tcpin_u32_to_packed_safe(((u8_t *)inseg.tcphdr) + offsetof(struct tcp_hdr, seqno), seqno);
     } else {
       if (TCP_SEQ_LT(seqno, pcb->rcv_nxt)) {
         /* the whole segment is < rcv_nxt */

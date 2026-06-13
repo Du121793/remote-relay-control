@@ -10,6 +10,8 @@
 extern "C" {
 #endif
 
+#define DISCOVERY_PROTO_ANNOUNCE_MAX_SIZE 640U
+
 int discovery_proto_build_announce(char *buffer,
                                    size_t buffer_size,
                                    const char *service,

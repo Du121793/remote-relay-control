@@ -23,6 +23,18 @@
 MDK-ARM/DebugConfig/
 MDK-ARM/RTE/
 MDK-ARM/autoControl/
+node_modules/
+
+# Local build and diagnostic artifacts
+*.pcapng
+MDK-ARM/build_log.txt
+MDK-ARM/disasm.txt
+/image.png
+/image1.png
+
+# Root-level Codex CLI installation metadata (not part of this project)
+/package.json
+/package-lock.json
 
 # Local notes
 AGENT.md
@@ -36,3 +48,9 @@ tools/build/
 tools/dist/
 tools/__pycache__/
 tools/*.spec
+
+# backend-test runtime state and local working copies
+tools/backend-test/data/keys.json
+tools/backend-test/data/cloud-clusters.json
+tools/backend-test/data/cloud-devices.json
+tools/backend-test/server copy.js

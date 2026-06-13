@@ -35,6 +35,36 @@ static uint8_t discovery_proto_extract_value(const char *text,
   return (index > 0U) ? 1U : 0U;
 }
 
+static uint8_t discovery_proto_extract_optional_value(const char *text,
+                                                      const char *key,
+                                                      char *buffer,
+                                                      size_t buffer_size)
+{
+  const char *match;
+  const char *value;
+  size_t index = 0U;
+
+  if ((text == NULL) || (key == NULL) || (buffer == NULL) || (buffer_size == 0U))
+  {
+    return 0U;
+  }
+
+  match = strstr(text, key);
+  if (match == NULL)
+  {
+    buffer[0] = '\0';
+    return 0U;
+  }
+
+  value = match + strlen(key);
+  while ((*value != '\0') && (*value != ' ') && (index < (buffer_size - 1U)))
+  {
+    buffer[index++] = *value++;
+  }
+  buffer[index] = '\0';
+  return 1U;
+}
+
 static uint8_t discovery_proto_parse_u32(const char *text, uint32_t *value_out)
 {
   unsigned long value;
@@ -112,11 +142,12 @@ uint8_t discovery_proto_parse_announce(const void *payload,
                                        uint16_t length,
                                        discovery_proto_announce_t *announce)
 {
-  char text[512];
+  char text[DISCOVERY_PROTO_ANNOUNCE_MAX_SIZE];
   char value[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
   ip4_addr_t ip_addr;
   unsigned int mac[6];
   uint32_t parsed_u32;
+  uint8_t version;
 
   if ((payload == NULL) || (announce == NULL) || (length == 0U))
   {
@@ -132,7 +163,19 @@ uint8_t discovery_proto_parse_announce(const void *payload,
   text[length] = '\0';
   memset(announce, 0, sizeof(*announce));
 
-  if ((strstr(text, "type=announce") == NULL) || (strstr(text, "ver=3") == NULL))
+  if (strstr(text, "type=announce") == NULL)
+  {
+    return 0U;
+  }
+  if (strstr(text, "ver=3") != NULL)
+  {
+    version = 3U;
+  }
+  else if (strstr(text, "ver=2") != NULL)
+  {
+    version = 2U;
+  }
+  else
   {
     return 0U;
   }
@@ -149,17 +192,11 @@ uint8_t discovery_proto_parse_announce(const void *payload,
   {
     return 0U;
   }
-  if (!discovery_proto_extract_value(text, "cloud_cluster=", announce->cloud_cluster_id, sizeof(announce->cloud_cluster_id)))
+  if (version >= 3U)
   {
-    return 0U;
-  }
-  if (!discovery_proto_extract_value(text, "cloud_device=", announce->cloud_device_id, sizeof(announce->cloud_device_id)))
-  {
-    return 0U;
-  }
-  if (!discovery_proto_extract_value(text, "cloud_key=", announce->cloud_key_id, sizeof(announce->cloud_key_id)))
-  {
-    return 0U;
+    (void)discovery_proto_extract_optional_value(text, "cloud_cluster=", announce->cloud_cluster_id, sizeof(announce->cloud_cluster_id));
+    (void)discovery_proto_extract_optional_value(text, "cloud_device=", announce->cloud_device_id, sizeof(announce->cloud_device_id));
+    (void)discovery_proto_extract_optional_value(text, "cloud_key=", announce->cloud_key_id, sizeof(announce->cloud_key_id));
   }
   if (!discovery_proto_extract_value(text, "node=", value, sizeof(value)) ||
       !discovery_proto_parse_u32(value, &announce->node_id))

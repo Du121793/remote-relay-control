@@ -67,6 +67,7 @@
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)256)
 #define configTOTAL_HEAP_SIZE                    ((size_t)32768)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
+#define configCHECK_FOR_STACK_OVERFLOW           2
 #define configUSE_16_BIT_TICKS                   0
 #define configUSE_MUTEXES                        1
 #define configQUEUE_REGISTRY_SIZE                8

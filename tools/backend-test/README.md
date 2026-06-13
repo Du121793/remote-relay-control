@@ -27,6 +27,20 @@ npm start
 - UI / HTTP API: `http://127.0.0.1:4300/`
 - TCP backend link: `42001`
 
+安全預設：
+
+- 管理 HTTP 只監聽 `127.0.0.1`
+- provisioning API 不回傳 device private key
+- 僅限本機隔離測試時，才能用 `ALLOW_PRIVATE_KEY_EXPORT=1` 明確開啟 private key 匯出
+
+相關環境變數：
+
+- `HTTP_HOST`
+- `HTTP_PORT`
+- `TCP_PORT`
+- `BACKEND_KEY`
+- `ALLOW_PRIVATE_KEY_EXPORT`
+
 ## 已有功能
 
 ### 1. TCP 長連線接入
@@ -49,6 +63,12 @@ npm start
 金鑰資料持久化於：
 
 - `tools/backend-test/data/keys.json`
+
+`keys.json` 是本機 runtime 資料，不納入 Git。版本庫只保留：
+
+- `tools/backend-test/data/keys.example.json`
+
+請使用 `BACKEND_KEY` 環境變數提供本機 bootstrap key，不要把真實 key 寫入範例檔或提交。
 
 UI 與 API 支援：
 
@@ -91,6 +111,8 @@ backend 會從 master 上報的 payload 裡整理出兩份 registry：
 
 - `tools/backend-test/data/cloud-clusters.json`
 - `tools/backend-test/data/cloud-devices.json`
+
+這兩份檔案是本機 runtime registry，可能包含 CA private key、device private key 與 binding secret，因此不納入 Git，也不可作為正式環境的安全儲存方案。
 
 目前 registry 會記錄：
 

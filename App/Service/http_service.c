@@ -75,6 +75,7 @@ static uint8_t g_http_listener_accept_paused = 0U;
 static volatile uint8_t g_http_poll_pending = 0U;
 static uint32_t g_http_poll_skip_count = 0U;
 static uint32_t g_http_backend_sync_last_ms = 0U;
+static mqtt_link_stats_t g_http_mqtt_stats_snapshot;
 static void http_service_tcpip_step(void *arg);
 static void http_service_uart_write(const char *text);
 static void http_service_log_status(const char *text);
@@ -97,6 +98,7 @@ static void http_service_format_logout_json(char *buffer, size_t buffer_size);
 static void http_service_format_cluster_config_json(char *buffer, size_t buffer_size);
 static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_size);
 static void http_service_format_relay_config_json(char *buffer, size_t buffer_size);
+static err_t http_service_handle_status_request(http_service_connection_t *connection);
 static uint8_t http_service_get_master_ip_text(char *buffer, size_t buffer_size, uint8_t *is_local_master);
 static uint8_t http_service_is_master_control_allowed(char *master_ip_text, size_t buffer_size);
 static void http_service_sync_backend_config_to_cluster_async(void);
@@ -270,7 +272,7 @@ static void http_service_release_connection(http_service_connection_t *connectio
 
   if ((g_http_listener_pcb != NULL) &&
       (g_http_listener_accept_paused != 0U) &&
-      (http_service_active_connection_count() == 0U))
+      (http_service_active_connection_count() < HTTP_CONN_POOL_SIZE))
   {
     tcp_accept(g_http_listener_pcb, http_service_accept);
     g_http_listener_accept_paused = 0U;
@@ -724,20 +726,10 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
   char ip_text[16];
   char mask_text[16];
   char gw_text[16];
-  char mqtt_client_id_json[(MQTT_LINK_CLIENT_ID_MAX_LEN * 2U) + 8U];
-  char mqtt_topic_status_json[(MQTT_LINK_TOPIC_MAX_LEN * 2U) + 8U];
-  char mqtt_topic_events_json[(MQTT_LINK_TOPIC_MAX_LEN * 2U) + 8U];
-  char mqtt_topic_measure_json[(MQTT_LINK_TOPIC_MAX_LEN * 2U) + 8U];
-  char mqtt_topic_command_relay_json[(MQTT_LINK_TOPIC_MAX_LEN * 2U) + 8U];
-  char mqtt_topic_command_mask_json[(MQTT_LINK_TOPIC_MAX_LEN * 2U) + 8U];
-  char mqtt_topic_command_config_relay_json[(MQTT_LINK_TOPIC_MAX_LEN * 2U) + 8U];
-  char mqtt_topic_ack_prefix_json[(MQTT_LINK_TOPIC_MAX_LEN * 2U) + 8U];
-  char mqtt_cluster_ca_fingerprint_json[(DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 2U) + 8U];
-  char mqtt_cluster_binding_secret_json[(DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN * 2U) + 8U];
   control_service_stats_t control_stats;
   discovery_service_stats_t discovery_stats;
   backend_link_stats_t backend_stats;
-  mqtt_link_stats_t mqtt_stats;
+  mqtt_link_stats_t *mqtt_stats = &g_http_mqtt_stats_snapshot;
   cluster_service_state_t cluster_state;
   size_t heap_free = xPortGetFreeHeapSize();
   size_t heap_min = xPortGetMinimumEverFreeHeapSize();
@@ -750,28 +742,8 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
   control_service_get_stats(&control_stats);
   discovery_service_get_stats(&discovery_stats);
   backend_link_service_get_stats(&backend_stats);
-  mqtt_link_service_get_stats(&mqtt_stats);
+  mqtt_link_service_get_stats(mqtt_stats);
   cluster_service_get_state(&cluster_state);
-  http_service_json_escape_copy(mqtt_client_id_json, sizeof(mqtt_client_id_json),
-                                mqtt_stats.client_id, sizeof(mqtt_stats.client_id));
-  http_service_json_escape_copy(mqtt_topic_status_json, sizeof(mqtt_topic_status_json),
-                                mqtt_stats.topic_status, sizeof(mqtt_stats.topic_status));
-  http_service_json_escape_copy(mqtt_topic_events_json, sizeof(mqtt_topic_events_json),
-                                mqtt_stats.topic_events, sizeof(mqtt_stats.topic_events));
-  http_service_json_escape_copy(mqtt_topic_measure_json, sizeof(mqtt_topic_measure_json),
-                                mqtt_stats.topic_measure, sizeof(mqtt_stats.topic_measure));
-  http_service_json_escape_copy(mqtt_topic_command_relay_json, sizeof(mqtt_topic_command_relay_json),
-                                mqtt_stats.topic_command_relay, sizeof(mqtt_stats.topic_command_relay));
-  http_service_json_escape_copy(mqtt_topic_command_mask_json, sizeof(mqtt_topic_command_mask_json),
-                                mqtt_stats.topic_command_mask, sizeof(mqtt_stats.topic_command_mask));
-  http_service_json_escape_copy(mqtt_topic_command_config_relay_json, sizeof(mqtt_topic_command_config_relay_json),
-                                mqtt_stats.topic_command_config_relay, sizeof(mqtt_stats.topic_command_config_relay));
-  http_service_json_escape_copy(mqtt_topic_ack_prefix_json, sizeof(mqtt_topic_ack_prefix_json),
-                                mqtt_stats.topic_ack_prefix, sizeof(mqtt_stats.topic_ack_prefix));
-  http_service_json_escape_copy(mqtt_cluster_ca_fingerprint_json, sizeof(mqtt_cluster_ca_fingerprint_json),
-                                mqtt_stats.cluster_ca_fingerprint, sizeof(mqtt_stats.cluster_ca_fingerprint));
-  http_service_json_escape_copy(mqtt_cluster_binding_secret_json, sizeof(mqtt_cluster_binding_secret_json),
-                                mqtt_stats.cluster_binding_secret, sizeof(mqtt_stats.cluster_binding_secret));
   (void)ip4addr_ntoa_r(netif_ip4_addr(&gnetif), ip_text, sizeof(ip_text));
   (void)ip4addr_ntoa_r(netif_ip4_netmask(&gnetif), mask_text, sizeof(mask_text));
   (void)ip4addr_ntoa_r(netif_ip4_gw(&gnetif), gw_text, sizeof(gw_text));
@@ -806,7 +778,7 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  "\"auth\":{\"required\":1,\"active_session\":%u,\"sessions_issued\":%lu,\"login_failures\":%lu},"
                  "\"http\":{\"connections\":%lu,\"requests\":%lu,\"errors\":%lu,\"active\":%lu,\"close_pending\":%lu,\"listener_up\":%lu},"
                  "\"backend\":{\"connected\":%u,\"should_run\":%u,\"port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"sent_hello\":%lu,\"sent_heartbeat\":%lu,\"sent_status\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"last_error\":%lu},"
-                 "\"cloud\":{\"configured\":%u,\"enabled\":%u,\"should_run\":%u,\"connected\":%u,\"transport\":%u,\"broker_port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"published_hello\":%lu,\"published_heartbeat\":%lu,\"published_status\":%lu,\"published_fault_reports\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"last_error\":%lu,\"status_dirty_count\":%lu,\"client_id\":\"%s\",\"topic_status\":\"%s\",\"topic_events\":\"%s\",\"topic_measure\":\"%s\",\"topic_command_relay\":\"%s\",\"topic_command_mask\":\"%s\",\"topic_command_config_relay\":\"%s\",\"topic_ack_prefix\":\"%s\",\"cluster_ca_fingerprint\":\"%s\",\"cluster_binding_secret\":\"%s\"},"
+                 "\"cloud\":{\"configured\":%u,\"enabled\":%u,\"should_run\":%u,\"connected\":%u,\"transport\":%u,\"broker_port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"published_hello\":%lu,\"published_heartbeat\":%lu,\"published_status\":%lu,\"published_fault_reports\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"last_error\":%lu,\"status_dirty_count\":%lu,\"ca_fingerprint_configured\":%u,\"binding_secret_configured\":%u},"
                  "\"lwip\":{\"mem_avail\":%lu,\"mem_used\":%lu,\"mem_err\":%lu,\"tcp_pcb_used\":%lu,\"tcp_pcb_max\":%lu,\"tcp_seg_used\":%lu,\"tcp_seg_max\":%lu,\"pbuf_used\":%lu,\"pbuf_max\":%lu}"
                  "}",
                  (unsigned long)HAL_GetTick(),
@@ -860,32 +832,24 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)backend_stats.received_commands,
                  (unsigned long)backend_stats.command_errors,
                  (unsigned long)backend_stats.last_error,
-                 (unsigned int)mqtt_stats.configured,
-                 (unsigned int)mqtt_stats.enabled,
-                 (unsigned int)mqtt_stats.should_run,
-                 (unsigned int)mqtt_stats.connected,
-                 (unsigned int)mqtt_stats.transport,
-                 (unsigned int)mqtt_stats.broker_port,
-                 (unsigned long)mqtt_stats.connect_attempts,
-                 (unsigned long)mqtt_stats.connect_failures,
-                 (unsigned long)mqtt_stats.published_hello,
-                 (unsigned long)mqtt_stats.published_heartbeat,
-                 (unsigned long)mqtt_stats.published_status,
-                 (unsigned long)mqtt_stats.published_fault_reports,
-                 (unsigned long)mqtt_stats.received_commands,
-                 (unsigned long)mqtt_stats.command_errors,
-                 (unsigned long)mqtt_stats.last_error,
-                 (unsigned long)mqtt_stats.status_dirty_count,
-                 mqtt_client_id_json,
-                 mqtt_topic_status_json,
-                 mqtt_topic_events_json,
-                 mqtt_topic_measure_json,
-                 mqtt_topic_command_relay_json,
-                 mqtt_topic_command_mask_json,
-                 mqtt_topic_command_config_relay_json,
-                 mqtt_topic_ack_prefix_json,
-                 mqtt_cluster_ca_fingerprint_json,
-                 mqtt_cluster_binding_secret_json,
+                 (unsigned int)mqtt_stats->configured,
+                 (unsigned int)mqtt_stats->enabled,
+                 (unsigned int)mqtt_stats->should_run,
+                 (unsigned int)mqtt_stats->connected,
+                 (unsigned int)mqtt_stats->transport,
+                 (unsigned int)mqtt_stats->broker_port,
+                 (unsigned long)mqtt_stats->connect_attempts,
+                 (unsigned long)mqtt_stats->connect_failures,
+                 (unsigned long)mqtt_stats->published_hello,
+                 (unsigned long)mqtt_stats->published_heartbeat,
+                 (unsigned long)mqtt_stats->published_status,
+                 (unsigned long)mqtt_stats->published_fault_reports,
+                 (unsigned long)mqtt_stats->received_commands,
+                 (unsigned long)mqtt_stats->command_errors,
+                 (unsigned long)mqtt_stats->last_error,
+                 (unsigned long)mqtt_stats->status_dirty_count,
+                 (unsigned int)(mqtt_stats->cluster_ca_fingerprint[0] != '\0'),
+                 (unsigned int)(mqtt_stats->cluster_binding_secret[0] != '\0'),
                  (unsigned long)lwip_stats.mem.avail,
                  (unsigned long)lwip_stats.mem.used,
                  (unsigned long)lwip_stats.mem.err,
@@ -895,6 +859,18 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)MEMP_STATS_GET(max, MEMP_TCP_SEG),
                  (unsigned long)MEMP_STATS_GET(used, MEMP_PBUF),
                  (unsigned long)MEMP_STATS_GET(max, MEMP_PBUF));
+}
+
+__attribute__((noinline)) static err_t http_service_handle_status_request(http_service_connection_t *connection)
+{
+  if (connection == NULL)
+  {
+    return ERR_ARG;
+  }
+
+  http_service_format_status_json(connection->response_buffer, sizeof(connection->response_buffer));
+  http_service_uart_write("[http] status ready\r\n");
+  return http_service_send_payload(connection, "200 OK", "application/json", connection->response_buffer);
 }
 
 static void http_service_format_relay_json(char *buffer, size_t buffer_size, uint32_t relay_mask)
@@ -1081,17 +1057,17 @@ static void http_service_sync_backend_config_to_cluster_async(void)
 static void http_service_format_cluster_config_json(char *buffer, size_t buffer_size)
 {
   const device_config_t *config = device_config_get();
-  cluster_service_state_t cluster_state;
-  char master_ip[16];
-  char device_name_json[(DEVICE_CONFIG_NAME_MAX_LEN * 2U) + 8U];
-  char cluster_name_json[(DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN * 2U) + 8U];
-  char backend_host_json[(DEVICE_CONFIG_BACKEND_HOST_MAX_LEN * 2U) + 8U];
-  char cloud_broker_host_json[(DEVICE_CONFIG_CLOUD_HOST_MAX_LEN * 2U) + 8U];
-  char cloud_cluster_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
-  char cloud_device_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
-  char cloud_key_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
-  char cloud_cluster_ca_fingerprint_json[(DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 2U) + 8U];
-  char cloud_cluster_binding_secret_json[(DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN * 2U) + 8U];
+  static cluster_service_state_t cluster_state;
+  static char master_ip[16];
+  static char device_name_json[(DEVICE_CONFIG_NAME_MAX_LEN * 2U) + 8U];
+  static char cluster_name_json[(DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN * 2U) + 8U];
+  static char backend_host_json[(DEVICE_CONFIG_BACKEND_HOST_MAX_LEN * 2U) + 8U];
+  static char cloud_broker_host_json[(DEVICE_CONFIG_CLOUD_HOST_MAX_LEN * 2U) + 8U];
+  static char cloud_cluster_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
+  static char cloud_device_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
+  static char cloud_key_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
+  static char cloud_cluster_ca_fingerprint_json[(DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 2U) + 8U];
+  static char cloud_cluster_binding_secret_json[(DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN * 2U) + 8U];
   uint8_t is_local_master = 0U;
 
   cluster_service_get_state(&cluster_state);
@@ -1176,13 +1152,13 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
   uint32_t index;
   uint32_t local_auth_tag = device_config_password_tag(config);
   size_t used;
-  char ip_text[16];
-  char cluster_name_json[(CLUSTER_SERVICE_CLUSTER_NAME_LEN * 2U) + 8U];
-  char node_name_json[(CLUSTER_SERVICE_DEVICE_NAME_LEN * 2U) + 8U];
-  char cloud_cluster_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
-  char cloud_device_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
-  char cloud_key_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
-  ip4_addr_t ip_addr;
+  static char ip_text[16];
+  static char cluster_name_json[(CLUSTER_SERVICE_CLUSTER_NAME_LEN * 2U) + 8U];
+  static char node_name_json[(CLUSTER_SERVICE_DEVICE_NAME_LEN * 2U) + 8U];
+  static char cloud_cluster_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
+  static char cloud_device_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
+  static char cloud_key_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
+  static ip4_addr_t ip_addr;
 
   nodes = cluster_service_get_nodes(&count);
   used = (size_t)snprintf(buffer, buffer_size, "{\"ok\":true,\"nodes\":[");
@@ -1342,25 +1318,26 @@ static void http_service_apply_remote_command(const cluster_node_t *node,
   (void)snprintf(buffer, buffer_size, "{\"ok\":true,\"queued\":1}");
 }
 
-static err_t http_service_handle_request(http_service_connection_t *connection, const char *request)
+__attribute__((noinline)) static err_t http_service_handle_request(http_service_connection_t *connection,
+                                                                   const char *request)
 {
-  char method[8];
-  char path[64];
+  static char method[8];
+  static char path[64];
   char *response_body = connection->response_buffer;
   const size_t response_body_size = HTTP_BODY_BUFFER_SIZE;
   const char *body;
   uint32_t value;
   uint8_t authenticated = http_service_has_valid_session(request);
-  control_proto_command_t command;
-  char password_text[32];
-  char device_name[DEVICE_CONFIG_NAME_MAX_LEN];
-  char cluster_name[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN];
-  char relay_name[DEVICE_CONFIG_NAME_MAX_LEN];
-  char master_ip_text[16];
+  static control_proto_command_t command;
+  static char password_text[32];
+  static char device_name[DEVICE_CONFIG_NAME_MAX_LEN];
+  static char cluster_name[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN];
+  static char relay_name[DEVICE_CONFIG_NAME_MAX_LEN];
+  static char master_ip_text[16];
   const cluster_node_t *remote_node;
   const device_config_t *active_config = device_config_get();
   uint32_t local_auth_tag = device_config_password_tag(active_config);
-  cluster_service_state_t cluster_state;
+  static cluster_service_state_t cluster_state;
 
   if ((connection == NULL) || (connection->pcb == NULL) || (request == NULL))
   {
@@ -1403,12 +1380,6 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
 
-  if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/status") == 0))
-  {
-    http_service_format_status_json(response_body, response_body_size);
-    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
-  }
-
   if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/relay") == 0))
   {
     http_service_format_relay_json(response_body, response_body_size, board_relay_snapshot());
@@ -1417,7 +1388,7 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
 
   if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/config/cluster") == 0))
   {
-    char cfg_log[96];
+    static char cfg_log[96];
     http_service_format_cluster_config_json(response_body, response_body_size);
     (void)snprintf(cfg_log, sizeof(cfg_log), "[http] cfg len=%lu\r\n",
                    (unsigned long)strlen(response_body));
@@ -1576,18 +1547,18 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/config/cluster") == 0))
   {
-    device_config_t config;
+    static device_config_t config;
     const device_config_t *current_config = device_config_get();
-    char backend_host[DEVICE_CONFIG_BACKEND_HOST_MAX_LEN];
-    char backend_port_text[16];
-    char backend_key[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
-    char cloud_broker_host[DEVICE_CONFIG_CLOUD_HOST_MAX_LEN];
-    char cloud_broker_port_text[16];
-    char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
-    char cloud_device_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
-    char cloud_key_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
-    char cloud_cluster_ca_fingerprint[DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN];
-    char cloud_cluster_binding_secret[DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN];
+    static char backend_host[DEVICE_CONFIG_BACKEND_HOST_MAX_LEN];
+    static char backend_port_text[16];
+    static char backend_key[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
+    static char cloud_broker_host[DEVICE_CONFIG_CLOUD_HOST_MAX_LEN];
+    static char cloud_broker_port_text[16];
+    static char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+    static char cloud_device_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+    static char cloud_key_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
+    static char cloud_cluster_ca_fingerprint[DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN];
+    static char cloud_cluster_binding_secret[DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN];
     uint8_t cluster_password_supplied = 0U;
     uint8_t cluster_identity_changed = 0U;
     uint8_t cluster_runtime_changed = 0U;
@@ -1821,7 +1792,8 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
       }
     }
 
-    if (device_config_update_and_save(&config) == 0U)
+    if ((memcmp(&config, current_config, sizeof(config)) != 0) &&
+        (device_config_update_and_save(&config) == 0U))
     {
       (void)snprintf(response_body,
                      response_body_size,
@@ -1869,7 +1841,7 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/config/relay") == 0))
   {
-    device_config_t config;
+    static device_config_t config;
     uint32_t channel;
 
     if (!authenticated)
@@ -1981,7 +1953,8 @@ static err_t http_service_handle_request(http_service_connection_t *connection, 
 static err_t http_service_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
 {
   http_service_connection_t *connection = (http_service_connection_t *)arg;
-  char line[96];
+  static char line[96];
+  static char message[128];
   err_t request_err;
   u16_t copy_len;
   char *header_end;
@@ -2046,7 +2019,6 @@ static err_t http_service_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
   g_http_service_stats.requests++;
   if (sscanf(connection->request_buffer, "%95[^\r\n]", line) == 1)
   {
-    char message[128];
     (void)snprintf(message, sizeof(message), "[http] req %s\r\n", line);
     http_service_uart_write(message);
   }
@@ -2059,7 +2031,14 @@ static err_t http_service_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
      connection->send_progress = 0;
   }
   
-  request_err = http_service_handle_request(connection, connection->request_buffer);
+  if (strncmp(connection->request_buffer, "GET /api/status ", 16U) == 0)
+  {
+    request_err = http_service_handle_status_request(connection);
+  }
+  else
+  {
+    request_err = http_service_handle_request(connection, connection->request_buffer);
+  }
   if (request_err != ERR_OK)
   {
     http_service_log_error_value("[http] send err=", request_err);
@@ -2168,7 +2147,7 @@ static err_t http_service_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
   }
 
   active_count = http_service_active_connection_count();
-  if (active_count >= 1U)
+  if (active_count >= HTTP_CONN_POOL_SIZE)
   {
     g_http_service_stats.errors++;
     http_service_log_status("[http] accept busy\r\n");
@@ -2191,7 +2170,8 @@ static err_t http_service_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
   tcp_err(newpcb, http_service_error);
   tcp_sent(newpcb, http_service_sent);
   tcp_poll(newpcb, http_service_poll_close, 1);
-  if (g_http_listener_pcb != NULL)
+  if ((g_http_listener_pcb != NULL) &&
+      (http_service_active_connection_count() >= HTTP_CONN_POOL_SIZE))
   {
     tcp_accept(g_http_listener_pcb, NULL);
     g_http_listener_accept_paused = 1U;
@@ -2256,7 +2236,7 @@ static void http_service_tcpip_step(void *arg)
     http_service_log_status("[http] up 80\r\n");
   }
   else if ((g_http_listener_accept_paused != 0U) &&
-           (http_service_active_connection_count() == 0U))
+           (http_service_active_connection_count() < HTTP_CONN_POOL_SIZE))
   {
     tcp_accept(g_http_listener_pcb, http_service_accept);
     g_http_listener_accept_paused = 0U;

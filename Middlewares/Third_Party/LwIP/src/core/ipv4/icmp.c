@@ -67,6 +67,30 @@
 
 static void icmp_send_response(struct pbuf *p, u8_t type, u8_t code);
 
+__attribute__((noinline, optnone)) static void
+icmp_copy_bytes_safe(void *dst, const void *src, size_t len)
+{
+  u8_t *dst_bytes = (u8_t *)dst;
+  const u8_t *src_bytes = (const u8_t *)src;
+  size_t i;
+
+  for (i = 0; i < len; ++i) {
+    dst_bytes[i] = src_bytes[i];
+  }
+}
+
+__attribute__((noinline, optnone)) static void
+icmp_ip4_addr_copy_from_packed_safe(ip4_addr_t *dst, const void *src)
+{
+  icmp_copy_bytes_safe(&dst->addr, src, sizeof(dst->addr));
+}
+
+__attribute__((noinline, optnone)) static void
+icmp_ip4_addr_copy_to_packed_safe(void *dst, const ip4_addr_t *src)
+{
+  icmp_copy_bytes_safe(dst, &src->addr, sizeof(src->addr));
+}
+
 /**
  * Processes ICMP input packets, called from ip_input().
  *
@@ -210,8 +234,9 @@ icmp_input(struct pbuf *p, struct netif *inp)
       } else {
         err_t ret;
         struct ip_hdr *iphdr = (struct ip_hdr *)p->payload;
-        ip4_addr_copy(iphdr->src, *src);
-        ip4_addr_copy(iphdr->dest, *ip4_current_src_addr());
+        icmp_ip4_addr_copy_to_packed_safe(((u8_t *)iphdr) + offsetof(struct ip_hdr, src), src);
+        icmp_ip4_addr_copy_to_packed_safe(((u8_t *)iphdr) + offsetof(struct ip_hdr, dest),
+                                          ip4_current_src_addr());
         ICMPH_TYPE_SET(iecho, ICMP_ER);
 #if CHECKSUM_GEN_ICMP
         IF__NETIF_CHECKSUM_ENABLED(inp, NETIF_CHECKSUM_GEN_ICMP) {
@@ -377,11 +402,13 @@ icmp_send_response(struct pbuf *p, u8_t type, u8_t code)
   SMEMCPY((u8_t *)q->payload + sizeof(struct icmp_echo_hdr), (u8_t *)p->payload,
           IP_HLEN + ICMP_DEST_UNREACH_DATASIZE);
 
-  ip4_addr_copy(iphdr_src, iphdr->src);
+  icmp_ip4_addr_copy_from_packed_safe(&iphdr_src,
+                                      ((const u8_t *)iphdr) + offsetof(struct ip_hdr, src));
 #ifdef LWIP_HOOK_IP4_ROUTE_SRC
   {
     ip4_addr_t iphdr_dst;
-    ip4_addr_copy(iphdr_dst, iphdr->dest);
+    icmp_ip4_addr_copy_from_packed_safe(&iphdr_dst,
+                                        ((const u8_t *)iphdr) + offsetof(struct ip_hdr, dest));
     netif = ip4_route_src(&iphdr_dst, &iphdr_src);
   }
 #else

@@ -5,6 +5,7 @@ const path = require("path");
 const crypto = require("crypto");
 
 const HTTP_PORT = Number(process.env.HTTP_PORT || 4300);
+const HTTP_HOST = String(process.env.HTTP_HOST || "127.0.0.1");
 const TCP_PORT = Number(process.env.TCP_PORT || 42001);
 const CLOUD_BROKER_HOST = String(process.env.CLOUD_BROKER_HOST || "broker.example.com");
 const CLOUD_BROKER_PORT = Number(process.env.CLOUD_BROKER_PORT || 8883);
@@ -13,6 +14,7 @@ const DUPLICATE_MASTER_GRACE_MS = Number(process.env.DUPLICATE_MASTER_GRACE_MS |
 const DUPLICATE_MASTER_SCAN_MS = Number(process.env.DUPLICATE_MASTER_SCAN_MS || 2000);
 const CLIENT_STALE_MS = Number(process.env.CLIENT_STALE_MS || 12000);
 const PROVISIONING_RESEND_COOLDOWN_MS = Number(process.env.PROVISIONING_RESEND_COOLDOWN_MS || 30000);
+const ALLOW_PRIVATE_KEY_EXPORT = process.env.ALLOW_PRIVATE_KEY_EXPORT === "1";
 const REMOTE_ADMIN_PASSWORD = process.env.REMOTE_ADMIN_PASSWORD || "admin";
 const DATA_DIR = path.join(__dirname, "data");
 const KEYS_PATH = path.join(DATA_DIR, "keys.json");
@@ -384,11 +386,12 @@ function buildDeviceProvisioningBundle(clusterRecord, deviceRecord) {
     },
     deviceBundle: {
       devicePublicPem: deviceRecord.devicePublicPem || "",
-      devicePrivatePem: deviceRecord.devicePrivatePem || "",
+      devicePrivatePem: ALLOW_PRIVATE_KEY_EXPORT ? (deviceRecord.devicePrivatePem || "") : "",
       deviceFingerprint: deviceRecord.deviceFingerprint || "",
       certificatePayload: deviceRecord.certificatePayload || null,
       certificateSignature: deviceRecord.certificateSignature || "",
     },
+    privateKeyExportEnabled: ALLOW_PRIVATE_KEY_EXPORT,
   };
 }
 
@@ -824,6 +827,15 @@ function knownNodeKey(key, cluster, nodeId) {
 function upsertKnownNode(record) {
   const key = knownNodeKey(record.backendKey, record.cluster, record.nodeId);
   const existing = knownNodes.get(key) || {};
+  const existingSeenMs = Date.parse(existing.lastSeenAt || "");
+  const recordSeenMs = Date.parse(record.lastSeenAt || "");
+
+  if (Number.isFinite(existingSeenMs) &&
+      Number.isFinite(recordSeenMs) &&
+      recordSeenMs < existingSeenMs) {
+    return existing;
+  }
+
   const merged = {
       ...existing,
       ...record,
@@ -831,6 +843,7 @@ function upsertKnownNode(record) {
     };
   knownNodes.set(key, merged);
   syncCloudRegistryFromKnownNode(merged);
+  return merged;
 }
 
 function setKnownNodeRelayMask(nodeId, relayMask) {
@@ -1099,6 +1112,7 @@ function buildSummarySnapshot() {
   const clientList = Array.from(clients.values());
   return {
     ok: true,
+    httpHost: HTTP_HOST,
     httpPort: HTTP_PORT,
     tcpPort: TCP_PORT,
     keyCount: keyStore.length,
@@ -1273,7 +1287,7 @@ function applyClusterStatusSnapshot(client, message) {
         cloudKeyId,
         ip: String(node.ip || ""),
       role: Number(node.role || 0),
-      term: Number(node.term || 0),
+      term: Number(node.term || message.term || existing.term || 0),
       online: Number(node.online ? 1 : 0),
       deviceState: Number(node.device_state || 0),
       relayMask: Number(node.relay_mask || 0) >>> 0,
@@ -2843,6 +2857,7 @@ app.get("/api/cloud/devices/:clusterId/:deviceId/provision", (req, res) => {
     formFields: buildProvisioningFormFields(provisioning),
     trustBundle: bundle.trustBundle,
     deviceBundle: bundle.deviceBundle,
+    privateKeyExportEnabled: bundle.privateKeyExportEnabled,
   });
 });
 
@@ -3255,8 +3270,8 @@ tcpServer.listen(TCP_PORT, () => {
   console.log(`[backend-test] tcp listening on ${TCP_PORT}`);
 });
 
-app.listen(HTTP_PORT, () => {
-  console.log(`[backend-test] http listening on ${HTTP_PORT}`);
+app.listen(HTTP_PORT, HTTP_HOST, () => {
+  console.log(`[backend-test] http listening on ${HTTP_HOST}:${HTTP_PORT}`);
 });
 
 setInterval(scanDuplicateMasters, DUPLICATE_MASTER_SCAN_MS);

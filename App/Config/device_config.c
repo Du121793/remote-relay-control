@@ -30,6 +30,12 @@ typedef struct
   TaskHandle_t waiting_task;
 } device_config_request_t;
 
+static StaticQueue_t g_device_config_queue_buffer;
+static uint8_t g_device_config_queue_storage[
+  DEVICE_CONFIG_QUEUE_LENGTH * sizeof(device_config_request_t)];
+static StaticTask_t g_device_config_task_buffer;
+static StackType_t g_device_config_task_stack[1024];
+
 typedef struct
 {
   uint32_t magic;
@@ -785,15 +791,25 @@ static void device_config_worker_init(void)
     return;
   }
 
-  g_device_config_queue = xQueueCreate(DEVICE_CONFIG_QUEUE_LENGTH, sizeof(device_config_request_t));
+  g_device_config_queue =
+    xQueueCreateStatic(DEVICE_CONFIG_QUEUE_LENGTH,
+                       sizeof(device_config_request_t),
+                       g_device_config_queue_storage,
+                       &g_device_config_queue_buffer);
   if ((g_device_config_queue != NULL) && (g_device_config_task_handle == NULL))
   {
-    (void)xTaskCreate(device_config_worker_task,
-                      "CfgSave",
-                      1024U,
-                      NULL,
-                      tskIDLE_PRIORITY + 1U,
-                      &g_device_config_task_handle);
+    g_device_config_task_handle =
+      xTaskCreateStatic(device_config_worker_task,
+                        "CfgSave",
+                        1024U,
+                        NULL,
+                        tskIDLE_PRIORITY + 1U,
+                        g_device_config_task_stack,
+                        &g_device_config_task_buffer);
+    if (g_device_config_task_handle == NULL)
+    {
+      g_device_config_queue = NULL;
+    }
   }
 }
 
