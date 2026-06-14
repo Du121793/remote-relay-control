@@ -51,6 +51,13 @@ typedef struct
   uint32_t relay_mask;
   uint32_t enabled_mask;
   uint32_t auth_tag;
+  uint32_t unix_time;
+  uint8_t time_valid;
+  uint8_t time_source;
+  uint8_t time_quality;
+  uint32_t time_seq;
+  uint32_t gateway_epoch;
+  uint32_t gateway_node_id;
   char node_name[CLUSTER_SERVICE_DEVICE_NAME_LEN];
   char cluster_name[CLUSTER_SERVICE_CLUSTER_NAME_LEN];
   char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
@@ -66,6 +73,10 @@ typedef struct
   uint8_t role;
   uint8_t has_master;
   uint8_t master_eligible;
+  uint8_t time_valid;
+  uint8_t rtc_lse_ready;
+  uint8_t time_source;
+  uint8_t time_quality;
   uint32_t self_node_id;
   uint32_t master_node_id;
   uint32_t term;
@@ -73,8 +84,24 @@ typedef struct
   uint32_t health_score;
   uint32_t health_lateness_ms;
   uint32_t health_bad_streak;
+  uint32_t unix_time;
+  uint32_t time_sync_count;
+  uint32_t time_seq;
+  uint32_t gateway_epoch;
+  uint32_t gateway_node_id;
+  int32_t last_time_offset_seconds;
   char cluster_name[CLUSTER_SERVICE_CLUSTER_NAME_LEN];
 } cluster_service_state_t;
+
+#define CLUSTER_TIME_SOURCE_NONE       0U
+#define CLUSTER_TIME_SOURCE_MQTT       1U
+#define CLUSTER_TIME_SOURCE_MASTER     2U
+#define CLUSTER_TIME_SOURCE_RTC        3U
+
+#define CLUSTER_TIME_QUALITY_INVALID       0U
+#define CLUSTER_TIME_QUALITY_CLUSTER       1U
+#define CLUSTER_TIME_QUALITY_RTC_HOLDOVER  2U
+#define CLUSTER_TIME_QUALITY_BROKER        3U
 
 void cluster_service_init(void);
 void cluster_service_poll(void);
@@ -91,6 +118,8 @@ uint32_t cluster_service_compute_load_score(uint32_t http_active_connections,
                                             uint32_t pending_commands);
 void cluster_service_set_local_load_score(uint32_t load_score);
 void cluster_service_note_remote_node(const cluster_node_t *node);
+uint8_t cluster_service_set_unix_time(uint32_t unix_time, uint8_t source);
+uint32_t cluster_service_get_unix_time(uint8_t *valid);
 
 #ifdef __cplusplus
 }

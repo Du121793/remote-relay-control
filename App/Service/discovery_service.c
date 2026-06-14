@@ -97,6 +97,14 @@ static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t por
                                                board_relay_snapshot(),
                                                enabled_mask,
                                                config->auto_join_cluster,
+                                               cluster_state.unix_time,
+                                               cluster_state.time_valid,
+                                               cluster_state.rtc_lse_ready,
+                                               cluster_state.time_source,
+                                               cluster_state.time_quality,
+                                               cluster_state.time_seq,
+                                               cluster_state.gateway_epoch,
+                                               cluster_state.gateway_node_id,
                                                ip_text,
                                                DISCOVERY_UDP_PORT,
                                                gnetif.hwaddr);
@@ -210,6 +218,13 @@ static void discovery_service_udp_recv(void *arg, struct udp_pcb *pcb, struct pb
       node.relay_mask = announce.relay_mask;
       node.enabled_mask = announce.enabled_mask;
       node.auth_tag = announce.auth_tag;
+      node.unix_time = announce.unix_time;
+      node.time_valid = announce.time_valid;
+      node.time_source = announce.time_source;
+      node.time_quality = announce.time_quality;
+      node.time_seq = announce.time_seq;
+      node.gateway_epoch = announce.gateway_epoch;
+      node.gateway_node_id = announce.gateway_node_id;
       memcpy(node.node_name, announce.device, sizeof(node.node_name));
       memcpy(node.cluster_name, announce.cluster, sizeof(node.cluster_name));
       memcpy(node.cloud_cluster_id, announce.cloud_cluster_id, sizeof(node.cloud_cluster_id));

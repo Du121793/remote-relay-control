@@ -40,6 +40,8 @@
 /* Parameters set in STM32CubeMX LwIP Configuration GUI -*/
 /*----- WITH_RTOS enabled (Since FREERTOS is set) -----*/
 #define WITH_RTOS 1
+/*----- mbedTLS is provided by the CubeMX middleware package. -----*/
+#define WITH_MBEDTLS 1
 /*----- Keep checksum handling in software while validating ETH/DHCP RX/TX -----*/
 #define CHECKSUM_BY_HARDWARE 0
 /*-----------------------------------------------------------------------------*/
@@ -48,10 +50,20 @@
 /* Parameters set in STM32CubeMX LwIP Configuration GUI -*/
 /*----- Value in opt.h for LWIP_DHCP: 0 -----*/
 #define LWIP_DHCP 1
+/*----- DNS is required to resolve configured MQTT broker host names. -----*/
+#define LWIP_DNS 1
+/*----- Enable the altcp mbedTLS transport used by secure MQTT. -----*/
+#define LWIP_ALTCP 1
+#define LWIP_ALTCP_TLS 1
+#define LWIP_ALTCP_TLS_MBEDTLS 1
+#define ALTCP_MBEDTLS_RNG_FN mbedtls_entropy_func
+#define MQTT_OUTPUT_RINGBUF_SIZE 1024
+/* Long command topics plus the accepted 383-byte JSON payload must fit. */
+#define MQTT_VAR_HEADER_BUFFER_LEN 640
 /*----- Value in opt.h for MEMP_NUM_IGMP_GROUP: 8 -----*/
 #define MEMP_NUM_IGMP_GROUP 8
 /*----- Raise lwIP heap and TCP resource pools for concurrent browser/API traffic -----*/
-#define MEM_SIZE (12U * 1024U)
+#define MEM_SIZE (48U * 1024U)
 #define MEMP_NUM_TCP_PCB 12
 #define MEMP_NUM_TCP_PCB_LISTEN 8
 #define MEMP_NUM_TCP_SEG 48
@@ -61,7 +73,7 @@
 /*----- Default Value for F7 devices: 0x20048000 -----*/
 #define LWIP_RAM_HEAP_POINTER 0x20048000
 /*----- Value in opt.h for MEMP_NUM_SYS_TIMEOUT: (LWIP_TCP + IP_REASSEMBLY + LWIP_ARP + (2*LWIP_DHCP) + LWIP_AUTOIP + LWIP_IGMP + LWIP_DNS + (PPP_SUPPORT*6*MEMP_NUM_PPP_PCB) + (LWIP_IPV6 ? (1 + LWIP_IPV6_REASS + LWIP_IPV6_MLD) : 0)) -*/
-#define MEMP_NUM_SYS_TIMEOUT 6
+#define MEMP_NUM_SYS_TIMEOUT 16
 /*----- Value in opt.h for LWIP_ETHERNET: LWIP_ARP || PPPOE_SUPPORT -*/
 #define LWIP_ETHERNET 1
 /*----- Value in opt.h for LWIP_DNS_SECURE: (LWIP_DNS_SECURE_RAND_XID | LWIP_DNS_SECURE_NO_MULTIPLE_OUTSTANDING | LWIP_DNS_SECURE_RAND_SRC_PORT) -*/
@@ -102,6 +114,8 @@
 #define DEFAULT_ACCEPTMBOX_SIZE 12
 /*----- Value in opt.h for RECV_BUFSIZE_DEFAULT: INT_MAX -----*/
 #define RECV_BUFSIZE_DEFAULT 2000000000
+/*----- Use the CubeMX-generated external mbedTLS middleware. -----*/
+#define LWIP_USE_EXTERNAL_MBEDTLS 1
 /*----- Value in opt.h for LWIP_STATS: 1 -----*/
 #define LWIP_STATS 1
 #define MEM_STATS 1

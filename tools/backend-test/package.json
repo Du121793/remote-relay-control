@@ -5,7 +5,9 @@
   "description": "Express + TCP backend for autoControl long-link testing",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "mqtt": "node mqtt-psk-broker.js",
+    "mqtt:smoke": "node mqtt-smoke-test.js"
   },
   "dependencies": {
     "express": "^4.21.2"

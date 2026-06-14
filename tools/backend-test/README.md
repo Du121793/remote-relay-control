@@ -152,6 +152,99 @@ backend 目前會：
 - 在 UI `事件紀錄` 顯示
 - 在 console 直接 `console.error(...)`
 
+## MQTT over TLS-PSK 測試服務
+
+- MQTT broker：`0.0.0.0:8883`
+- 本機控制 API：`http://127.0.0.1:4301`
+- TLS：固定使用 TLS 1.2 PSK。
+- PSK identity：device 的 `cloud_device_id`。
+- PSK：cluster 的 `cloud_cluster_binding_secret` 經 base64url 解碼後的 32 bytes。
+- MQTT username/password 仍會比對 `cloud_key_id` 與原始 binding secret。
+
+啟動與桌面 smoke test：
+
+```powershell
+npm run mqtt
+npm run mqtt:smoke
+```
+
+控制 API：
+
+- `GET /api/summary`
+- `GET /api/clients`
+- `GET /api/events`
+- `POST /api/publish`
+
+裝置訂閱 `cluster/<clusterId>/command/time` 後，測試 broker 會自動下發：
+
+```json
+{
+  "request_id": "broker-time-...",
+  "unix_time": 1781367600
+}
+```
+
+master 寫入 LSE RTC，並透過 discovery announce 將時間同步給 member。
+
+`POST /api/publish` 範例：
+
+```json
+{
+  "topic": "cluster/default/command/relay",
+  "payload": {
+    "request_id": "test-1",
+    "node_id": 1165657530,
+    "channel": 3,
+    "value": 1
+  }
+}
+```
+
+relay queue 滿載時，裝置會在 ack 回覆：
+
+```json
+{
+  "ok": false,
+  "queued": 0,
+  "completed": 0,
+  "error": "queue_full"
+}
+```
+
+繼電器設定使用獨立 topic：
+
+```json
+{
+  "topic": "cluster/default/command/config/relay",
+  "payload": {
+    "request_id": "config-test-1",
+    "node_id": 1165657530,
+    "channel": 16,
+    "name": "MqttMember16",
+    "enabled": 1,
+    "remember_state": 0,
+    "boot_default_on": 0
+  }
+}
+```
+
+`node_id=0` 或省略時設定目前 master；指定 member node ID 時，由 master 透過
+member HTTP 設定介面保存。設定命令只有在 Flash 保存完成後才回覆完成 ACK：
+
+```json
+{
+  "ok": true,
+  "queued": 1,
+  "completed": 1,
+  "request_id": "config-test-1",
+  "target_node_id": 1165657530,
+  "error": ""
+}
+```
+
+一般 relay/mask 命令的 ACK 表示已接受進入 control queue，會是
+`queued=1, completed=0`；設定與時間命令則以 `completed=1` 表示持久化或時間套用已完成。
+
 ## HTTP API
 
 ### UI 與狀態

@@ -73,6 +73,12 @@ struct altcp_tls_config *altcp_tls_create_config_server_privkey_cert(const u8_t 
 struct altcp_tls_config *altcp_tls_create_config_client(const u8_t *cert, size_t cert_len);
 
 /** @ingroup altcp_tls
+ * Create an ALTCP_TLS client configuration using a pre-shared key.
+ */
+struct altcp_tls_config *altcp_tls_create_config_client_psk(const u8_t *psk, size_t psk_len,
+                            const u8_t *identity, size_t identity_len);
+
+/** @ingroup altcp_tls
  * Create an ALTCP_TLS client configuration handle with two-way server/client authentication
  */
 struct altcp_tls_config *altcp_tls_create_config_client_2wayauth(const u8_t *ca, size_t ca_len, const u8_t *privkey, size_t privkey_len,

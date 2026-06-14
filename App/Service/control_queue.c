@@ -2,11 +2,13 @@
 #include "backend_link_service.h"
 #include "mqtt_link_service.h"
 #include "cluster_service.h"
+#include "discovery_service.h"
 
 #include "cmsis_os.h"
 
 #include "FreeRTOS.h"
 #include "queue.h"
+#include "semphr.h"
 #include "task.h"
 #include "../Config/device_config.h"
 
@@ -36,6 +38,8 @@ typedef struct
 {
   uint8_t kind;
   control_proto_command_t command;
+  control_queue_relay_config_t relay_config;
+  char request_id[CONTROL_QUEUE_REQUEST_ID_MAX_LEN];
   relay_domain_result_t *result;
   TaskHandle_t waiting_task;
   uint32_t remote_ip_addr;
@@ -48,13 +52,14 @@ typedef struct
   char login_request[256];
   char login_response[512];
   char config_request[1280];
-  char config_response[512];
+  char config_response[2048];
   char encoded_host[(DEVICE_CONFIG_BACKEND_HOST_MAX_LEN * 3U) + 1U];
   char encoded_key[(DEVICE_CONFIG_BACKEND_KEY_MAX_LEN * 3U) + 1U];
   char encoded_cloud_host[(DEVICE_CONFIG_CLOUD_HOST_MAX_LEN * 3U) + 1U];
   char encoded_cloud_cluster_id[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 3U) + 1U];
   char encoded_cloud_cluster_ca_fingerprint[(DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 3U) + 1U];
   char encoded_cloud_cluster_binding_secret[(DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN * 3U) + 1U];
+  char encoded_relay_name[(DEVICE_CONFIG_NAME_MAX_LEN * 3U) + 1U];
   char body[1152];
 } control_queue_backend_sync_workspace_t;
 
@@ -62,6 +67,7 @@ typedef struct
 #define CONTROL_QUEUE_WAIT_TIMEOUT_MS    1000U
 #define CONTROL_QUEUE_REQ_COMMAND        0U
 #define CONTROL_QUEUE_REQ_BACKEND_SYNC   1U
+#define CONTROL_QUEUE_REQ_RELAY_CONFIG   2U
 #define CONTROL_QUEUE_REMOTE_ADMIN_PASSWORD "admin"
 
 static control_queue_stats_t g_control_queue_stats;
@@ -71,9 +77,63 @@ static control_queue_request_t g_control_queue_worker_request;
 static relay_domain_result_t g_control_queue_async_result;
 static control_queue_backend_sync_t g_control_queue_backend_sync_request;
 static control_queue_backend_sync_workspace_t g_control_queue_backend_sync_workspace;
+static device_config_t g_control_queue_relay_config_snapshot;
 static volatile uint8_t g_control_queue_backend_sync_pending = 0U;
 static StaticTask_t g_control_queue_task_buffer;
 static StackType_t g_control_queue_task_stack[1024];
+static StaticSemaphore_t g_control_queue_sync_mutex_buffer;
+static SemaphoreHandle_t g_control_queue_sync_mutex = NULL;
+static relay_domain_result_t g_control_queue_sync_result;
+
+static HAL_StatusTypeDef control_queue_send_all(int sock, const char *text)
+{
+  size_t length;
+  size_t sent = 0U;
+
+  if ((sock < 0) || (text == NULL))
+  {
+    return HAL_ERROR;
+  }
+
+  length = strlen(text);
+  while (sent < length)
+  {
+    int send_len = lwip_send(sock, text + sent, length - sent, 0);
+    if (send_len <= 0)
+    {
+      return HAL_ERROR;
+    }
+    sent += (size_t)send_len;
+  }
+
+  return HAL_OK;
+}
+
+static void control_queue_note_enqueued(void)
+{
+  UBaseType_t depth;
+
+  if (g_control_queue_handle == NULL)
+  {
+    return;
+  }
+
+  depth = uxQueueMessagesWaiting(g_control_queue_handle);
+  g_control_queue_stats.current_depth = (uint32_t)depth;
+  if ((uint32_t)depth > g_control_queue_stats.high_watermark)
+  {
+    g_control_queue_stats.high_watermark = (uint32_t)depth;
+  }
+}
+
+static void control_queue_note_dequeued(void)
+{
+  if (g_control_queue_handle != NULL)
+  {
+    g_control_queue_stats.current_depth =
+      (uint32_t)uxQueueMessagesWaiting(g_control_queue_handle);
+  }
+}
 
 static size_t control_queue_url_encode(const char *src, char *dst, size_t dst_size)
 {
@@ -157,9 +217,9 @@ static HAL_StatusTypeDef control_queue_http_request(uint32_t ip_addr,
   int sock = -1;
   struct sockaddr_in remote_addr;
   struct timeval timeout_value;
-  int sent_len;
   int recv_len;
   size_t used = 0U;
+  uint8_t complete = 0U;
 
   if ((ip_addr == 0U) || (request_text == NULL) || (response == NULL) || (response_size < 2U))
   {
@@ -188,8 +248,7 @@ static HAL_StatusTypeDef control_queue_http_request(uint32_t ip_addr,
     return HAL_ERROR;
   }
 
-  sent_len = lwip_send(sock, request_text, strlen(request_text), 0);
-  if (sent_len < 0)
+  if (control_queue_send_all(sock, request_text) != HAL_OK)
   {
     lwip_close(sock);
     return HAL_ERROR;
@@ -208,6 +267,7 @@ static HAL_StatusTypeDef control_queue_http_request(uint32_t ip_addr,
     response[used] = '\0';
     if (control_queue_http_response_complete(response, used) != 0U)
     {
+      complete = 1U;
       break;
     }
     if (used >= (response_size - 1U))
@@ -218,7 +278,7 @@ static HAL_StatusTypeDef control_queue_http_request(uint32_t ip_addr,
 
   response[used] = '\0';
   lwip_close(sock);
-  return (used > 0U) ? HAL_OK : HAL_ERROR;
+  return (complete != 0U) ? HAL_OK : HAL_ERROR;
 }
 
 __attribute__((noinline)) static HAL_StatusTypeDef control_queue_sync_remote_backend_config(
@@ -315,6 +375,180 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_sync_remote_bac
                  (unsigned int)strlen(workspace->body),
                  workspace->body);
 
+  if (control_queue_http_request(ip_addr,
+                                 workspace->config_request,
+                                 workspace->config_response,
+                                 sizeof(workspace->config_response)) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  if ((strstr(workspace->config_response, "200 OK") == NULL) ||
+      (strstr(workspace->config_response, "\"ok\":true") == NULL))
+  {
+    return HAL_ERROR;
+  }
+
+  return HAL_OK;
+}
+
+__attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_local_relay_config(
+  const control_queue_relay_config_t *relay_config)
+{
+  device_config_t *config = &g_control_queue_relay_config_snapshot;
+  device_config_relay_t *relay;
+
+  if ((relay_config == NULL) ||
+      (relay_config->channel == 0U) ||
+      (relay_config->channel > DEVICE_CONFIG_RELAY_COUNT) ||
+      (relay_config->fields == 0U))
+  {
+    return HAL_ERROR;
+  }
+
+  *config = *device_config_get();
+  relay = &config->relay[relay_config->channel - 1U];
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_NAME_PRESENT) != 0U)
+  {
+    if (relay_config->name[0] == '\0')
+    {
+      return HAL_ERROR;
+    }
+    memset(relay->name, 0, sizeof(relay->name));
+    strncpy(relay->name, relay_config->name, sizeof(relay->name) - 1U);
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_ENABLED_PRESENT) != 0U)
+  {
+    relay->enabled = relay_config->enabled;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_REMEMBER_PRESENT) != 0U)
+  {
+    relay->remember_state = relay_config->remember_state;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_BOOT_PRESENT) != 0U)
+  {
+    relay->boot_default_on = relay_config->boot_default_on;
+  }
+
+  return (device_config_update_and_save(config) != 0U) ? HAL_OK : HAL_ERROR;
+}
+
+__attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_remote_relay_config(
+  uint32_t ip_addr,
+  const control_queue_relay_config_t *relay_config)
+{
+  control_queue_backend_sync_workspace_t *workspace = &g_control_queue_backend_sync_workspace;
+  uint32_t token;
+  char *token_text;
+  char *endptr = NULL;
+  size_t used;
+  int written;
+
+  if ((ip_addr == 0U) ||
+      (relay_config == NULL) ||
+      (relay_config->channel == 0U) ||
+      (relay_config->channel > DEVICE_CONFIG_RELAY_COUNT) ||
+      (relay_config->fields == 0U))
+  {
+    return HAL_ERROR;
+  }
+
+  (void)snprintf(workspace->body, sizeof(workspace->body),
+                 "password=%s", CONTROL_QUEUE_REMOTE_ADMIN_PASSWORD);
+  (void)snprintf(workspace->login_request, sizeof(workspace->login_request),
+                 "POST /api/login HTTP/1.1\r\n"
+                 "Host: remote\r\n"
+                 "Content-Type: application/x-www-form-urlencoded\r\n"
+                 "Content-Length: %u\r\n"
+                 "Connection: close\r\n"
+                 "\r\n"
+                 "%s",
+                 (unsigned int)strlen(workspace->body),
+                 workspace->body);
+  if (control_queue_http_request(ip_addr,
+                                 workspace->login_request,
+                                 workspace->login_response,
+                                 sizeof(workspace->login_response)) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  token_text = strstr(workspace->login_response, "\"token\":");
+  if (token_text == NULL)
+  {
+    return HAL_ERROR;
+  }
+  token = (uint32_t)strtoul(token_text + 8, &endptr, 10);
+  if ((endptr == (token_text + 8)) || (token == 0U))
+  {
+    return HAL_ERROR;
+  }
+
+  written = snprintf(workspace->body, sizeof(workspace->body),
+                     "channel=%u", (unsigned int)relay_config->channel);
+  if ((written <= 0) || ((size_t)written >= sizeof(workspace->body)))
+  {
+    return HAL_ERROR;
+  }
+  used = (size_t)written;
+
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_NAME_PRESENT) != 0U)
+  {
+    control_queue_url_encode(relay_config->name,
+                             workspace->encoded_relay_name,
+                             sizeof(workspace->encoded_relay_name));
+    written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
+                       "&name=%s", workspace->encoded_relay_name);
+    if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
+    {
+      return HAL_ERROR;
+    }
+    used += (size_t)written;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_ENABLED_PRESENT) != 0U)
+  {
+    written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
+                       "&enabled=%u", (unsigned int)relay_config->enabled);
+    if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
+    {
+      return HAL_ERROR;
+    }
+    used += (size_t)written;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_REMEMBER_PRESENT) != 0U)
+  {
+    written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
+                       "&remember_state=%u",
+                       (unsigned int)relay_config->remember_state);
+    if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
+    {
+      return HAL_ERROR;
+    }
+    used += (size_t)written;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_BOOT_PRESENT) != 0U)
+  {
+    written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
+                       "&boot_default_on=%u",
+                       (unsigned int)relay_config->boot_default_on);
+    if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
+    {
+      return HAL_ERROR;
+    }
+  }
+
+  (void)snprintf(workspace->config_request, sizeof(workspace->config_request),
+                 "POST /api/config/relay HTTP/1.1\r\n"
+                 "Host: remote\r\n"
+                 "X-Auth-Token: %lu\r\n"
+                 "Content-Type: application/x-www-form-urlencoded\r\n"
+                 "Content-Length: %u\r\n"
+                 "Connection: close\r\n"
+                 "\r\n"
+                 "%s",
+                 (unsigned long)token,
+                 (unsigned int)strlen(workspace->body),
+                 workspace->body);
   if (control_queue_http_request(ip_addr,
                                  workspace->config_request,
                                  workspace->config_response,
@@ -468,7 +702,7 @@ static HAL_StatusTypeDef control_queue_fetch_remote_relay_mask(uint32_t ip_addr,
     return HAL_ERROR;
   }
 
-  if (lwip_send(sock, request, strlen(request), 0) < 0)
+  if (control_queue_send_all(sock, request) != HAL_OK)
   {
     lwip_close(sock);
     return HAL_ERROR;
@@ -527,7 +761,7 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_execute_remote_
     return HAL_ERROR;
   }
 
-  if (lwip_send(sock, request, strlen(request), 0) < 0)
+  if (control_queue_send_all(sock, request) != HAL_OK)
   {
     lwip_close(sock);
     return HAL_ERROR;
@@ -589,7 +823,7 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_execute_remote(
     return HAL_ERROR;
   }
 
-  if (lwip_send(sock, request, strlen(request), 0) < 0)
+  if (control_queue_send_all(sock, request) != HAL_OK)
   {
     lwip_close(sock);
     return HAL_ERROR;
@@ -616,7 +850,7 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_execute_remote(
     {
       return HAL_OK;
     }
-    return HAL_OK;
+    return HAL_ERROR;
   }
 
   return HAL_ERROR;
@@ -632,6 +866,7 @@ static void control_queue_worker_task(void const *argument)
     {
       control_queue_request_t *request = &g_control_queue_worker_request;
 
+      control_queue_note_dequeued();
       if (request->kind == CONTROL_QUEUE_REQ_BACKEND_SYNC)
       {
         if (control_queue_sync_remote_backend_config(request->remote_ip_addr,
@@ -644,6 +879,41 @@ static void control_queue_worker_task(void const *argument)
           g_control_queue_stats.dropped++;
         }
         g_control_queue_backend_sync_pending = 0U;
+      }
+      else if (request->kind == CONTROL_QUEUE_REQ_RELAY_CONFIG)
+      {
+        HAL_StatusTypeDef config_status;
+
+        if (request->remote != 0U)
+        {
+          config_status =
+            control_queue_apply_remote_relay_config(request->remote_ip_addr,
+                                                    &request->relay_config);
+        }
+        else
+        {
+          config_status =
+            control_queue_apply_local_relay_config(&request->relay_config);
+        }
+
+        if (config_status == HAL_OK)
+        {
+          g_control_queue_stats.executed++;
+          discovery_service_force_announce();
+          mqtt_link_service_complete_relay_config(request->request_id,
+                                                  request->remote_node_id,
+                                                  1U,
+                                                  "");
+        }
+        else
+        {
+          g_control_queue_stats.dropped++;
+          mqtt_link_service_complete_relay_config(
+            request->request_id,
+            request->remote_node_id,
+            0U,
+            (request->remote != 0U) ? "remote_config_failed" : "config_save_failed");
+        }
       }
       else if (request->remote != 0U)
       {
@@ -682,14 +952,16 @@ static void control_queue_worker_task(void const *argument)
       }
       else
       {
-        relay_domain_execute(&request->command, request->result);
-        if ((request->result != NULL) &&
-            (request->result->error == CONTROL_PROTO_ERR_NONE) &&
+        relay_domain_result_t *target_result =
+          (request->result != NULL) ? request->result : &g_control_queue_async_result;
+
+        relay_domain_execute(&request->command, target_result);
+        if ((target_result->error == CONTROL_PROTO_ERR_NONE) &&
             ((request->command.type == CONTROL_PROTO_CMD_SET_RELAY) ||
              (request->command.type == CONTROL_PROTO_CMD_SET_RELAY_MASK) ||
              (request->command.type == CONTROL_PROTO_CMD_SET_RELAY_ALL)))
         {
-          device_config_runtime_relay_mask_set(request->result->relay_mask);
+          device_config_runtime_relay_mask_set(target_result->relay_mask);
           backend_link_service_mark_status_dirty();
           mqtt_link_service_mark_status_dirty();
         }
@@ -714,10 +986,19 @@ void control_queue_init(void)
   }
 
   memset(&g_control_queue_stats, 0, sizeof(g_control_queue_stats));
+  g_control_queue_stats.capacity = CONTROL_QUEUE_LENGTH;
   g_control_queue_handle = xQueueCreate(CONTROL_QUEUE_LENGTH, sizeof(control_queue_request_t));
 
   if (g_control_queue_handle != NULL)
   {
+    g_control_queue_sync_mutex =
+      xSemaphoreCreateMutexStatic(&g_control_queue_sync_mutex_buffer);
+    if (g_control_queue_sync_mutex == NULL)
+    {
+      vQueueDelete(g_control_queue_handle);
+      g_control_queue_handle = NULL;
+      return;
+    }
     g_control_queue_task_handle =
       xTaskCreateStatic((TaskFunction_t)control_queue_worker_task,
                         "ControlQueueWorker",
@@ -743,29 +1024,85 @@ void control_queue_init(void)
 
 HAL_StatusTypeDef control_queue_submit(const control_proto_command_t *command, relay_domain_result_t *result)
 {
+  control_queue_request_t request;
+
   if ((command == NULL) || (result == NULL))
   {
     g_control_queue_stats.dropped++;
     return HAL_ERROR;
   }
 
-  g_control_queue_stats.submitted++;
-
-  taskENTER_CRITICAL();
-  relay_domain_execute(command, result);
-  taskEXIT_CRITICAL();
-
-  if ((result->error == CONTROL_PROTO_ERR_NONE) &&
-      ((command->type == CONTROL_PROTO_CMD_SET_RELAY) ||
-       (command->type == CONTROL_PROTO_CMD_SET_RELAY_MASK) ||
-       (command->type == CONTROL_PROTO_CMD_SET_RELAY_ALL)))
+  control_queue_init();
+  if ((g_control_queue_handle == NULL) ||
+      (g_control_queue_task_handle == NULL) ||
+      (g_control_queue_sync_mutex == NULL))
   {
-    device_config_runtime_relay_mask_set(result->relay_mask);
-    backend_link_service_mark_status_dirty();
-    mqtt_link_service_mark_status_dirty();
+    g_control_queue_stats.dropped++;
+    return HAL_ERROR;
   }
 
-  g_control_queue_stats.executed++;
+  if (xSemaphoreTake(g_control_queue_sync_mutex,
+                     pdMS_TO_TICKS(CONTROL_QUEUE_WAIT_TIMEOUT_MS)) != pdTRUE)
+  {
+    g_control_queue_stats.busy_rejected++;
+    g_control_queue_stats.dropped++;
+    return HAL_BUSY;
+  }
+
+  memset(&request, 0, sizeof(request));
+  memset(&g_control_queue_sync_result, 0, sizeof(g_control_queue_sync_result));
+  request.command = *command;
+  request.kind = CONTROL_QUEUE_REQ_COMMAND;
+  request.result = &g_control_queue_sync_result;
+  request.waiting_task = xTaskGetCurrentTaskHandle();
+  (void)ulTaskNotifyTake(pdTRUE, 0U);
+
+  if (xQueueSend(g_control_queue_handle, &request, 0U) != pdPASS)
+  {
+    g_control_queue_stats.queue_full++;
+    g_control_queue_stats.dropped++;
+    (void)xSemaphoreGive(g_control_queue_sync_mutex);
+    return HAL_BUSY;
+  }
+
+  g_control_queue_stats.submitted++;
+  control_queue_note_enqueued();
+  (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  *result = g_control_queue_sync_result;
+  (void)xSemaphoreGive(g_control_queue_sync_mutex);
+  return (result->error == CONTROL_PROTO_ERR_NONE) ? HAL_OK : HAL_ERROR;
+}
+
+HAL_StatusTypeDef control_queue_submit_async(const control_proto_command_t *command)
+{
+  control_queue_request_t request;
+
+  if (command == NULL)
+  {
+    g_control_queue_stats.dropped++;
+    return HAL_ERROR;
+  }
+
+  control_queue_init();
+  if ((g_control_queue_handle == NULL) || (g_control_queue_task_handle == NULL))
+  {
+    g_control_queue_stats.dropped++;
+    return HAL_ERROR;
+  }
+
+  memset(&request, 0, sizeof(request));
+  request.command = *command;
+  request.kind = CONTROL_QUEUE_REQ_COMMAND;
+
+  if (xQueueSend(g_control_queue_handle, &request, 0U) != pdPASS)
+  {
+    g_control_queue_stats.queue_full++;
+    g_control_queue_stats.dropped++;
+    return HAL_BUSY;
+  }
+
+  g_control_queue_stats.submitted++;
+  control_queue_note_enqueued();
   return HAL_OK;
 }
 
@@ -782,15 +1119,27 @@ HAL_StatusTypeDef control_queue_submit_remote(uint32_t ip_addr,
   }
 
   control_queue_init();
-  if ((g_control_queue_handle == NULL) || (g_control_queue_task_handle == NULL))
+  if ((g_control_queue_handle == NULL) ||
+      (g_control_queue_task_handle == NULL) ||
+      (g_control_queue_sync_mutex == NULL))
   {
     g_control_queue_stats.dropped++;
     return HAL_ERROR;
   }
 
+  if (xSemaphoreTake(g_control_queue_sync_mutex,
+                     pdMS_TO_TICKS(CONTROL_QUEUE_WAIT_TIMEOUT_MS)) != pdTRUE)
+  {
+    g_control_queue_stats.busy_rejected++;
+    g_control_queue_stats.dropped++;
+    return HAL_BUSY;
+  }
+
+  memset(&request, 0, sizeof(request));
+  memset(&g_control_queue_sync_result, 0, sizeof(g_control_queue_sync_result));
   request.command = *command;
   request.kind = CONTROL_QUEUE_REQ_COMMAND;
-  request.result = result;
+  request.result = &g_control_queue_sync_result;
   request.waiting_task = xTaskGetCurrentTaskHandle();
   request.remote_ip_addr = ip_addr;
   request.remote_node_id = 0U;
@@ -800,18 +1149,18 @@ HAL_StatusTypeDef control_queue_submit_remote(uint32_t ip_addr,
 
   if (xQueueSend(g_control_queue_handle, &request, 0U) != pdPASS)
   {
+    g_control_queue_stats.queue_full++;
     g_control_queue_stats.dropped++;
+    (void)xSemaphoreGive(g_control_queue_sync_mutex);
     return HAL_BUSY;
   }
 
   g_control_queue_stats.submitted++;
+  control_queue_note_enqueued();
 
-  if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CONTROL_QUEUE_WAIT_TIMEOUT_MS)) == 0U)
-  {
-    g_control_queue_stats.dropped++;
-    return HAL_TIMEOUT;
-  }
-
+  (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  *result = g_control_queue_sync_result;
+  (void)xSemaphoreGive(g_control_queue_sync_mutex);
   return (result->error == CONTROL_PROTO_ERR_NONE) ? HAL_OK : HAL_ERROR;
 }
 
@@ -834,6 +1183,7 @@ HAL_StatusTypeDef control_queue_submit_remote_async(uint32_t ip_addr,
     return HAL_ERROR;
   }
 
+  memset(&request, 0, sizeof(request));
   request.command = *command;
   request.kind = CONTROL_QUEUE_REQ_COMMAND;
   request.result = NULL;
@@ -844,11 +1194,13 @@ HAL_StatusTypeDef control_queue_submit_remote_async(uint32_t ip_addr,
 
   if (xQueueSend(g_control_queue_handle, &request, 0U) != pdPASS)
   {
+    g_control_queue_stats.queue_full++;
     g_control_queue_stats.dropped++;
     return HAL_BUSY;
   }
 
   g_control_queue_stats.submitted++;
+  control_queue_note_enqueued();
   return HAL_OK;
 }
 
@@ -874,6 +1226,7 @@ HAL_StatusTypeDef control_queue_submit_backend_sync_async(uint32_t ip_addr,
   if (g_control_queue_backend_sync_pending != 0U)
   {
     taskEXIT_CRITICAL();
+    g_control_queue_stats.busy_rejected++;
     return HAL_BUSY;
   }
   g_control_queue_backend_sync_pending = 1U;
@@ -909,11 +1262,59 @@ HAL_StatusTypeDef control_queue_submit_backend_sync_async(uint32_t ip_addr,
   if (xQueueSend(g_control_queue_handle, &request, 0U) != pdPASS)
   {
     g_control_queue_backend_sync_pending = 0U;
+    g_control_queue_stats.queue_full++;
     g_control_queue_stats.dropped++;
     return HAL_BUSY;
   }
 
   g_control_queue_stats.submitted++;
+  control_queue_note_enqueued();
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef control_queue_submit_relay_config_async(
+  uint32_t ip_addr,
+  uint32_t node_id,
+  const control_queue_relay_config_t *relay_config,
+  const char *request_id)
+{
+  control_queue_request_t request;
+
+  if ((relay_config == NULL) ||
+      (relay_config->channel == 0U) ||
+      (relay_config->channel > DEVICE_CONFIG_RELAY_COUNT) ||
+      (relay_config->fields == 0U) ||
+      (request_id == NULL) ||
+      (request_id[0] == '\0'))
+  {
+    g_control_queue_stats.dropped++;
+    return HAL_ERROR;
+  }
+
+  control_queue_init();
+  if ((g_control_queue_handle == NULL) || (g_control_queue_task_handle == NULL))
+  {
+    g_control_queue_stats.dropped++;
+    return HAL_ERROR;
+  }
+
+  memset(&request, 0, sizeof(request));
+  request.kind = CONTROL_QUEUE_REQ_RELAY_CONFIG;
+  request.relay_config = *relay_config;
+  request.remote_ip_addr = ip_addr;
+  request.remote_node_id = node_id;
+  request.remote = (ip_addr != 0U) ? 1U : 0U;
+  strncpy(request.request_id, request_id, sizeof(request.request_id) - 1U);
+
+  if (xQueueSend(g_control_queue_handle, &request, 0U) != pdPASS)
+  {
+    g_control_queue_stats.queue_full++;
+    g_control_queue_stats.dropped++;
+    return HAL_BUSY;
+  }
+
+  g_control_queue_stats.submitted++;
+  control_queue_note_enqueued();
   return HAL_OK;
 }
 
@@ -927,5 +1328,10 @@ void control_queue_get_stats(control_queue_stats_t *stats)
   if (stats != NULL)
   {
     *stats = g_control_queue_stats;
+    if (g_control_queue_handle != NULL)
+    {
+      stats->current_depth =
+        (uint32_t)uxQueueMessagesWaiting(g_control_queue_handle);
+    }
   }
 }

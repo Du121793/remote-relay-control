@@ -298,10 +298,15 @@ function sanitizeKeyRecord(record) {
 }
 
 function pushEvent(type, payload) {
+  const deviceMessage = payload && payload.message && typeof payload.message === "object"
+    ? payload.message
+    : payload;
   const entry = {
     ts: new Date().toISOString(),
     type,
     payload,
+    uptime_ms: Number(deviceMessage?.uptime_ms || 0),
+    unix_time: Number(deviceMessage?.unix_time || 0),
   };
   events.push(entry);
   while (events.length > 300) {
@@ -574,11 +579,21 @@ function rejectHello(client, socket, error) {
 async function applyProvisioningToNode(node, clusterRecord, deviceRecord) {
   const nodeId = Number(node.nodeId || 0);
   const activeClient = findClientByNodeId(nodeId);
+  let data;
 
   if (activeClient && sendJson(activeClient, buildProvisioningApplyMessage(clusterRecord, deviceRecord))) {
     return { ok: true, via: "backend_link" };
   }
-  throw new Error("node_not_connected");
+
+  data = await remoteNodeRequest(
+    nodeId,
+    "/api/config/cluster",
+    new URLSearchParams(buildProvisioningApplyPayload(clusterRecord, deviceRecord))
+  );
+  if (!data || data.ok === false) {
+    throw new Error(data?.error || "node_http_apply_failed");
+  }
+  return { ok: true, via: "http" };
 }
 
 function nowIso() {
@@ -1377,6 +1392,9 @@ function scanStaleClients() {
         });
         client.staleWarningIssued = true;
       }
+      if (!client.socket.destroyed) {
+        client.socket.destroy();
+      }
     } else {
       client.staleWarningIssued = false;
     }
@@ -1529,7 +1547,8 @@ const tcpServer = net.createServer((socket) => {
               rejectHello(client, socket, "bad_cloud_cluster_binding_secret");
               continue;
             }
-            if (clusterRecord && clusterRecord.keyId && client.cloudKeyId && clusterRecord.keyId !== client.cloudKeyId) {
+            if (clusterRecord && !deviceRecord && clusterRecord.keyId && client.cloudKeyId &&
+                clusterRecord.keyId !== client.cloudKeyId) {
               rejectHello(client, socket, "bad_cloud_cluster_key_id");
               continue;
             }
@@ -3039,6 +3058,27 @@ app.patch("/api/cloud/clusters/:clusterId", (req, res) => {
   }
   if (typeof req.body.enabled === "boolean") {
     record.enabled = req.body.enabled;
+  }
+  if (typeof req.body.transport !== "undefined") {
+    const transport = Number(req.body.transport);
+    if (!Number.isInteger(transport) || transport < 1 || transport > 255) {
+      return res.status(400).json({ ok: false, error: "bad_cloud_transport" });
+    }
+    record.transport = transport;
+  }
+  if (typeof req.body.brokerHost !== "undefined") {
+    const brokerHost = String(req.body.brokerHost || "").trim();
+    if (!brokerHost || brokerHost.length > 253) {
+      return res.status(400).json({ ok: false, error: "bad_broker_host" });
+    }
+    record.brokerHost = brokerHost;
+  }
+  if (typeof req.body.brokerPort !== "undefined") {
+    const brokerPort = Number(req.body.brokerPort);
+    if (!Number.isInteger(brokerPort) || brokerPort < 1 || brokerPort > 65535) {
+      return res.status(400).json({ ok: false, error: "bad_broker_port" });
+    }
+    record.brokerPort = brokerPort;
   }
   record.lastUpdatedAt = nowIso();
   cloudClusters.set(record.clusterId, record);

@@ -31,6 +31,8 @@ MDK-ARM/build_log.txt
 MDK-ARM/disasm.txt
 /image.png
 /image1.png
+/image0.png
+/image2.png
 
 # Root-level Codex CLI installation metadata (not part of this project)
 /package.json

@@ -20,6 +20,7 @@
 #include "main.h"
 #include "cmsis_os.h"
 #include "lwip.h"
+#include "mbedtls.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -63,6 +64,10 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 
+RNG_HandleTypeDef hrng;
+
+RTC_HandleTypeDef hrtc;
+
 UART_HandleTypeDef huart3;
 
 osThreadId defaultTaskHandle;
@@ -105,6 +110,8 @@ static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_RNG_Init(void);
+static void MX_RTC_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
@@ -243,6 +250,15 @@ void lwip_platform_assert(const char *msg, int line, const char *file)
 
 static void log_startup_banner(void)
 {
+  cluster_service_state_t cluster_state;
+
+  cluster_service_get_state(&cluster_state);
+  (void)snprintf(g_uart_message, sizeof(g_uart_message),
+                 "[boot] rtc lse=%u source=%u quality=%u\r\n",
+                 (unsigned int)cluster_state.rtc_lse_ready,
+                 (unsigned int)cluster_state.time_source,
+                 (unsigned int)cluster_state.time_quality);
+  uart3_write(g_uart_message);
   uart3_write("\r\n[boot] autoControl startup complete\r\n");
 }
 
@@ -354,10 +370,14 @@ int main(void)
   MX_GPIO_Init();
   MX_ADC1_Init();
   MX_USART3_UART_Init();
+  uart3_write("\r\n[boot] uart ready\r\n");
+  MX_RNG_Init();
+  MX_MBEDTLS_Init();
   /* USER CODE BEGIN 2 */
   device_config_init();
   (void)board_relay_apply_mask(device_config_build_startup_relay_mask(device_config_get()));
   cluster_service_init();
+  MX_RTC_Init();
   log_startup_banner();
 
   /* USER CODE END 2 */
@@ -430,7 +450,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLM = 8;
   RCC_OscInitStruct.PLL.PLLN = 216;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 9;
   RCC_OscInitStruct.PLL.PLLR = 2;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
@@ -509,6 +529,58 @@ static void MX_ADC1_Init(void)
 
   /* USER CODE END ADC1_Init 2 */
 
+}
+
+/**
+  * @brief RNG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RNG_Init(void)
+{
+
+  /* USER CODE BEGIN RNG_Init 0 */
+
+  /* USER CODE END RNG_Init 0 */
+
+  /* USER CODE BEGIN RNG_Init 1 */
+
+  /* USER CODE END RNG_Init 1 */
+  hrng.Instance = RNG;
+  if (HAL_RNG_Init(&hrng) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RNG_Init 2 */
+
+  /* USER CODE END RNG_Init 2 */
+
+}
+
+/**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+  if (__HAL_RCC_GET_FLAG(RCC_FLAG_LSERDY) == RESET)
+  {
+    memset(&hrtc, 0, sizeof(hrtc));
+    return;
+  }
+
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127U;
+  hrtc.Init.SynchPrediv = 255U;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    memset(&hrtc, 0, sizeof(hrtc));
+  }
 }
 
 /**
@@ -725,6 +797,14 @@ void MPU_Config(void)
   /* Enables the MPU */
   HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
 }
 
 /**

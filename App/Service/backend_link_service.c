@@ -27,6 +27,8 @@
 #define BACKEND_LINK_LOOP_DELAY_MS             200UL
 #define BACKEND_LINK_MASTER_STABLE_DELAY_MS    2000UL
 #define BACKEND_LINK_STALE_RECONNECT_MS        12000UL
+#define BACKEND_LINK_SEND_TIMEOUT_MS            500UL
+#define BACKEND_LINK_SEND_RETRY_DELAY_MS          5UL
 #define BACKEND_LINK_RX_BUFFER_SIZE            512U
 #define BACKEND_LINK_TX_BUFFER_SIZE            4096U
 
@@ -447,6 +449,8 @@ static void backend_link_build_node_ip_text(uint32_t ip_addr, char *buffer, size
 static int backend_link_send_json(const char *json_text)
 {
   size_t len;
+  size_t sent = 0U;
+  uint32_t started_ms;
   int send_len;
 
   if ((json_text == NULL) || (g_backend_link_context.sock < 0))
@@ -455,11 +459,30 @@ static int backend_link_send_json(const char *json_text)
   }
 
   len = strlen(json_text);
-  send_len = lwip_send(g_backend_link_context.sock, json_text, (int)len, 0);
-  if (send_len != (int)len)
+  started_ms = HAL_GetTick();
+  while (sent < len)
   {
+    send_len = lwip_send(g_backend_link_context.sock,
+                         json_text + sent,
+                         (int)(len - sent),
+                         0);
+    if (send_len > 0)
+    {
+      sent += (size_t)send_len;
+      continue;
+    }
+
+    if ((send_len < 0) &&
+        ((errno == EWOULDBLOCK) || (errno == EAGAIN)) &&
+        ((HAL_GetTick() - started_ms) < BACKEND_LINK_SEND_TIMEOUT_MS))
+    {
+      osDelay(BACKEND_LINK_SEND_RETRY_DELAY_MS);
+      continue;
+    }
+
     g_backend_link_context.stats.last_error = 1U;
-    backend_link_log_reason("[backend] send fail=", (uint32_t)((send_len < 0) ? (1000 - send_len) : (uint32_t)send_len));
+    backend_link_log_reason("[backend] send fail=",
+                            (uint32_t)((send_len < 0) ? (1000 - send_len) : sent));
     backend_link_close_socket();
     return -1;
   }
@@ -521,10 +544,17 @@ static int backend_link_send_heartbeat(void)
 
   cluster_service_get_state(&cluster_state);
   (void)snprintf(message, sizeof(message),
-                 "{\"type\":\"heartbeat\",\"node_id\":%lu,\"role\":%u,\"term\":%lu}\n",
+                 "{\"type\":\"heartbeat\",\"node_id\":%lu,\"role\":%u,\"term\":%lu,"
+                 "\"uptime_ms\":%lu,\"unix_time\":%lu,\"time_valid\":%u,"
+                 "\"time_source\":%u,\"time_quality\":%u}\n",
                  (unsigned long)cluster_state.self_node_id,
                  (unsigned int)cluster_state.role,
-                 (unsigned long)cluster_state.term);
+                 (unsigned long)cluster_state.term,
+                 (unsigned long)HAL_GetTick(),
+                 (unsigned long)cluster_state.unix_time,
+                 (unsigned int)cluster_state.time_valid,
+                 (unsigned int)cluster_state.time_source,
+                 (unsigned int)cluster_state.time_quality);
 
   if (backend_link_send_json(message) != 0)
   {
@@ -567,7 +597,7 @@ static int backend_link_send_status(void)
 
   used = (size_t)snprintf(g_backend_link_context.tx_buffer,
                           sizeof(g_backend_link_context.tx_buffer),
-                          "{\"type\":\"status\",\"device\":\"%s\",\"cluster\":\"%s\",\"node_id\":%lu,\"master_node_id\":%lu,\"role\":%u,\"term\":%lu,\"relay_mask\":%lu,\"device_state\":%u,\"ip\":\"%s\",\"cloud_transport\":%u,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\",\"cloud_cluster_ca_fingerprint\":\"%s\",\"nodes\":[{\"node_id\":%lu,\"name\":\"%s\",\"ip\":\"%s\",\"role\":%u,\"online\":1,\"device_state\":%u,\"relay_mask\":%lu,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
+                          "{\"type\":\"status\",\"device\":\"%s\",\"cluster\":\"%s\",\"node_id\":%lu,\"master_node_id\":%lu,\"role\":%u,\"term\":%lu,\"relay_mask\":%lu,\"device_state\":%u,\"ip\":\"%s\",\"uptime_ms\":%lu,\"unix_time\":%lu,\"time_valid\":%u,\"time_source\":%u,\"time_quality\":%u,\"time_seq\":%lu,\"gateway_epoch\":%lu,\"gateway_node_id\":%lu,\"cloud_transport\":%u,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\",\"cloud_cluster_ca_fingerprint\":\"%s\",\"nodes\":[{\"node_id\":%lu,\"name\":\"%s\",\"ip\":\"%s\",\"role\":%u,\"online\":1,\"device_state\":%u,\"relay_mask\":%lu,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
                           device_json,
                           cluster_json,
                           (unsigned long)cluster_state.self_node_id,
@@ -577,6 +607,14 @@ static int backend_link_send_status(void)
                           (unsigned long)relay_mask,
                           (unsigned int)CLUSTER_DEVICE_STATE_RUNNING,
                           ip_text,
+                          (unsigned long)HAL_GetTick(),
+                          (unsigned long)cluster_state.unix_time,
+                          (unsigned int)cluster_state.time_valid,
+                          (unsigned int)cluster_state.time_source,
+                          (unsigned int)cluster_state.time_quality,
+                          (unsigned long)cluster_state.time_seq,
+                          (unsigned long)cluster_state.gateway_epoch,
+                          (unsigned long)cluster_state.gateway_node_id,
                           (unsigned int)config->cloud_transport,
                           cloud_cluster_id_json,
                           cloud_device_id_json,
@@ -656,6 +694,7 @@ static int backend_link_send_status(void)
 static int backend_link_send_fault_report(void)
 {
   fault_service_record_t record;
+  cluster_service_state_t cluster_state;
   int written;
 
   if (fault_service_peek(&record) == 0U)
@@ -663,9 +702,10 @@ static int backend_link_send_fault_report(void)
     return 0;
   }
 
+  cluster_service_get_state(&cluster_state);
   written = snprintf(g_backend_link_context.tx_buffer,
                      sizeof(g_backend_link_context.tx_buffer),
-                     "{\"type\":\"fault_report\",\"fault_type\":%lu,\"cfsr\":%lu,\"hfsr\":%lu,\"mmfar\":%lu,\"bfar\":%lu,\"exc_lr\":%lu,\"sp\":%lu,\"pc\":%lu,\"lr\":%lu,\"psr\":%lu,\"r0\":%lu,\"r1\":%lu,\"r2\":%lu,\"r3\":%lu,\"r12\":%lu}\n",
+                     "{\"type\":\"fault_report\",\"fault_type\":%lu,\"cfsr\":%lu,\"hfsr\":%lu,\"mmfar\":%lu,\"bfar\":%lu,\"exc_lr\":%lu,\"sp\":%lu,\"pc\":%lu,\"lr\":%lu,\"psr\":%lu,\"r0\":%lu,\"r1\":%lu,\"r2\":%lu,\"r3\":%lu,\"r12\":%lu,\"uptime_ms\":%lu,\"unix_time\":%lu,\"time_valid\":%u}\n",
                      (unsigned long)record.type,
                      (unsigned long)record.cfsr,
                      (unsigned long)record.hfsr,
@@ -680,7 +720,10 @@ static int backend_link_send_fault_report(void)
                      (unsigned long)record.r1,
                      (unsigned long)record.r2,
                      (unsigned long)record.r3,
-                     (unsigned long)record.r12);
+                     (unsigned long)record.r12,
+                     (unsigned long)HAL_GetTick(),
+                     (unsigned long)cluster_state.unix_time,
+                     (unsigned int)cluster_state.time_valid);
   if ((written <= 0) || ((size_t)written >= sizeof(g_backend_link_context.tx_buffer)))
   {
     return -1;
@@ -802,21 +845,26 @@ static void backend_link_handle_command_line(const char *line)
       return;
     }
 
-    remote_node = cluster_service_find_node(target_node_id);
-    if ((remote_node == NULL) || (remote_node->ip_addr == 0U))
+    if (target_node_id != cluster_state.self_node_id)
     {
-      g_backend_link_context.stats.command_errors++;
+      remote_node = cluster_service_find_node(target_node_id);
+      if ((remote_node == NULL) || (remote_node->ip_addr == 0U))
+      {
+        g_backend_link_context.stats.command_errors++;
+        return;
+      }
+
+      if (control_queue_submit_remote_async(remote_node->ip_addr,
+                                            remote_node->node_id,
+                                            &command) != HAL_OK)
+      {
+        g_backend_link_context.stats.command_errors++;
+        return;
+      }
+
+      (void)backend_link_send_status();
       return;
     }
-
-    if (control_queue_submit_remote_async(remote_node->ip_addr, remote_node->node_id, &command) != HAL_OK)
-    {
-      g_backend_link_context.stats.command_errors++;
-      return;
-    }
-
-    (void)backend_link_send_status();
-    return;
   }
 
   if (control_queue_submit(&command, &result) != HAL_OK)

@@ -2,6 +2,7 @@
 #include "control_proto.h"
 #include "control_queue.h"
 #include "relay_domain.h"
+#include "../Platform/board_relay.h"
 
 #include "cmsis_os.h"
 
@@ -26,6 +27,7 @@ static volatile uint8_t g_control_poll_pending = 0U;
 static void control_service_tcpip_step(void *arg);
 static err_t control_service_sent_close(void *arg, struct tcp_pcb *tpcb, u16_t len);
 static err_t control_service_poll_close(void *arg, struct tcp_pcb *tpcb);
+static err_t control_service_poll_idle(void *arg, struct tcp_pcb *tpcb);
 
 static void control_service_close(struct tcp_pcb *tpcb)
 {
@@ -106,10 +108,40 @@ static void control_service_execute(const control_proto_command_t *command, char
     case CONTROL_PROTO_CMD_SET_RELAY:
     case CONTROL_PROTO_CMD_SET_RELAY_MASK:
     case CONTROL_PROTO_CMD_SET_RELAY_ALL:
-      queue_status = control_queue_submit(command, &result);
+      queue_status = control_queue_submit_async(command);
       if (queue_status != HAL_OK)
       {
         result.error = CONTROL_PROTO_ERR_BAD_COMMAND;
+      }
+      else
+      {
+        result.error = CONTROL_PROTO_ERR_NONE;
+        result.relay_mask = board_relay_snapshot();
+        if (command->type == CONTROL_PROTO_CMD_SET_RELAY)
+        {
+          if ((command->channel == 0U) ||
+              (command->channel > BOARD_RELAY_CHANNEL_COUNT) ||
+              (command->value > 1U))
+          {
+            result.error = CONTROL_PROTO_ERR_BAD_VALUE;
+          }
+          else if (command->value != 0U)
+          {
+            result.relay_mask |= (1UL << (command->channel - 1U));
+          }
+          else
+          {
+            result.relay_mask &= ~(1UL << (command->channel - 1U));
+          }
+        }
+        else if (command->type == CONTROL_PROTO_CMD_SET_RELAY_MASK)
+        {
+          result.relay_mask = command->mask;
+        }
+        else
+        {
+          result.relay_mask = (command->value != 0U) ? BOARD_RELAY_ALL_MASK : 0U;
+        }
       }
       break;
 
@@ -222,8 +254,21 @@ static err_t control_service_accept(void *arg, struct tcp_pcb *newpcb, err_t err
   tcp_arg(newpcb, NULL);
   tcp_recv(newpcb, control_service_recv);
   tcp_err(newpcb, control_service_error);
-  tcp_poll(newpcb, NULL, 0);
+  tcp_poll(newpcb, control_service_poll_idle, 4);
   return ERR_OK;
+}
+
+static err_t control_service_poll_idle(void *arg, struct tcp_pcb *tpcb)
+{
+  LWIP_UNUSED_ARG(arg);
+
+  g_control_stats.errors++;
+  tcp_arg(tpcb, NULL);
+  tcp_recv(tpcb, NULL);
+  tcp_err(tpcb, NULL);
+  tcp_poll(tpcb, NULL, 0);
+  tcp_abort(tpcb);
+  return ERR_ABRT;
 }
 
 static err_t control_service_sent_close(void *arg, struct tcp_pcb *tpcb, u16_t len)

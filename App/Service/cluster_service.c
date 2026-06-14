@@ -1,6 +1,7 @@
 #include "cluster_service.h"
 #include "backend_link_service.h"
 #include "mqtt_link_service.h"
+#include "../Platform/board_relay.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -21,6 +22,10 @@ extern struct netif gnetif;
 #define CLUSTER_SERVICE_HEALTH_GOOD_THRESHOLD   700UL
 #define CLUSTER_SERVICE_HEALTH_UNFIT_DELAY_MS   15000UL
 #define CLUSTER_SERVICE_HEALTH_RECOVER_DELAY_MS 10000UL
+#define CLUSTER_SERVICE_RTC_SIGNATURE        0x54494D45UL
+#define CLUSTER_SERVICE_RTC_MIN_UNIX         1577836800UL
+#define CLUSTER_SERVICE_RTC_MAX_UNIX         4102444799UL
+#define CLUSTER_SERVICE_RTC_LSE_TIMEOUT_MS   3000UL
 
 typedef struct
 {
@@ -35,6 +40,8 @@ typedef struct
   uint32_t last_remote_master_node_id;
   uint32_t health_bad_since_ms;
   uint32_t health_good_since_ms;
+  uint32_t software_time_base_unix;
+  uint32_t software_time_base_tick;
   cluster_service_state_t state;
   cluster_node_t nodes[CLUSTER_SERVICE_NODE_CAPACITY];
   uint32_t banned_node_ids[CLUSTER_SERVICE_BAN_CAPACITY];
@@ -42,10 +49,232 @@ typedef struct
 } cluster_service_context_t;
 
 static cluster_service_context_t g_cluster_context;
+static StaticTask_t g_cluster_health_task_buffer;
+static StackType_t g_cluster_health_task_stack[1024];
 
 static void cluster_service_health_task(void *argument);
 static void cluster_service_ensure_health_task(void);
 static uint32_t cluster_service_health_score_from_lateness(uint32_t lateness_ms);
+
+static uint32_t cluster_service_build_gateway_epoch(uint32_t unix_time)
+{
+  uint32_t epoch = g_cluster_context.state.self_node_id ^
+                   unix_time ^
+                   HAL_GetTick() ^
+                   (g_cluster_context.state.term * 2654435761UL);
+
+  return (epoch != 0U) ? epoch : 1U;
+}
+
+static uint8_t cluster_service_bcd_to_bin(uint32_t value)
+{
+  return (uint8_t)(((value >> 4U) * 10U) + (value & 0x0FU));
+}
+
+static uint32_t cluster_service_bin_to_bcd(uint32_t value)
+{
+  return ((value / 10U) << 4U) | (value % 10U);
+}
+
+static int64_t cluster_service_days_from_civil(int32_t year,
+                                               uint32_t month,
+                                               uint32_t day)
+{
+  int32_t era;
+  uint32_t year_of_era;
+  uint32_t day_of_year;
+  uint32_t day_of_era;
+
+  year -= (month <= 2U) ? 1 : 0;
+  era = (year >= 0) ? (year / 400) : ((year - 399) / 400);
+  year_of_era = (uint32_t)(year - (era * 400));
+  day_of_year = ((153U * (month + ((month > 2U) ? (uint32_t)-3 : 9U))) + 2U) / 5U;
+  day_of_year += day - 1U;
+  day_of_era = (year_of_era * 365U) + (year_of_era / 4U) -
+               (year_of_era / 100U) + day_of_year;
+  return ((int64_t)era * 146097LL) + (int64_t)day_of_era - 719468LL;
+}
+
+static void cluster_service_civil_from_days(int64_t days,
+                                            int32_t *year,
+                                            uint32_t *month,
+                                            uint32_t *day)
+{
+  int64_t era;
+  uint32_t day_of_era;
+  uint32_t year_of_era;
+  int32_t calculated_year;
+  uint32_t day_of_year;
+  uint32_t month_prime;
+
+  days += 719468LL;
+  era = (days >= 0) ? (days / 146097LL) : ((days - 146096LL) / 146097LL);
+  day_of_era = (uint32_t)(days - (era * 146097LL));
+  year_of_era = (day_of_era - (day_of_era / 1460U) +
+                 (day_of_era / 36524U) - (day_of_era / 146096U)) / 365U;
+  calculated_year = (int32_t)year_of_era + ((int32_t)era * 400);
+  day_of_year = day_of_era - ((365U * year_of_era) +
+                              (year_of_era / 4U) -
+                              (year_of_era / 100U));
+  month_prime = ((5U * day_of_year) + 2U) / 153U;
+  *day = day_of_year - (((153U * month_prime) + 2U) / 5U) + 1U;
+  *month = month_prime + ((month_prime < 10U) ? 3U : (uint32_t)-9);
+  calculated_year += (*month <= 2U) ? 1 : 0;
+  *year = calculated_year;
+}
+
+static uint8_t cluster_service_rtc_read(uint32_t *unix_time)
+{
+  uint32_t time_register;
+  uint32_t date_register;
+  uint32_t year;
+  uint32_t month;
+  uint32_t day;
+  uint32_t hour;
+  uint32_t minute;
+  uint32_t second;
+  int64_t days;
+  int64_t value;
+
+  if ((unix_time == NULL) ||
+      (g_cluster_context.state.rtc_lse_ready == 0U) ||
+      (RTC->BKP16R != CLUSTER_SERVICE_RTC_SIGNATURE))
+  {
+    return 0U;
+  }
+
+  time_register = RTC->TR;
+  date_register = RTC->DR;
+  year = 2000U + cluster_service_bcd_to_bin((date_register >> 16U) & 0xFFU);
+  month = cluster_service_bcd_to_bin((date_register >> 8U) & 0x1FU);
+  day = cluster_service_bcd_to_bin(date_register & 0x3FU);
+  hour = cluster_service_bcd_to_bin((time_register >> 16U) & 0x3FU);
+  minute = cluster_service_bcd_to_bin((time_register >> 8U) & 0x7FU);
+  second = cluster_service_bcd_to_bin(time_register & 0x7FU);
+  if ((year < 2020U) || (year > 2099U) ||
+      (month == 0U) || (month > 12U) ||
+      (day == 0U) || (day > 31U) ||
+      (hour > 23U) || (minute > 59U) || (second > 59U))
+  {
+    return 0U;
+  }
+
+  days = cluster_service_days_from_civil((int32_t)year, month, day);
+  value = (days * 86400LL) + ((int64_t)hour * 3600LL) +
+          ((int64_t)minute * 60LL) + (int64_t)second;
+  if ((value < (int64_t)CLUSTER_SERVICE_RTC_MIN_UNIX) ||
+      (value > (int64_t)CLUSTER_SERVICE_RTC_MAX_UNIX))
+  {
+    return 0U;
+  }
+
+  *unix_time = (uint32_t)value;
+  return 1U;
+}
+
+static uint8_t cluster_service_rtc_write(uint32_t unix_time)
+{
+  int64_t days;
+  uint32_t seconds_of_day;
+  int32_t year;
+  uint32_t month;
+  uint32_t day;
+  uint32_t hour;
+  uint32_t minute;
+  uint32_t second;
+  uint32_t weekday;
+  uint32_t start;
+
+  if ((g_cluster_context.state.rtc_lse_ready == 0U) ||
+      (unix_time < CLUSTER_SERVICE_RTC_MIN_UNIX) ||
+      (unix_time > CLUSTER_SERVICE_RTC_MAX_UNIX))
+  {
+    return 0U;
+  }
+
+  days = (int64_t)(unix_time / 86400UL);
+  seconds_of_day = unix_time % 86400UL;
+  cluster_service_civil_from_days(days, &year, &month, &day);
+  hour = seconds_of_day / 3600UL;
+  minute = (seconds_of_day % 3600UL) / 60UL;
+  second = seconds_of_day % 60UL;
+  weekday = (uint32_t)(((days + 3LL) % 7LL) + 1LL);
+
+  RTC->WPR = 0xCAU;
+  RTC->WPR = 0x53U;
+  RTC->ISR |= RTC_ISR_INIT;
+  start = HAL_GetTick();
+  while ((RTC->ISR & RTC_ISR_INITF) == 0U)
+  {
+    if ((HAL_GetTick() - start) >= 100U)
+    {
+      RTC->WPR = 0xFFU;
+      return 0U;
+    }
+  }
+  RTC->CR &= ~RTC_CR_FMT;
+  RTC->PRER = (127UL << 16U) | 255UL;
+  RTC->TR = (cluster_service_bin_to_bcd(hour) << 16U) |
+            (cluster_service_bin_to_bcd(minute) << 8U) |
+            cluster_service_bin_to_bcd(second);
+  RTC->DR = (cluster_service_bin_to_bcd((uint32_t)year - 2000U) << 16U) |
+            (cluster_service_bin_to_bcd(month) << 8U) |
+            (weekday << 13U) |
+            cluster_service_bin_to_bcd(day);
+  RTC->ISR &= ~RTC_ISR_INIT;
+  RTC->WPR = 0xFFU;
+  RTC->BKP16R = CLUSTER_SERVICE_RTC_SIGNATURE;
+  return 1U;
+}
+
+static void cluster_service_rtc_init(void)
+{
+  uint32_t fault_backup[16];
+  uint32_t index;
+  uint32_t start;
+  uint8_t reset_backup_domain = 0U;
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  HAL_PWR_EnableBkUpAccess();
+  if ((RCC->BDCR & RCC_BDCR_RTCSEL) != RCC_BDCR_RTCSEL_0)
+  {
+    for (index = 0U; index < 16U; ++index)
+    {
+      fault_backup[index] = (&RTC->BKP0R)[index];
+    }
+    __HAL_RCC_BACKUPRESET_FORCE();
+    __HAL_RCC_BACKUPRESET_RELEASE();
+    reset_backup_domain = 1U;
+  }
+
+  RCC->BDCR |= RCC_BDCR_LSEON;
+  start = HAL_GetTick();
+  while ((RCC->BDCR & RCC_BDCR_LSERDY) == 0U)
+  {
+    if ((HAL_GetTick() - start) >= CLUSTER_SERVICE_RTC_LSE_TIMEOUT_MS)
+    {
+      if (reset_backup_domain != 0U)
+      {
+        for (index = 0U; index < 16U; ++index)
+        {
+          (&RTC->BKP0R)[index] = fault_backup[index];
+        }
+      }
+      return;
+    }
+  }
+
+  RCC->BDCR = (RCC->BDCR & ~RCC_BDCR_RTCSEL) |
+              RCC_BDCR_RTCSEL_0 | RCC_BDCR_RTCEN;
+  if (reset_backup_domain != 0U)
+  {
+    for (index = 0U; index < 16U; ++index)
+    {
+      (&RTC->BKP0R)[index] = fault_backup[index];
+    }
+  }
+  g_cluster_context.state.rtc_lse_ready = 1U;
+}
 
 static void cluster_service_mark_backend_dirty(void)
 {
@@ -91,6 +320,7 @@ static uint32_t cluster_service_health_score_from_lateness(uint32_t lateness_ms)
 static void cluster_service_health_task(void *argument)
 {
   const TickType_t period_ticks = pdMS_TO_TICKS(CLUSTER_SERVICE_HEALTH_TASK_PERIOD_MS);
+  TickType_t last_wake_tick = xTaskGetTickCount();
   uint32_t expected_ms = HAL_GetTick() + CLUSTER_SERVICE_HEALTH_TASK_PERIOD_MS;
 
   (void)argument;
@@ -104,7 +334,7 @@ static void cluster_service_health_task(void *argument)
     uint8_t previous_master_eligible;
     uint8_t mark_dirty = 0U;
 
-    vTaskDelay(period_ticks);
+    vTaskDelayUntil(&last_wake_tick, period_ticks);
     current_ms = HAL_GetTick();
     if ((int32_t)(current_ms - expected_ms) > 0)
     {
@@ -563,6 +793,7 @@ void cluster_service_reload_from_config(void)
 void cluster_service_init(void)
 {
   const device_config_t *config;
+  uint32_t restored_unix_time;
 
   if (g_cluster_context.initialized != 0U)
   {
@@ -572,6 +803,7 @@ void cluster_service_init(void)
   device_config_init();
   config = device_config_get();
   memset(&g_cluster_context, 0, sizeof(g_cluster_context));
+  cluster_service_rtc_init();
   g_cluster_context.state.cluster_enabled = config->cluster_enabled;
   g_cluster_context.state.join_mode = (config->cluster_enabled != 0U)
                                       ? ((config->auto_join_cluster != 0U) ? CLUSTER_JOIN_AUTO : CLUSTER_JOIN_MANUAL)
@@ -595,6 +827,20 @@ void cluster_service_init(void)
   g_cluster_context.last_remote_master_node_id = 0U;
   g_cluster_context.health_bad_since_ms = 0U;
   g_cluster_context.health_good_since_ms = 0U;
+  if (cluster_service_rtc_read(&restored_unix_time) != 0U)
+  {
+    g_cluster_context.state.time_valid = 1U;
+    g_cluster_context.state.time_source = CLUSTER_TIME_SOURCE_RTC;
+    g_cluster_context.state.time_quality = CLUSTER_TIME_QUALITY_RTC_HOLDOVER;
+    g_cluster_context.state.unix_time = restored_unix_time;
+    g_cluster_context.state.time_seq = 1U;
+    g_cluster_context.state.gateway_epoch =
+      cluster_service_build_gateway_epoch(restored_unix_time);
+    g_cluster_context.state.gateway_node_id =
+      g_cluster_context.state.self_node_id;
+    g_cluster_context.software_time_base_unix = restored_unix_time;
+    g_cluster_context.software_time_base_tick = HAL_GetTick();
+  }
   memset(g_cluster_context.banned_node_ids, 0, sizeof(g_cluster_context.banned_node_ids));
   g_cluster_context.initialized = 1U;
 }
@@ -609,12 +855,14 @@ static void cluster_service_ensure_health_task(void)
   {
     return;
   }
-  (void)xTaskCreate(cluster_service_health_task,
-                    "ClusterHealth",
-                    1024U,
-                    NULL,
-                    tskIDLE_PRIORITY + 1U,
-                    &g_cluster_context.health_task_handle);
+  g_cluster_context.health_task_handle =
+    xTaskCreateStatic(cluster_service_health_task,
+                      "ClusterHealth",
+                      1024U,
+                      NULL,
+                      tskIDLE_PRIORITY + 1U,
+                      g_cluster_health_task_stack,
+                      &g_cluster_health_task_buffer);
 }
 
 void cluster_service_poll(void)
@@ -641,19 +889,144 @@ void cluster_service_poll(void)
 
 void cluster_service_reset(void)
 {
+  TaskHandle_t health_task = g_cluster_context.health_task_handle;
+  uint8_t resume_health_task = 0U;
+
+  if ((health_task != NULL) &&
+      (health_task != xTaskGetCurrentTaskHandle()) &&
+      (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING))
+  {
+    vTaskSuspend(health_task);
+    resume_health_task = 1U;
+  }
+
+  taskENTER_CRITICAL();
   memset(&g_cluster_context, 0, sizeof(g_cluster_context));
+  g_cluster_context.health_task_handle = health_task;
+  taskEXIT_CRITICAL();
+  cluster_service_init();
+
+  if (resume_health_task != 0U)
+  {
+    vTaskResume(health_task);
+  }
 }
 
 void cluster_service_get_state(cluster_service_state_t *state)
 {
+  uint8_t time_valid;
+  uint32_t unix_time;
+
   cluster_service_init();
 
   if (state != NULL)
   {
+    unix_time = cluster_service_get_unix_time(&time_valid);
     taskENTER_CRITICAL();
+    g_cluster_context.state.time_valid = time_valid;
+    g_cluster_context.state.unix_time = unix_time;
     *state = g_cluster_context.state;
     taskEXIT_CRITICAL();
   }
+}
+
+uint32_t cluster_service_get_unix_time(uint8_t *valid)
+{
+  uint32_t unix_time;
+
+  cluster_service_init();
+  if (cluster_service_rtc_read(&unix_time) != 0U)
+  {
+    if (valid != NULL)
+    {
+      *valid = 1U;
+    }
+    return unix_time;
+  }
+  if (g_cluster_context.software_time_base_unix != 0U)
+  {
+    unix_time = g_cluster_context.software_time_base_unix +
+                ((HAL_GetTick() - g_cluster_context.software_time_base_tick) / 1000UL);
+    if (valid != NULL)
+    {
+      *valid = 1U;
+    }
+    return unix_time;
+  }
+
+  if (valid != NULL)
+  {
+    *valid = 0U;
+  }
+  return 0U;
+}
+
+uint8_t cluster_service_set_unix_time(uint32_t unix_time, uint8_t source)
+{
+  uint8_t previous_valid;
+  uint8_t previous_source;
+  uint32_t previous_time;
+  int64_t offset;
+
+  cluster_service_init();
+  if ((unix_time < CLUSTER_SERVICE_RTC_MIN_UNIX) ||
+      (unix_time > CLUSTER_SERVICE_RTC_MAX_UNIX))
+  {
+    return 0U;
+  }
+
+  previous_time = cluster_service_get_unix_time(&previous_valid);
+  previous_source = g_cluster_context.state.time_source;
+  offset = (previous_valid != 0U)
+           ? ((int64_t)unix_time - (int64_t)previous_time)
+           : 0LL;
+  if (offset > 2147483647LL)
+  {
+    offset = 2147483647LL;
+  }
+  else if (offset < -2147483647LL)
+  {
+    offset = -2147483647LL;
+  }
+
+  (void)cluster_service_rtc_write(unix_time);
+  taskENTER_CRITICAL();
+  g_cluster_context.software_time_base_unix = unix_time;
+  g_cluster_context.software_time_base_tick = HAL_GetTick();
+  g_cluster_context.state.time_valid = 1U;
+  g_cluster_context.state.time_source = source;
+  if (source == CLUSTER_TIME_SOURCE_MQTT)
+  {
+    if ((g_cluster_context.state.gateway_epoch == 0U) ||
+        (g_cluster_context.state.gateway_node_id != g_cluster_context.state.self_node_id) ||
+        (previous_source != CLUSTER_TIME_SOURCE_MQTT))
+    {
+      g_cluster_context.state.gateway_epoch =
+        cluster_service_build_gateway_epoch(unix_time);
+      g_cluster_context.state.time_seq = 0U;
+    }
+    g_cluster_context.state.gateway_node_id = g_cluster_context.state.self_node_id;
+    g_cluster_context.state.time_quality = CLUSTER_TIME_QUALITY_BROKER;
+    g_cluster_context.state.time_seq++;
+    if (g_cluster_context.state.time_seq == 0U)
+    {
+      g_cluster_context.state.time_seq = 1U;
+    }
+  }
+  else if (source == CLUSTER_TIME_SOURCE_MASTER)
+  {
+    g_cluster_context.state.time_quality = CLUSTER_TIME_QUALITY_CLUSTER;
+  }
+  else if (source == CLUSTER_TIME_SOURCE_RTC)
+  {
+    g_cluster_context.state.time_quality = CLUSTER_TIME_QUALITY_RTC_HOLDOVER;
+  }
+  g_cluster_context.state.unix_time = unix_time;
+  g_cluster_context.state.time_sync_count++;
+  g_cluster_context.state.last_time_offset_seconds = (int32_t)offset;
+  taskEXIT_CRITICAL();
+  cluster_service_mark_backend_dirty();
+  return 1U;
 }
 
 const cluster_node_t *cluster_service_get_nodes(uint32_t *count)
@@ -788,6 +1161,57 @@ void cluster_service_note_remote_node(const cluster_node_t *node)
   {
     g_cluster_context.last_remote_master_seen_ms = target->last_seen_ms;
     g_cluster_context.last_remote_master_node_id = target->node_id;
+    if ((target->time_valid != 0U) &&
+        (target->unix_time >= CLUSTER_SERVICE_RTC_MIN_UNIX) &&
+        (cluster_service_node_is_eligible(target, &g_cluster_context.state) != 0U))
+    {
+      uint8_t local_valid;
+      uint32_t local_time = cluster_service_get_unix_time(&local_valid);
+      int64_t difference = (int64_t)target->unix_time - (int64_t)local_time;
+      uint8_t authority_newer = 0U;
+      uint8_t forward_correction = 0U;
+
+      if (target->gateway_epoch != 0U)
+      {
+        if (target->gateway_epoch == g_cluster_context.state.gateway_epoch)
+        {
+          authority_newer =
+            (target->time_seq > g_cluster_context.state.time_seq) ? 1U : 0U;
+        }
+        else if ((local_valid == 0U) || (difference >= -2LL))
+        {
+          authority_newer = 1U;
+        }
+      }
+      if ((local_valid != 0U) && (difference > 2LL))
+      {
+        forward_correction = 1U;
+      }
+
+      if ((local_valid == 0U) ||
+          (authority_newer != 0U) ||
+          (forward_correction != 0U) ||
+          ((target->gateway_epoch == 0U) &&
+           ((difference > 2LL) || (difference < -2LL))))
+      {
+        if (cluster_service_set_unix_time(target->unix_time,
+                                          CLUSTER_TIME_SOURCE_MASTER) != 0U)
+        {
+          taskENTER_CRITICAL();
+          g_cluster_context.state.time_quality =
+            (target->time_quality != CLUSTER_TIME_QUALITY_INVALID)
+            ? target->time_quality
+            : CLUSTER_TIME_QUALITY_CLUSTER;
+          g_cluster_context.state.time_seq = target->time_seq;
+          g_cluster_context.state.gateway_epoch = target->gateway_epoch;
+          g_cluster_context.state.gateway_node_id =
+            (target->gateway_node_id != 0U)
+            ? target->gateway_node_id
+            : target->node_id;
+          taskEXIT_CRITICAL();
+        }
+      }
+    }
   }
   cluster_service_mark_backend_dirty();
   cluster_service_recount_nodes();
@@ -831,7 +1255,8 @@ uint8_t cluster_service_apply_remote_command(uint32_t node_id, const control_pro
   switch (command->type)
   {
     case CONTROL_PROTO_CMD_SET_RELAY:
-      if ((command->channel == 0U) || (command->channel > 32U))
+      if ((command->channel == 0U) ||
+          (command->channel > BOARD_RELAY_CHANNEL_COUNT))
       {
         return 0U;
       }

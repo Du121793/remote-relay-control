@@ -11,7 +11,7 @@ static uint8_t discovery_proto_extract_value(const char *text,
                                              char *buffer,
                                              size_t buffer_size)
 {
-  const char *match;
+  const char *match = text;
   const char *value;
   size_t index = 0U;
 
@@ -20,9 +20,17 @@ static uint8_t discovery_proto_extract_value(const char *text,
     return 0U;
   }
 
-  match = strstr(text, key);
+  while ((match = strstr(match, key)) != NULL)
+  {
+    if ((match == text) || (match[-1] == ' '))
+    {
+      break;
+    }
+    match += strlen(key);
+  }
   if (match == NULL)
   {
+    buffer[0] = '\0';
     return 0U;
   }
 
@@ -40,29 +48,7 @@ static uint8_t discovery_proto_extract_optional_value(const char *text,
                                                       char *buffer,
                                                       size_t buffer_size)
 {
-  const char *match;
-  const char *value;
-  size_t index = 0U;
-
-  if ((text == NULL) || (key == NULL) || (buffer == NULL) || (buffer_size == 0U))
-  {
-    return 0U;
-  }
-
-  match = strstr(text, key);
-  if (match == NULL)
-  {
-    buffer[0] = '\0';
-    return 0U;
-  }
-
-  value = match + strlen(key);
-  while ((*value != '\0') && (*value != ' ') && (index < (buffer_size - 1U)))
-  {
-    buffer[index++] = *value++;
-  }
-  buffer[index] = '\0';
-  return 1U;
+  return discovery_proto_extract_value(text, key, buffer, buffer_size);
 }
 
 static uint8_t discovery_proto_parse_u32(const char *text, uint32_t *value_out)
@@ -101,12 +87,20 @@ int discovery_proto_build_announce(char *buffer,
                                    uint32_t relay_mask,
                                    uint32_t enabled_mask,
                                    uint8_t auto_join,
+                                   uint32_t unix_time,
+                                   uint8_t time_valid,
+                                   uint8_t rtc_lse_ready,
+                                   uint8_t time_source,
+                                   uint8_t time_quality,
+                                   uint32_t time_seq,
+                                   uint32_t gateway_epoch,
+                                   uint32_t gateway_node_id,
                                    const char *ip_text,
                                    uint16_t port,
                                    const uint8_t mac[6])
 {
   return snprintf(buffer, buffer_size,
-                  "type=announce ver=3 service=%s cluster=%s device=%s cloud_cluster=%s cloud_device=%s cloud_key=%s node=%lu role=%u term=%lu load=%lu auth=%lu relay=%lu enabled=%lu auto=%u ip=%s port=%u mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                  "type=announce ver=5 service=%s cluster=%s device=%s cloud_cluster=%s cloud_device=%s cloud_key=%s node=%lu role=%u term=%lu load=%lu auth=%lu relay=%lu enabled=%lu auto=%u time=%lu time_valid=%u rtc_lse=%u time_source=%u time_quality=%u time_seq=%lu gateway_epoch=%lu gateway_node=%lu ip=%s port=%u mac=%02X:%02X:%02X:%02X:%02X:%02X",
                   service,
                   cluster,
                   device,
@@ -121,6 +115,14 @@ int discovery_proto_build_announce(char *buffer,
                   (unsigned long)relay_mask,
                   (unsigned long)enabled_mask,
                   (unsigned int)auto_join,
+                  (unsigned long)unix_time,
+                  (unsigned int)time_valid,
+                  (unsigned int)rtc_lse_ready,
+                  (unsigned int)time_source,
+                  (unsigned int)time_quality,
+                  (unsigned long)time_seq,
+                  (unsigned long)gateway_epoch,
+                  (unsigned long)gateway_node_id,
                   ip_text,
                   (unsigned int)port,
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -163,22 +165,19 @@ uint8_t discovery_proto_parse_announce(const void *payload,
   text[length] = '\0';
   memset(announce, 0, sizeof(*announce));
 
-  if (strstr(text, "type=announce") == NULL)
+  if (!discovery_proto_extract_value(text, "type=", value, sizeof(value)) ||
+      (strcmp(value, "announce") != 0))
   {
     return 0U;
   }
-  if (strstr(text, "ver=3") != NULL)
-  {
-    version = 3U;
-  }
-  else if (strstr(text, "ver=2") != NULL)
-  {
-    version = 2U;
-  }
-  else
+  if (!discovery_proto_extract_value(text, "ver=", value, sizeof(value)) ||
+      !discovery_proto_parse_u32(value, &parsed_u32) ||
+      (parsed_u32 < 2U) ||
+      (parsed_u32 > 5U))
   {
     return 0U;
   }
+  version = (uint8_t)parsed_u32;
 
   if (!discovery_proto_extract_value(text, "service=", announce->service, sizeof(announce->service)))
   {
@@ -242,6 +241,52 @@ uint8_t discovery_proto_parse_announce(const void *payload,
     return 0U;
   }
   announce->auto_join = (uint8_t)parsed_u32;
+  if (version >= 4U)
+  {
+    if (discovery_proto_extract_optional_value(text, "time=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->unix_time);
+    }
+    if ((discovery_proto_extract_optional_value(text, "time_valid=", value, sizeof(value)) != 0U) &&
+        (discovery_proto_parse_u32(value, &parsed_u32) != 0U) &&
+        (parsed_u32 <= 1U))
+    {
+      announce->time_valid = (uint8_t)parsed_u32;
+    }
+    if ((discovery_proto_extract_optional_value(text, "rtc_lse=", value, sizeof(value)) != 0U) &&
+        (discovery_proto_parse_u32(value, &parsed_u32) != 0U) &&
+        (parsed_u32 <= 1U))
+    {
+      announce->rtc_lse_ready = (uint8_t)parsed_u32;
+    }
+  }
+  if (version >= 5U)
+  {
+    if ((discovery_proto_extract_optional_value(text, "time_source=", value, sizeof(value)) != 0U) &&
+        (discovery_proto_parse_u32(value, &parsed_u32) != 0U) &&
+        (parsed_u32 <= 255U))
+    {
+      announce->time_source = (uint8_t)parsed_u32;
+    }
+    if ((discovery_proto_extract_optional_value(text, "time_quality=", value, sizeof(value)) != 0U) &&
+        (discovery_proto_parse_u32(value, &parsed_u32) != 0U) &&
+        (parsed_u32 <= 255U))
+    {
+      announce->time_quality = (uint8_t)parsed_u32;
+    }
+    if (discovery_proto_extract_optional_value(text, "time_seq=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->time_seq);
+    }
+    if (discovery_proto_extract_optional_value(text, "gateway_epoch=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->gateway_epoch);
+    }
+    if (discovery_proto_extract_optional_value(text, "gateway_node=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->gateway_node_id);
+    }
+  }
   if (!discovery_proto_extract_value(text, "ip=", value, sizeof(value)))
   {
     return 0U;

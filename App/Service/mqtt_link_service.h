@@ -27,6 +27,9 @@ typedef struct
   uint32_t published_fault_reports;
   uint32_t received_commands;
   uint32_t command_errors;
+  uint32_t published_acks;
+  uint32_t ack_queue_dropped;
+  uint32_t ack_queue_depth;
   uint32_t last_error;
   uint32_t status_dirty_count;
   char client_id[MQTT_LINK_CLIENT_ID_MAX_LEN];
@@ -36,6 +39,7 @@ typedef struct
   char topic_command_relay[MQTT_LINK_TOPIC_MAX_LEN];
   char topic_command_mask[MQTT_LINK_TOPIC_MAX_LEN];
   char topic_command_config_relay[MQTT_LINK_TOPIC_MAX_LEN];
+  char topic_command_time[MQTT_LINK_TOPIC_MAX_LEN];
   char topic_ack_prefix[MQTT_LINK_TOPIC_MAX_LEN];
   char cluster_ca_fingerprint[DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN];
   char cluster_binding_secret[DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN];
@@ -45,6 +49,10 @@ void mqtt_link_service_init(void);
 void mqtt_link_service_poll(void);
 void mqtt_link_service_get_stats(mqtt_link_stats_t *stats);
 void mqtt_link_service_mark_status_dirty(void);
+void mqtt_link_service_complete_relay_config(const char *request_id,
+                                             uint32_t target_node_id,
+                                             uint8_t ok,
+                                             const char *error_text);
 
 #ifdef __cplusplus
 }

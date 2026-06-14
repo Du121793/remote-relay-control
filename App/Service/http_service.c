@@ -34,10 +34,12 @@
 #define HTTP_BODY_BUFFER_SIZE       4096U
 #define HTTP_AUTH_TOKEN_SIZE        16U
 #define HTTP_AUTH_SESSION_TTL_MS    (15UL * 60UL * 1000UL)
+#define HTTP_CONNECTION_IDLE_TIMEOUT_MS 10000UL
 #define HTTP_AUTH_PASSWORD          "admin"
 
 extern struct netif gnetif;
 extern UART_HandleTypeDef huart3;
+extern RNG_HandleTypeDef hrng;
 
 typedef struct
 {
@@ -361,9 +363,48 @@ static uint8_t http_service_parse_u32_value(const char *text, uint32_t *value_ou
   return 1U;
 }
 
+static const char *http_service_find_form_value(const char *body, const char *key)
+{
+  const char *match = body;
+  size_t key_length;
+
+  if ((body == NULL) || (key == NULL) || (key[0] == '\0'))
+  {
+    return NULL;
+  }
+
+  key_length = strlen(key);
+  while ((match = strstr(match, key)) != NULL)
+  {
+    if (((match == body) || (match[-1] == '&')) && (match[key_length] == '='))
+    {
+      return match + key_length + 1U;
+    }
+    match += key_length;
+  }
+
+  return NULL;
+}
+
+static int http_service_hex_value(char value)
+{
+  if ((value >= '0') && (value <= '9'))
+  {
+    return value - '0';
+  }
+  if ((value >= 'A') && (value <= 'F'))
+  {
+    return value - 'A' + 10;
+  }
+  if ((value >= 'a') && (value <= 'f'))
+  {
+    return value - 'a' + 10;
+  }
+  return -1;
+}
+
 static uint8_t http_service_extract_form_value(const char *body, const char *key, uint32_t *value_out)
 {
-  const char *match;
   const char *value_text;
   char token[16];
   size_t index = 0U;
@@ -373,18 +414,11 @@ static uint8_t http_service_extract_form_value(const char *body, const char *key
     return 0U;
   }
 
-  match = strstr(body, key);
-  if (match == NULL)
+  value_text = http_service_find_form_value(body, key);
+  if (value_text == NULL)
   {
     return 0U;
   }
-
-  value_text = match + strlen(key);
-  if (*value_text != '=')
-  {
-    return 0U;
-  }
-  value_text++;
 
   while ((*value_text != '\0') && (*value_text != '&') && (index < (sizeof(token) - 1U)))
   {
@@ -397,7 +431,6 @@ static uint8_t http_service_extract_form_value(const char *body, const char *key
 
 static uint8_t http_service_extract_form_text(const char *body, const char *key, char *buffer, size_t buffer_size)
 {
-  const char *match;
   const char *value_text;
   size_t index = 0U;
 
@@ -406,23 +439,37 @@ static uint8_t http_service_extract_form_text(const char *body, const char *key,
     return 0U;
   }
 
-  match = strstr(body, key);
-  if (match == NULL)
+  value_text = http_service_find_form_value(body, key);
+  if (value_text == NULL)
   {
     return 0U;
   }
-
-  value_text = match + strlen(key);
-  if (*value_text != '=')
-  {
-    return 0U;
-  }
-  value_text++;
 
   while ((*value_text != '\0') && (*value_text != '&') && (*value_text != '\r') &&
          (*value_text != '\n') && (index < (buffer_size - 1U)))
   {
-    buffer[index++] = *value_text++;
+    if (*value_text == '+')
+    {
+      buffer[index++] = ' ';
+      value_text++;
+    }
+    else if ((*value_text == '%') &&
+             (value_text[1] != '\0') &&
+             (value_text[2] != '\0'))
+    {
+      int high = http_service_hex_value(value_text[1]);
+      int low = http_service_hex_value(value_text[2]);
+      if ((high < 0) || (low < 0))
+      {
+        return 0U;
+      }
+      buffer[index++] = (char)((high << 4) | low);
+      value_text += 3;
+    }
+    else
+    {
+      buffer[index++] = *value_text++;
+    }
   }
   buffer[index] = '\0';
 
@@ -431,8 +478,11 @@ static uint8_t http_service_extract_form_text(const char *body, const char *key,
 
 static uint8_t http_service_extract_header_text(const char *request, const char *header_name, char *buffer, size_t buffer_size)
 {
-  const char *match;
+  const char *cursor;
+  const char *header_end;
+  const char *line_end;
   const char *value_text;
+  size_t header_name_length;
   size_t index = 0U;
 
   if ((request == NULL) || (header_name == NULL) || (buffer == NULL) || (buffer_size == 0U))
@@ -440,13 +490,40 @@ static uint8_t http_service_extract_header_text(const char *request, const char 
     return 0U;
   }
 
-  match = strstr(request, header_name);
-  if (match == NULL)
+  header_end = strstr(request, "\r\n\r\n");
+  if (header_end == NULL)
   {
     return 0U;
   }
 
-  value_text = match + strlen(header_name);
+  cursor = strstr(request, "\r\n");
+  if (cursor == NULL)
+  {
+    return 0U;
+  }
+  cursor += 2;
+  header_name_length = strlen(header_name);
+  value_text = NULL;
+  while (cursor < header_end)
+  {
+    line_end = strstr(cursor, "\r\n");
+    if ((line_end == NULL) || (line_end > header_end))
+    {
+      line_end = header_end;
+    }
+    if (((size_t)(line_end - cursor) >= header_name_length) &&
+        (strncmp(cursor, header_name, header_name_length) == 0))
+    {
+      value_text = cursor + header_name_length;
+      break;
+    }
+    cursor = line_end + 2;
+  }
+  if (value_text == NULL)
+  {
+    return 0U;
+  }
+
   while ((*value_text == ' ') || (*value_text == '\t'))
   {
     value_text++;
@@ -482,7 +559,16 @@ static uint32_t http_service_parse_content_length(const char *request)
 
 static uint32_t http_service_issue_session_token(void)
 {
-  uint32_t seed = HAL_GetTick();
+  uint32_t seed;
+
+  if ((hrng.Instance != NULL) &&
+      (HAL_RNG_GenerateRandomNumber(&hrng, &seed) == HAL_OK) &&
+      (seed != 0U))
+  {
+    return seed;
+  }
+
+  seed = HAL_GetTick();
 
   seed ^= board_relay_snapshot() << 8;
   seed ^= (g_http_service_stats.requests + 1U) * 2654435761UL;
@@ -509,7 +595,7 @@ static uint8_t http_service_has_valid_session(const char *request)
     return 0U;
   }
 
-  if (HAL_GetTick() > g_http_auth_state.expires_at_ms)
+  if ((int32_t)(HAL_GetTick() - g_http_auth_state.expires_at_ms) >= 0)
   {
     g_http_auth_state.active = 0U;
     g_http_auth_state.token = 0U;
@@ -727,6 +813,7 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
   char mask_text[16];
   char gw_text[16];
   control_service_stats_t control_stats;
+  control_queue_stats_t control_queue_stats;
   discovery_service_stats_t discovery_stats;
   backend_link_stats_t backend_stats;
   mqtt_link_stats_t *mqtt_stats = &g_http_mqtt_stats_snapshot;
@@ -740,6 +827,7 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
   uint8_t dhcp_bound = dhcp_supplied_address(&gnetif) ? 1U : 0U;
 
   control_service_get_stats(&control_stats);
+  control_queue_get_stats(&control_queue_stats);
   discovery_service_get_stats(&discovery_stats);
   backend_link_service_get_stats(&backend_stats);
   mqtt_link_service_get_stats(mqtt_stats);
@@ -770,16 +858,17 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  "\"netmask\":\"%s\","
                  "\"gateway\":\"%s\","
                  "\"relay_mask\":%lu,"
-                 "\"cluster\":{\"enabled\":%u,\"name\":\"%s\",\"role\":%u,\"join_mode\":%u,\"self_node_id\":%lu,\"master_node_id\":%lu,\"term\":%lu,\"master_eligible\":%u,\"health_score\":%lu,\"health_lateness_ms\":%lu,\"health_bad_streak\":%lu},"
+                 "\"cluster\":{\"enabled\":%u,\"name\":\"%s\",\"role\":%u,\"join_mode\":%u,\"self_node_id\":%lu,\"master_node_id\":%lu,\"term\":%lu,\"master_eligible\":%u,\"health_score\":%lu,\"health_lateness_ms\":%lu,\"health_bad_streak\":%lu,\"unix_time\":%lu,\"time_valid\":%u,\"time_source\":%u,\"time_quality\":%u,\"time_sync_count\":%lu,\"time_seq\":%lu,\"gateway_epoch\":%lu,\"gateway_node_id\":%lu,\"last_time_offset_seconds\":%ld,\"rtc_lse_ready\":%u},"
                  "\"ports\":{\"control\":41000,\"discovery\":40000,\"http\":80},"
                  "\"rtos\":{\"heap_free\":%lu,\"heap_min\":%lu},"
                  "\"control\":{\"connections\":%lu,\"commands\":%lu,\"errors\":%lu,\"listener_up\":%lu},"
+                 "\"control_queue\":{\"submitted\":%lu,\"executed\":%lu,\"dropped\":%lu,\"queue_full\":%lu,\"busy_rejected\":%lu,\"depth\":%lu,\"high_watermark\":%lu,\"capacity\":%lu},"
                  "\"discovery\":{\"rx\":%lu,\"tx_attempts\":%lu,\"announce\":%lu,\"tx_failures\":%lu,\"discover\":%lu,\"last_tx_err\":%ld,\"last_payload_len\":%lu},"
                  "\"auth\":{\"required\":1,\"active_session\":%u,\"sessions_issued\":%lu,\"login_failures\":%lu},"
                  "\"http\":{\"connections\":%lu,\"requests\":%lu,\"errors\":%lu,\"active\":%lu,\"close_pending\":%lu,\"listener_up\":%lu},"
                  "\"backend\":{\"connected\":%u,\"should_run\":%u,\"port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"sent_hello\":%lu,\"sent_heartbeat\":%lu,\"sent_status\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"last_error\":%lu},"
-                 "\"cloud\":{\"configured\":%u,\"enabled\":%u,\"should_run\":%u,\"connected\":%u,\"transport\":%u,\"broker_port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"published_hello\":%lu,\"published_heartbeat\":%lu,\"published_status\":%lu,\"published_fault_reports\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"last_error\":%lu,\"status_dirty_count\":%lu,\"ca_fingerprint_configured\":%u,\"binding_secret_configured\":%u},"
-                 "\"lwip\":{\"mem_avail\":%lu,\"mem_used\":%lu,\"mem_err\":%lu,\"tcp_pcb_used\":%lu,\"tcp_pcb_max\":%lu,\"tcp_seg_used\":%lu,\"tcp_seg_max\":%lu,\"pbuf_used\":%lu,\"pbuf_max\":%lu}"
+                 "\"cloud\":{\"configured\":%u,\"enabled\":%u,\"should_run\":%u,\"connected\":%u,\"transport\":%u,\"broker_port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"published_hello\":%lu,\"published_heartbeat\":%lu,\"published_status\":%lu,\"published_fault_reports\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"published_acks\":%lu,\"ack_queue_dropped\":%lu,\"ack_queue_depth\":%lu,\"last_error\":%lu,\"status_dirty_count\":%lu,\"ca_fingerprint_configured\":%u,\"binding_secret_configured\":%u},"
+                 "\"lwip\":{\"mem_avail\":%lu,\"mem_used\":%lu,\"mem_err\":%lu,\"tcp_pcb_used\":%lu,\"tcp_pcb_max\":%lu,\"tcp_seg_used\":%lu,\"tcp_seg_max\":%lu,\"pbuf_used\":%lu,\"pbuf_max\":%lu,\"sys_timeout_used\":%lu,\"sys_timeout_max\":%lu,\"sys_timeout_err\":%lu}"
                  "}",
                  (unsigned long)HAL_GetTick(),
                  (unsigned int)link_up,
@@ -799,12 +888,30 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)cluster_state.health_score,
                  (unsigned long)cluster_state.health_lateness_ms,
                  (unsigned long)cluster_state.health_bad_streak,
+                 (unsigned long)cluster_state.unix_time,
+                 (unsigned int)cluster_state.time_valid,
+                 (unsigned int)cluster_state.time_source,
+                 (unsigned int)cluster_state.time_quality,
+                 (unsigned long)cluster_state.time_sync_count,
+                 (unsigned long)cluster_state.time_seq,
+                 (unsigned long)cluster_state.gateway_epoch,
+                 (unsigned long)cluster_state.gateway_node_id,
+                 (long)cluster_state.last_time_offset_seconds,
+                 (unsigned int)cluster_state.rtc_lse_ready,
                  (unsigned long)heap_free,
                  (unsigned long)heap_min,
                  (unsigned long)control_stats.connections,
                  (unsigned long)control_stats.commands,
                  (unsigned long)control_stats.errors,
                  (unsigned long)control_stats.listener_up,
+                 (unsigned long)control_queue_stats.submitted,
+                 (unsigned long)control_queue_stats.executed,
+                 (unsigned long)control_queue_stats.dropped,
+                 (unsigned long)control_queue_stats.queue_full,
+                 (unsigned long)control_queue_stats.busy_rejected,
+                 (unsigned long)control_queue_stats.current_depth,
+                 (unsigned long)control_queue_stats.high_watermark,
+                 (unsigned long)control_queue_stats.capacity,
                  (unsigned long)discovery_stats.rx_packets,
                  (unsigned long)discovery_stats.tx_attempts,
                  (unsigned long)discovery_stats.announce_packets,
@@ -846,6 +953,9 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)mqtt_stats->published_fault_reports,
                  (unsigned long)mqtt_stats->received_commands,
                  (unsigned long)mqtt_stats->command_errors,
+                 (unsigned long)mqtt_stats->published_acks,
+                 (unsigned long)mqtt_stats->ack_queue_dropped,
+                 (unsigned long)mqtt_stats->ack_queue_depth,
                  (unsigned long)mqtt_stats->last_error,
                  (unsigned long)mqtt_stats->status_dirty_count,
                  (unsigned int)(mqtt_stats->cluster_ca_fingerprint[0] != '\0'),
@@ -858,7 +968,10 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)MEMP_STATS_GET(used, MEMP_TCP_SEG),
                  (unsigned long)MEMP_STATS_GET(max, MEMP_TCP_SEG),
                  (unsigned long)MEMP_STATS_GET(used, MEMP_PBUF),
-                 (unsigned long)MEMP_STATS_GET(max, MEMP_PBUF));
+                 (unsigned long)MEMP_STATS_GET(max, MEMP_PBUF),
+                 (unsigned long)MEMP_STATS_GET(used, MEMP_SYS_TIMEOUT),
+                 (unsigned long)MEMP_STATS_GET(max, MEMP_SYS_TIMEOUT),
+                 (unsigned long)MEMP_STATS_GET(err, MEMP_SYS_TIMEOUT));
 }
 
 __attribute__((noinline)) static err_t http_service_handle_status_request(http_service_connection_t *connection)
@@ -870,7 +983,11 @@ __attribute__((noinline)) static err_t http_service_handle_status_request(http_s
 
   http_service_format_status_json(connection->response_buffer, sizeof(connection->response_buffer));
   http_service_uart_write("[http] status ready\r\n");
-  return http_service_send_payload(connection, "200 OK", "application/json", connection->response_buffer);
+  return http_service_send_payload_streaming(connection,
+                                             "200 OK",
+                                             "application/json",
+                                             (const unsigned char *)connection->response_buffer,
+                                             strlen(connection->response_buffer));
 }
 
 static void http_service_format_relay_json(char *buffer, size_t buffer_size, uint32_t relay_mask)
@@ -1273,29 +1390,19 @@ static void http_service_format_relay_config_json(char *buffer, size_t buffer_si
 
 static void http_service_apply_command(control_proto_command_t *command, char *buffer, size_t buffer_size)
 {
-  relay_domain_result_t result;
-
   if ((command == NULL) || (buffer == NULL))
   {
     return;
   }
 
-  memset(&result, 0, sizeof(result));
-  if (control_queue_submit(command, &result) != HAL_OK)
+  if (control_queue_submit_async(command) != HAL_OK)
   {
     g_http_service_stats.errors++;
-    http_service_format_error_json(buffer, buffer_size, "relay_command_failed");
+    http_service_format_error_json(buffer, buffer_size, "relay_queue_full");
     return;
   }
 
-  if (result.error != CONTROL_PROTO_ERR_NONE)
-  {
-    g_http_service_stats.errors++;
-    http_service_format_error_json(buffer, buffer_size, "relay_command_failed");
-    return;
-  }
-
-  http_service_format_relay_json(buffer, buffer_size, result.relay_mask);
+  (void)snprintf(buffer, buffer_size, "{\"ok\":true,\"queued\":1}");
 }
 
 static void http_service_apply_remote_command(const cluster_node_t *node,
@@ -1890,6 +1997,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       return http_service_send_payload(connection, "500 Internal Server Error", "application/json", response_body);
     }
 
+    discovery_service_force_announce();
     http_service_format_relay_config_json(response_body, response_body_size);
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
@@ -2111,7 +2219,21 @@ static err_t http_service_poll_close(void *arg, struct tcp_pcb *tpcb)
 
   if (connection != NULL)
   {
-      connection->last_activity_ms = HAL_GetTick();
+      if ((int32_t)(HAL_GetTick() - connection->last_activity_ms) >=
+          (int32_t)HTTP_CONNECTION_IDLE_TIMEOUT_MS)
+      {
+        g_http_service_stats.errors++;
+        tcp_arg(tpcb, NULL);
+        tcp_recv(tpcb, NULL);
+        tcp_err(tpcb, NULL);
+        tcp_poll(tpcb, NULL, 0);
+        tcp_sent(tpcb, NULL);
+        tcp_abort(tpcb);
+        http_service_release_connection(connection);
+        http_service_log_status("[http] idle abort\r\n");
+        return ERR_ABRT;
+      }
+
       if (connection->send_data != NULL && connection->send_progress < connection->send_total)
       {
          (void)http_service_send_payload_chunk(connection);

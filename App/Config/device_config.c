@@ -9,12 +9,14 @@
 #include "stm32f7xx_hal_flash_ex.h"
 #include "FreeRTOS.h"
 #include "queue.h"
+#include "semphr.h"
 #include "task.h"
 
 static device_config_t g_device_config;
 static uint32_t g_device_config_last_flash_error = 0U;
 static QueueHandle_t g_device_config_queue = NULL;
 static TaskHandle_t g_device_config_task_handle = NULL;
+static uint8_t g_device_config_initialized = 0U;
 static uint8_t g_device_config_runtime_dirty = 0U;
 static uint32_t g_device_config_runtime_due_ms = 0U;
 
@@ -35,6 +37,9 @@ static uint8_t g_device_config_queue_storage[
   DEVICE_CONFIG_QUEUE_LENGTH * sizeof(device_config_request_t)];
 static StaticTask_t g_device_config_task_buffer;
 static StackType_t g_device_config_task_stack[1024];
+static StaticSemaphore_t g_device_config_save_mutex_buffer;
+static SemaphoreHandle_t g_device_config_save_mutex = NULL;
+static uint8_t g_device_config_sync_result = 0U;
 
 typedef struct
 {
@@ -428,6 +433,12 @@ void device_config_init(void)
 {
   device_config_t loaded;
 
+  if (g_device_config_initialized != 0U)
+  {
+    return;
+  }
+  g_device_config_initialized = 1U;
+
   if (device_config_load(&loaded) != 0U)
   {
     g_device_config = loaded;
@@ -464,7 +475,7 @@ void device_config_set(const device_config_t *config)
 uint8_t device_config_update_and_save(const device_config_t *config)
 {
   device_config_request_t request;
-  uint8_t saved = 0U;
+  uint8_t saved;
 
   if (config == NULL)
   {
@@ -478,26 +489,34 @@ uint8_t device_config_update_and_save(const device_config_t *config)
   taskEXIT_CRITICAL();
   device_config_worker_init();
 
-  if ((g_device_config_queue == NULL) || (g_device_config_task_handle == NULL) ||
+  if ((g_device_config_queue == NULL) ||
+      (g_device_config_task_handle == NULL) ||
+      (g_device_config_save_mutex == NULL) ||
       (xTaskGetSchedulerState() != taskSCHEDULER_RUNNING))
   {
     return device_config_save_direct(&request.config);
   }
 
-  request.result = &saved;
+  if (xSemaphoreTake(g_device_config_save_mutex,
+                     pdMS_TO_TICKS(DEVICE_CONFIG_WAIT_MS)) != pdTRUE)
+  {
+    return 0U;
+  }
+
+  g_device_config_sync_result = 0U;
+  request.result = &g_device_config_sync_result;
   request.waiting_task = xTaskGetCurrentTaskHandle();
   (void)ulTaskNotifyTake(pdTRUE, 0U);
 
   if (xQueueSend(g_device_config_queue, &request, pdMS_TO_TICKS(DEVICE_CONFIG_WAIT_MS)) != pdPASS)
   {
+    (void)xSemaphoreGive(g_device_config_save_mutex);
     return 0U;
   }
 
-  if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(DEVICE_CONFIG_WAIT_MS)) == 0U)
-  {
-    return 0U;
-  }
-
+  (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  saved = g_device_config_sync_result;
+  (void)xSemaphoreGive(g_device_config_save_mutex);
   return saved;
 }
 
@@ -786,17 +805,29 @@ static void device_config_worker_task(void *argument)
 
 static void device_config_worker_init(void)
 {
-  if (g_device_config_queue != NULL)
+  if ((g_device_config_queue != NULL) &&
+      (g_device_config_task_handle != NULL) &&
+      (g_device_config_save_mutex != NULL))
   {
     return;
   }
 
-  g_device_config_queue =
-    xQueueCreateStatic(DEVICE_CONFIG_QUEUE_LENGTH,
-                       sizeof(device_config_request_t),
-                       g_device_config_queue_storage,
-                       &g_device_config_queue_buffer);
-  if ((g_device_config_queue != NULL) && (g_device_config_task_handle == NULL))
+  if (g_device_config_queue == NULL)
+  {
+    g_device_config_queue =
+      xQueueCreateStatic(DEVICE_CONFIG_QUEUE_LENGTH,
+                         sizeof(device_config_request_t),
+                         g_device_config_queue_storage,
+                         &g_device_config_queue_buffer);
+  }
+  if (g_device_config_save_mutex == NULL)
+  {
+    g_device_config_save_mutex =
+      xSemaphoreCreateMutexStatic(&g_device_config_save_mutex_buffer);
+  }
+  if ((g_device_config_queue != NULL) &&
+      (g_device_config_save_mutex != NULL) &&
+      (g_device_config_task_handle == NULL))
   {
     g_device_config_task_handle =
       xTaskCreateStatic(device_config_worker_task,

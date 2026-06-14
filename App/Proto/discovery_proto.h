@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define DISCOVERY_PROTO_ANNOUNCE_MAX_SIZE 640U
+#define DISCOVERY_PROTO_ANNOUNCE_MAX_SIZE 768U
 
 int discovery_proto_build_announce(char *buffer,
                                    size_t buffer_size,
@@ -28,6 +28,14 @@ int discovery_proto_build_announce(char *buffer,
                                    uint32_t relay_mask,
                                    uint32_t enabled_mask,
                                    uint8_t auto_join,
+                                   uint32_t unix_time,
+                                   uint8_t time_valid,
+                                   uint8_t rtc_lse_ready,
+                                   uint8_t time_source,
+                                   uint8_t time_quality,
+                                   uint32_t time_seq,
+                                   uint32_t gateway_epoch,
+                                   uint32_t gateway_node_id,
                                    const char *ip_text,
                                    uint16_t port,
                                    const uint8_t mac[6]);
@@ -47,6 +55,14 @@ typedef struct
   uint32_t relay_mask;
   uint32_t enabled_mask;
   uint8_t auto_join;
+  uint32_t unix_time;
+  uint8_t time_valid;
+  uint8_t rtc_lse_ready;
+  uint8_t time_source;
+  uint8_t time_quality;
+  uint32_t time_seq;
+  uint32_t gateway_epoch;
+  uint32_t gateway_node_id;
   char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
   char cloud_device_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
   char cloud_key_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
