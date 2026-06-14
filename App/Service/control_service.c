@@ -1,6 +1,7 @@
 #include "control_service.h"
 #include "control_proto.h"
 #include "control_queue.h"
+#include "cluster_service.h"
 #include "relay_domain.h"
 #include "../Platform/board_relay.h"
 
@@ -28,6 +29,34 @@ static void control_service_tcpip_step(void *arg);
 static err_t control_service_sent_close(void *arg, struct tcp_pcb *tpcb, u16_t len);
 static err_t control_service_poll_close(void *arg, struct tcp_pcb *tpcb);
 static err_t control_service_poll_idle(void *arg, struct tcp_pcb *tpcb);
+static uint8_t control_service_write_allowed(const struct tcp_pcb *tpcb);
+
+static uint8_t control_service_write_allowed(const struct tcp_pcb *tpcb)
+{
+  cluster_service_state_t state;
+  const cluster_node_t *master;
+
+  if ((tpcb == NULL) || !IP_IS_V4(&tpcb->remote_ip))
+  {
+    return 0U;
+  }
+
+  cluster_service_get_state(&state);
+  if ((state.role != CLUSTER_ROLE_MEMBER) ||
+      (state.has_master == 0U) ||
+      (state.master_node_id == 0U))
+  {
+    return 0U;
+  }
+
+  master = cluster_service_find_node(state.master_node_id);
+  if ((master == NULL) || (master->valid == 0U) || (master->online == 0U))
+  {
+    return 0U;
+  }
+
+  return (ip4_addr_get_u32(ip_2_ip4(&tpcb->remote_ip)) == master->ip_addr) ? 1U : 0U;
+}
 
 static void control_service_close(struct tcp_pcb *tpcb)
 {
@@ -216,7 +245,18 @@ static err_t control_service_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *
 
   g_control_stats.commands++;
   control_proto_parse(request, &command);
-  control_service_execute(&command, response, sizeof(response));
+  if (((command.type == CONTROL_PROTO_CMD_SET_RELAY) ||
+       (command.type == CONTROL_PROTO_CMD_SET_RELAY_MASK) ||
+       (command.type == CONTROL_PROTO_CMD_SET_RELAY_ALL)) &&
+      (control_service_write_allowed(tpcb) == 0U))
+  {
+    g_control_stats.errors++;
+    (void)snprintf(response, sizeof(response), "ERR code=unauthorized\r\n");
+  }
+  else
+  {
+    control_service_execute(&command, response, sizeof(response));
+  }
   send_err = control_service_send_response(tpcb, response);
   tcp_recv(tpcb, NULL);
   tcp_sent(tpcb, control_service_sent_close);

@@ -43,6 +43,7 @@ __attribute__((noinline, optnone)) static void ethernetif_copy_bytes_safe(void *
 static void ethernetif_uart_write(const char *text);
 static void ethernetif_netif_up_callback(void *ctx);
 static void ethernetif_netif_down_callback(void *ctx);
+static void ethernetif_tx_reclaim_callback(void *ctx);
 
 extern UART_HandleTypeDef huart3;
 
@@ -194,7 +195,7 @@ typedef struct
 LWIP_MEMPOOL_DECLARE(RX_POOL, ETH_RX_BUFFER_CNT, sizeof(RxBuff_t), "Zero-copy RX PBUF pool");
 
 /* Variable Definitions */
-static uint8_t RxAllocStatus;
+static volatile uint8_t RxAllocStatus;
 
 #if defined ( __ICCARM__ ) /*!< IAR Compiler */
 
@@ -233,6 +234,10 @@ volatile uint32_t g_eth_tx_packets = 0U;
 volatile uint32_t g_eth_tx_errors = 0U;
 volatile uint32_t g_eth_rx_packets = 0U;
 volatile uint32_t g_eth_rx_null_reads = 0U;
+volatile uint32_t g_eth_rx_alloc_failures = 0U;
+volatile uint32_t g_eth_rx_alloc_recoveries = 0U;
+volatile uint32_t g_eth_rx_alloc_stalled = 0U;
+volatile uint32_t g_eth_last_rx_ms = 0U;
 volatile uint32_t g_eth_rx_self_packets = 0U;
 volatile uint32_t g_eth_rx_arp_packets = 0U;
 volatile uint32_t g_eth_rx_ipv4_packets = 0U;
@@ -257,6 +262,8 @@ volatile uint32_t g_eth_tx_free_packets = 0U;
 volatile uint32_t g_eth_last_tx_hal_status = 0U;
 volatile uint32_t g_eth_last_tx_hal_error = 0U;
 volatile uint32_t g_eth_last_tx_dma_error = 0U;
+volatile uint32_t g_eth_tx_reclaim_calls = 0U;
+volatile uint32_t g_eth_tx_reclaim_schedule_errors = 0U;
 volatile uint32_t g_eth_irq_count = 0U;
 volatile uint32_t g_eth_rx_cplt_count = 0U;
 volatile uint32_t g_eth_link_thread_started = 0U;
@@ -272,6 +279,7 @@ volatile uint32_t g_eth_phy_physcsr_after_cfg = 0U;
 volatile uint32_t g_eth_phy_retry_count = 0U;
 volatile int32_t g_eth_phy_forced_mode = 0;
 static uint32_t g_eth_tx_dma_index = 0U;
+static volatile uint8_t g_eth_tx_reclaim_pending = 0U;
 /* USER CODE END 2 */
 
 osSemaphoreId RxPktSemaphore = NULL;   /* Semaphore to signal incoming packets */
@@ -680,6 +688,14 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
   LWIP_UNUSED_ARG(netif);
   memset(Txbuffer, 0, sizeof(Txbuffer));
 
+  /*
+   * HAL keeps completed descriptors reserved until ReleaseTxPacket runs.
+   * Reclaim here before preparing another packet; low_level_output and the
+   * scheduled reclaim callback both execute serially in tcpip_thread.
+   */
+  (void)HAL_ETH_ReleaseTxPacket(&heth);
+  g_eth_tx_reclaim_calls++;
+
   if (p->tot_len > ETH_TX_DMA_BUFFER_SIZE)
   {
     g_eth_tx_errors++;
@@ -727,6 +743,31 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
   return errval;
 }
 
+static void ethernetif_tx_reclaim_callback(void *ctx)
+{
+  LWIP_UNUSED_ARG(ctx);
+
+  (void)HAL_ETH_ReleaseTxPacket(&heth);
+  g_eth_tx_reclaim_calls++;
+  g_eth_tx_reclaim_pending = 0U;
+}
+
+void ethernetif_poll_tx_reclaim(void)
+{
+  if ((g_eth_tx_packets == g_eth_tx_free_packets) ||
+      (g_eth_tx_reclaim_pending != 0U))
+  {
+    return;
+  }
+
+  g_eth_tx_reclaim_pending = 1U;
+  if (tcpip_try_callback(ethernetif_tx_reclaim_callback, NULL) != ERR_OK)
+  {
+    g_eth_tx_reclaim_pending = 0U;
+    g_eth_tx_reclaim_schedule_errors++;
+  }
+}
+
 /**
  * @brief Should allocate a pbuf and transfer the bytes of the incoming
  * packet from the interface into the pbuf.
@@ -739,14 +780,17 @@ static struct pbuf * low_level_input(struct netif *netif)
 {
   struct pbuf *p = NULL;
 
-  if(RxAllocStatus == RX_ALLOC_OK)
-  {
-    HAL_ETH_ReadData(&heth, (void **)&p);
-  }
+  /*
+   * Always let the HAL retry descriptor rebuilding. Gating this call on
+   * RxAllocStatus can permanently stop RX if the pool-recovery notification
+   * races with the input task.
+   */
+  HAL_ETH_ReadData(&heth, (void **)&p);
 
   if (p != NULL)
   {
     g_eth_rx_packets++;
+    g_eth_last_rx_ms = HAL_GetTick();
   }
   else
   {
@@ -886,7 +930,6 @@ void pbuf_free_custom(struct pbuf *p)
 
   if (RxAllocStatus == RX_ALLOC_ERROR)
   {
-    RxAllocStatus = RX_ALLOC_OK;
     osSemaphoreRelease(RxPktSemaphore);
   }
 }
@@ -1235,6 +1278,12 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
   struct pbuf_custom *p = LWIP_MEMPOOL_ALLOC(RX_POOL);
   if (p)
   {
+      if (RxAllocStatus == RX_ALLOC_ERROR)
+      {
+        g_eth_rx_alloc_recoveries++;
+      }
+      RxAllocStatus = RX_ALLOC_OK;
+      g_eth_rx_alloc_stalled = 0U;
       /* Get the buff from the struct pbuf address. */
       *buff = (uint8_t *)p + offsetof(RxBuff_t, buff);
       p->custom_free_function = pbuf_free_custom;
@@ -1245,7 +1294,12 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
     }
     else
     {
+      if (RxAllocStatus != RX_ALLOC_ERROR)
+      {
+        g_eth_rx_alloc_failures++;
+      }
       RxAllocStatus = RX_ALLOC_ERROR;
+      g_eth_rx_alloc_stalled = 1U;
       *buff = NULL;
     }
 /* USER CODE END HAL ETH RxAllocateCallback */

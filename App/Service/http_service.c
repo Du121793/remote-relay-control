@@ -20,6 +20,7 @@
 #include "lwip/stats.h"
 #include "lwip/tcp.h"
 #include "lwip/tcpip.h"
+#include "lwip.h"
 
 #include "FreeRTOS.h"
 #include "portable.h"
@@ -34,6 +35,9 @@
 #define HTTP_BODY_BUFFER_SIZE       4096U
 #define HTTP_AUTH_TOKEN_SIZE        16U
 #define HTTP_AUTH_SESSION_TTL_MS    (15UL * 60UL * 1000UL)
+#define HTTP_AUTH_SESSION_CAPACITY  8U
+#define HTTP_AUTH_SCOPE_CONTROL     0U
+#define HTTP_AUTH_SCOPE_SERVICE     1U
 #define HTTP_CONNECTION_IDLE_TIMEOUT_MS 10000UL
 #define HTTP_AUTH_PASSWORD          "admin"
 
@@ -62,9 +66,15 @@ typedef struct
 {
   uint32_t token;
   uint32_t expires_at_ms;
+  uint8_t active;
+  uint8_t scope;
+} http_service_auth_session_t;
+
+typedef struct
+{
+  http_service_auth_session_t sessions[HTTP_AUTH_SESSION_CAPACITY];
   uint32_t sessions_issued;
   uint32_t login_failures;
-  uint8_t active;
 } http_service_auth_state_t;
 
 static struct tcp_pcb *g_http_listener_pcb = NULL;
@@ -92,10 +102,13 @@ static err_t http_service_poll_close(void *arg, struct tcp_pcb *tpcb);
 static uint8_t http_service_extract_form_text(const char *body, const char *key, char *buffer, size_t buffer_size);
 static uint8_t http_service_extract_header_text(const char *request, const char *header_name, char *buffer, size_t buffer_size);
 static uint32_t http_service_parse_content_length(const char *request);
-static uint8_t http_service_has_valid_session(const char *request);
+static uint8_t http_service_get_session_scope(const char *request, uint8_t *scope);
 static uint32_t http_service_issue_session_token(void);
+static uint32_t http_service_create_session(uint8_t scope);
+static void http_service_revoke_session(const char *request);
+static uint32_t http_service_active_control_session_count(void);
 static void http_service_format_session_json(char *buffer, size_t buffer_size, uint8_t authenticated);
-static void http_service_format_login_json(char *buffer, size_t buffer_size);
+static void http_service_format_login_json(char *buffer, size_t buffer_size, uint32_t token);
 static void http_service_format_logout_json(char *buffer, size_t buffer_size);
 static void http_service_format_cluster_config_json(char *buffer, size_t buffer_size);
 static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_size);
@@ -585,22 +598,12 @@ static uint32_t http_service_issue_session_token(void)
   return seed;
 }
 
-static uint8_t http_service_has_valid_session(const char *request)
+static uint8_t http_service_get_session_scope(const char *request, uint8_t *scope)
 {
   char token_text[HTTP_AUTH_TOKEN_SIZE];
   uint32_t token_value;
-
-  if (g_http_auth_state.active == 0U)
-  {
-    return 0U;
-  }
-
-  if ((int32_t)(HAL_GetTick() - g_http_auth_state.expires_at_ms) >= 0)
-  {
-    g_http_auth_state.active = 0U;
-    g_http_auth_state.token = 0U;
-    return 0U;
-  }
+  uint32_t now;
+  uint32_t index;
 
   if (!http_service_extract_header_text(request, "X-Auth-Token:", token_text, sizeof(token_text)))
   {
@@ -612,7 +615,119 @@ static uint8_t http_service_has_valid_session(const char *request)
     return 0U;
   }
 
-  return (token_value == g_http_auth_state.token) ? 1U : 0U;
+  now = HAL_GetTick();
+  for (index = 0U; index < HTTP_AUTH_SESSION_CAPACITY; index++)
+  {
+    http_service_auth_session_t *session = &g_http_auth_state.sessions[index];
+
+    if (session->active == 0U)
+    {
+      continue;
+    }
+    if ((int32_t)(now - session->expires_at_ms) >= 0)
+    {
+      memset(session, 0, sizeof(*session));
+      continue;
+    }
+    if (token_value == session->token)
+    {
+      if (scope != NULL)
+      {
+        *scope = session->scope;
+      }
+      return 1U;
+    }
+  }
+
+  return 0U;
+}
+
+static uint32_t http_service_create_session(uint8_t scope)
+{
+  uint32_t now = HAL_GetTick();
+  uint32_t selected = (scope == HTTP_AUTH_SCOPE_SERVICE) ? 1U : 0U;
+  uint32_t selected_remaining = 0xFFFFFFFFUL;
+  uint32_t index;
+  uint32_t token;
+
+  if (scope == HTTP_AUTH_SCOPE_CONTROL)
+  {
+    memset(&g_http_auth_state.sessions[0], 0, sizeof(g_http_auth_state.sessions[0]));
+  }
+  else
+  {
+    for (index = 1U; index < HTTP_AUTH_SESSION_CAPACITY; index++)
+    {
+      http_service_auth_session_t *session = &g_http_auth_state.sessions[index];
+
+      if ((session->active == 0U) || ((int32_t)(now - session->expires_at_ms) >= 0))
+      {
+        selected = index;
+        break;
+      }
+      if ((session->expires_at_ms - now) < selected_remaining)
+      {
+        selected = index;
+        selected_remaining = session->expires_at_ms - now;
+      }
+    }
+  }
+
+  do
+  {
+    token = http_service_issue_session_token();
+    for (index = 0U; index < HTTP_AUTH_SESSION_CAPACITY; index++)
+    {
+      if ((g_http_auth_state.sessions[index].active != 0U) &&
+          (g_http_auth_state.sessions[index].token == token))
+      {
+        token = 0U;
+        break;
+      }
+    }
+  } while (token == 0U);
+
+  g_http_auth_state.sessions[selected].token = token;
+  g_http_auth_state.sessions[selected].expires_at_ms = now + HTTP_AUTH_SESSION_TTL_MS;
+  g_http_auth_state.sessions[selected].active = 1U;
+  g_http_auth_state.sessions[selected].scope = scope;
+  g_http_auth_state.sessions_issued++;
+  return token;
+}
+
+static void http_service_revoke_session(const char *request)
+{
+  char token_text[HTTP_AUTH_TOKEN_SIZE];
+  uint32_t token_value;
+  uint32_t index;
+
+  if (!http_service_extract_header_text(request, "X-Auth-Token:", token_text, sizeof(token_text)) ||
+      !http_service_parse_u32_value(token_text, &token_value))
+  {
+    return;
+  }
+
+  for (index = 0U; index < HTTP_AUTH_SESSION_CAPACITY; index++)
+  {
+    if ((g_http_auth_state.sessions[index].active != 0U) &&
+        (g_http_auth_state.sessions[index].token == token_value))
+    {
+      memset(&g_http_auth_state.sessions[index], 0, sizeof(g_http_auth_state.sessions[index]));
+      return;
+    }
+  }
+}
+
+static uint32_t http_service_active_control_session_count(void)
+{
+  http_service_auth_session_t *session = &g_http_auth_state.sessions[0];
+  uint32_t now = HAL_GetTick();
+
+  if ((session->active != 0U) && ((int32_t)(now - session->expires_at_ms) >= 0))
+  {
+    memset(session, 0, sizeof(*session));
+  }
+  return ((session->active != 0U) && (session->scope == HTTP_AUTH_SCOPE_CONTROL)) ? 1U : 0U;
 }
 
 static err_t http_service_send_payload_chunk(http_service_connection_t *connection)
@@ -868,7 +983,7 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  "\"http\":{\"connections\":%lu,\"requests\":%lu,\"errors\":%lu,\"active\":%lu,\"close_pending\":%lu,\"listener_up\":%lu},"
                  "\"backend\":{\"connected\":%u,\"should_run\":%u,\"port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"sent_hello\":%lu,\"sent_heartbeat\":%lu,\"sent_status\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"last_error\":%lu},"
                  "\"cloud\":{\"configured\":%u,\"enabled\":%u,\"should_run\":%u,\"connected\":%u,\"transport\":%u,\"broker_port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"published_hello\":%lu,\"published_heartbeat\":%lu,\"published_status\":%lu,\"published_fault_reports\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"published_acks\":%lu,\"ack_queue_dropped\":%lu,\"ack_queue_depth\":%lu,\"last_error\":%lu,\"status_dirty_count\":%lu,\"ca_fingerprint_configured\":%u,\"binding_secret_configured\":%u},"
-                 "\"lwip\":{\"mem_avail\":%lu,\"mem_used\":%lu,\"mem_err\":%lu,\"tcp_pcb_used\":%lu,\"tcp_pcb_max\":%lu,\"tcp_seg_used\":%lu,\"tcp_seg_max\":%lu,\"pbuf_used\":%lu,\"pbuf_max\":%lu,\"sys_timeout_used\":%lu,\"sys_timeout_max\":%lu,\"sys_timeout_err\":%lu}"
+                 "\"lwip\":{\"mem_avail\":%lu,\"mem_used\":%lu,\"mem_err\":%lu,\"tcp_pcb_used\":%lu,\"tcp_pcb_max\":%lu,\"tcp_seg_used\":%lu,\"tcp_seg_max\":%lu,\"pbuf_used\":%lu,\"pbuf_max\":%lu,\"sys_timeout_used\":%lu,\"sys_timeout_max\":%lu,\"sys_timeout_err\":%lu,\"eth_tx\":%lu,\"eth_tx_err\":%lu,\"eth_tx_free\":%lu,\"eth_tx_reclaim\":%lu,\"eth_tx_reclaim_schedule_err\":%lu,\"eth_last_tx_hal_status\":%lu,\"eth_last_tx_hal_error\":%lu,\"eth_last_tx_dma_error\":%lu,\"eth_rx\":%lu,\"eth_rx_null\":%lu,\"eth_rx_alloc_fail\":%lu,\"eth_rx_alloc_recover\":%lu,\"eth_rx_alloc_stalled\":%lu,\"eth_last_rx_ms\":%lu,\"eth_dma_status\":%lu,\"eth_rx_build_pending\":%lu}"
                  "}",
                  (unsigned long)HAL_GetTick(),
                  (unsigned int)link_up,
@@ -919,7 +1034,7 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)discovery_stats.discover_packets,
                  (long)discovery_stats.last_tx_err,
                  (unsigned long)discovery_stats.last_payload_len,
-                 (unsigned int)(g_http_auth_state.active ? 1U : 0U),
+                 (unsigned int)http_service_active_control_session_count(),
                  (unsigned long)g_http_auth_state.sessions_issued,
                  (unsigned long)g_http_auth_state.login_failures,
                  (unsigned long)g_http_service_stats.connections,
@@ -971,7 +1086,23 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)MEMP_STATS_GET(max, MEMP_PBUF),
                  (unsigned long)MEMP_STATS_GET(used, MEMP_SYS_TIMEOUT),
                  (unsigned long)MEMP_STATS_GET(max, MEMP_SYS_TIMEOUT),
-                 (unsigned long)MEMP_STATS_GET(err, MEMP_SYS_TIMEOUT));
+                 (unsigned long)MEMP_STATS_GET(err, MEMP_SYS_TIMEOUT),
+                 (unsigned long)g_eth_tx_packets,
+                 (unsigned long)g_eth_tx_errors,
+                 (unsigned long)g_eth_tx_free_packets,
+                 (unsigned long)g_eth_tx_reclaim_calls,
+                 (unsigned long)g_eth_tx_reclaim_schedule_errors,
+                 (unsigned long)g_eth_last_tx_hal_status,
+                 (unsigned long)g_eth_last_tx_hal_error,
+                 (unsigned long)g_eth_last_tx_dma_error,
+                 (unsigned long)g_eth_rx_packets,
+                 (unsigned long)g_eth_rx_null_reads,
+                 (unsigned long)g_eth_rx_alloc_failures,
+                 (unsigned long)g_eth_rx_alloc_recoveries,
+                 (unsigned long)g_eth_rx_alloc_stalled,
+                 (unsigned long)g_eth_last_rx_ms,
+                 (unsigned long)heth.Instance->DMASR,
+                 (unsigned long)heth.RxDescList.RxBuildDescCnt);
 }
 
 __attribute__((noinline)) static err_t http_service_handle_status_request(http_service_connection_t *connection)
@@ -1038,11 +1169,11 @@ static void http_service_format_session_json(char *buffer, size_t buffer_size, u
                  "\"ttl_ms\":%lu"
                  "}",
                  (unsigned int)authenticated,
-                 (unsigned int)(g_http_auth_state.active ? 1U : 0U),
+                 (unsigned int)http_service_active_control_session_count(),
                  (unsigned long)HTTP_AUTH_SESSION_TTL_MS);
 }
 
-static void http_service_format_login_json(char *buffer, size_t buffer_size)
+static void http_service_format_login_json(char *buffer, size_t buffer_size, uint32_t token)
 {
   (void)snprintf(buffer, buffer_size,
                  "{"
@@ -1050,7 +1181,7 @@ static void http_service_format_login_json(char *buffer, size_t buffer_size)
                  "\"token\":%lu,"
                  "\"expires_in_ms\":%lu"
                  "}",
-                 (unsigned long)g_http_auth_state.token,
+                 (unsigned long)token,
                  (unsigned long)HTTP_AUTH_SESSION_TTL_MS);
 }
 
@@ -1434,9 +1565,13 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   const size_t response_body_size = HTTP_BODY_BUFFER_SIZE;
   const char *body;
   uint32_t value;
-  uint8_t authenticated = http_service_has_valid_session(request);
+  uint8_t session_scope = 0xFFU;
+  uint8_t authenticated = http_service_get_session_scope(request, &session_scope);
+  uint8_t control_authenticated =
+    (authenticated != 0U) && (session_scope == HTTP_AUTH_SCOPE_CONTROL);
   static control_proto_command_t command;
   static char password_text[32];
+  static char service_key_text[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
   static char device_name[DEVICE_CONFIG_NAME_MAX_LEN];
   static char cluster_name[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN];
   static char relay_name[DEVICE_CONFIG_NAME_MAX_LEN];
@@ -1496,6 +1631,12 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/config/cluster") == 0))
   {
     static char cfg_log[96];
+
+    if (!authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
     http_service_format_cluster_config_json(response_body, response_body_size);
     (void)snprintf(cfg_log, sizeof(cfg_log), "[http] cfg len=%lu\r\n",
                    (unsigned long)strlen(response_body));
@@ -1511,12 +1652,20 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
 
   if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/config/relays") == 0))
   {
+    if (!authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
     http_service_format_relay_config_json(response_body, response_body_size);
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/login") == 0))
   {
+    uint32_t session_token;
+    uint8_t session_scope = HTTP_AUTH_SCOPE_CONTROL;
+
     if (!http_service_extract_form_text(body, "password", password_text, sizeof(password_text)) ||
         (strcmp(password_text, HTTP_AUTH_PASSWORD) != 0))
     {
@@ -1525,26 +1674,37 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
     }
 
-    g_http_auth_state.token = http_service_issue_session_token();
-    g_http_auth_state.expires_at_ms = HAL_GetTick() + HTTP_AUTH_SESSION_TTL_MS;
-    g_http_auth_state.sessions_issued++;
-    g_http_auth_state.active = 1U;
-    http_service_format_login_json(response_body, response_body_size);
+    if (http_service_extract_form_text(body, "scope", password_text, sizeof(password_text)) &&
+        (strcmp(password_text, "service") == 0))
+    {
+      if (!http_service_extract_form_text(body,
+                                          "service_key",
+                                          service_key_text,
+                                          sizeof(service_key_text)) ||
+          (active_config->backend_key[0] == '\0') ||
+          (strcmp(service_key_text, active_config->backend_key) != 0))
+      {
+        g_http_auth_state.login_failures++;
+        http_service_format_error_json(response_body, response_body_size, "bad_service_key");
+        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+      }
+      session_scope = HTTP_AUTH_SCOPE_SERVICE;
+    }
+    session_token = http_service_create_session(session_scope);
+    http_service_format_login_json(response_body, response_body_size, session_token);
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/logout") == 0))
   {
-    g_http_auth_state.active = 0U;
-    g_http_auth_state.token = 0U;
-    g_http_auth_state.expires_at_ms = 0U;
+    http_service_revoke_session(request);
     http_service_format_logout_json(response_body, response_body_size);
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/relay-mask") == 0))
   {
-    if (!authenticated)
+    if (!control_authenticated)
     {
       http_service_format_error_json(response_body, response_body_size, "unauthorized");
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
@@ -1576,7 +1736,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     uint32_t channel;
     uint32_t relay_value;
 
-    if (!authenticated)
+    if (!control_authenticated)
     {
       http_service_format_error_json(response_body, response_body_size, "unauthorized");
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
@@ -1612,7 +1772,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     uint32_t relay_value;
     uint32_t node_id;
 
-    if (!authenticated)
+    if (!control_authenticated)
     {
       http_service_format_error_json(response_body, response_body_size, "unauthorized");
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
@@ -2006,7 +2166,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   {
     uint32_t node_id;
 
-    if (!authenticated)
+    if (!control_authenticated)
     {
       http_service_format_error_json(response_body, response_body_size, "unauthorized");
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
@@ -2032,7 +2192,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   {
     uint32_t node_id;
 
-    if (!authenticated)
+    if (!control_authenticated)
     {
       http_service_format_error_json(response_body, response_body_size, "unauthorized");
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);

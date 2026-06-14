@@ -16,6 +16,7 @@ const CLIENT_STALE_MS = Number(process.env.CLIENT_STALE_MS || 12000);
 const PROVISIONING_RESEND_COOLDOWN_MS = Number(process.env.PROVISIONING_RESEND_COOLDOWN_MS || 30000);
 const ALLOW_PRIVATE_KEY_EXPORT = process.env.ALLOW_PRIVATE_KEY_EXPORT === "1";
 const REMOTE_ADMIN_PASSWORD = process.env.REMOTE_ADMIN_PASSWORD || "admin";
+const REMOTE_SESSION_CACHE_TTL_MS = 14 * 60 * 1000;
 const DATA_DIR = path.join(__dirname, "data");
 const KEYS_PATH = path.join(DATA_DIR, "keys.json");
 const CLOUD_DEVICES_PATH = path.join(DATA_DIR, "cloud-devices.json");
@@ -990,7 +991,8 @@ async function remoteNodeLogin(node) {
   loginResponse = await fetch(`http://${node.ip}/api/login`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `password=${encodeURIComponent(REMOTE_ADMIN_PASSWORD)}`,
+    body: `password=${encodeURIComponent(REMOTE_ADMIN_PASSWORD)}`
+      + `&scope=service&service_key=${encodeURIComponent(node.backendKey || "")}`,
   });
   loginData = await loginResponse.json();
   if (!loginResponse.ok || !loginData.ok || !loginData.token) {
@@ -999,7 +1001,7 @@ async function remoteNodeLogin(node) {
 
   remoteSessionCache.set(cacheKey, {
     token: loginData.token,
-    expiresAt: Date.now() + 60000,
+    expiresAt: Date.now() + REMOTE_SESSION_CACHE_TTL_MS,
   });
   return loginData.token;
 }
@@ -3123,10 +3125,6 @@ app.get("/events", (_req, res) => {
 app.get("/api/config/:nodeId/relays", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const node = resolveKnownNode(nodeId);
-  let loginResponse;
-  let loginData;
-  let token;
-  let response;
   let data;
 
   if (!node || !node.ip || !node.online) {
@@ -3134,23 +3132,9 @@ app.get("/api/config/:nodeId/relays", async (req, res) => {
   }
 
   try {
-    loginResponse = await fetch(`http://${node.ip}/api/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: `password=${encodeURIComponent(REMOTE_ADMIN_PASSWORD)}`,
-    });
-    loginData = await loginResponse.json();
-    if (!loginResponse.ok || !loginData.ok || !loginData.token) {
-      return res.status(502).json({ ok: false, error: "remote_login_failed" });
-    }
-
-    token = loginData.token;
-    response = await fetch(`http://${node.ip}/api/config/relays`, {
-      headers: { "X-Auth-Token": String(token) },
-    });
-    data = await response.json();
-    if (!response.ok || !data.ok) {
-      return res.status(502).json({ ok: false, error: data.error || "remote_fetch_failed" });
+    data = await remoteNodeGetJson(nodeId, "/api/config/relays");
+    if (!data || !data.ok) {
+      return res.status(502).json({ ok: false, error: (data && data.error) || "remote_fetch_failed" });
     }
     return res.json(data);
   } catch (_error) {

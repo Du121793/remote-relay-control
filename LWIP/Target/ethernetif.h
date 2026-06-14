@@ -42,5 +42,7 @@ u32_t sys_now(void);
 extern volatile uint32_t g_tick_probe_armed;
 extern volatile uint32_t g_tick_probe_hits;
 
+void ethernetif_poll_tx_reclaim(void);
+
 /* USER CODE END 1 */
 #endif

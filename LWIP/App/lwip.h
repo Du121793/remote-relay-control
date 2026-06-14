@@ -45,6 +45,10 @@ extern volatile uint32_t g_eth_tx_packets;
 extern volatile uint32_t g_eth_tx_errors;
 extern volatile uint32_t g_eth_rx_packets;
 extern volatile uint32_t g_eth_rx_null_reads;
+extern volatile uint32_t g_eth_rx_alloc_failures;
+extern volatile uint32_t g_eth_rx_alloc_recoveries;
+extern volatile uint32_t g_eth_rx_alloc_stalled;
+extern volatile uint32_t g_eth_last_rx_ms;
 extern volatile uint32_t g_eth_rx_self_packets;
 extern volatile uint32_t g_eth_rx_arp_packets;
 extern volatile uint32_t g_eth_rx_ipv4_packets;
@@ -69,6 +73,8 @@ extern volatile uint32_t g_eth_tx_free_packets;
 extern volatile uint32_t g_eth_last_tx_hal_status;
 extern volatile uint32_t g_eth_last_tx_hal_error;
 extern volatile uint32_t g_eth_last_tx_dma_error;
+extern volatile uint32_t g_eth_tx_reclaim_calls;
+extern volatile uint32_t g_eth_tx_reclaim_schedule_errors;
 
 /* USER CODE END 0 */
 

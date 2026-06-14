@@ -728,10 +728,7 @@ void StartDefaultTask(void const * argument)
       next_dhcp_report_ms = now + g_dhcp_report_interval_ms;
     }
 
-    if (g_eth_tx_packets != g_eth_tx_free_packets)
-    {
-      HAL_ETH_ReleaseTxPacket(&heth);
-    }
+    ethernetif_poll_tx_reclaim();
 
     if ((last_stack_log_ms == 0U) || ((int32_t)(now - last_stack_log_ms) >= 5000))
     {

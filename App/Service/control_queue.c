@@ -49,7 +49,7 @@ typedef struct
 
 typedef struct
 {
-  char login_request[256];
+  char login_request[512];
   char login_response[512];
   char config_request[1280];
   char config_response[2048];
@@ -295,8 +295,13 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_sync_remote_bac
     return HAL_ERROR;
   }
 
+  control_queue_url_encode(config->backend_key,
+                           workspace->encoded_key,
+                           sizeof(workspace->encoded_key));
   (void)snprintf(workspace->body, sizeof(workspace->body),
-                 "password=%s", CONTROL_QUEUE_REMOTE_ADMIN_PASSWORD);
+                 "password=%s&scope=service&service_key=%s",
+                 CONTROL_QUEUE_REMOTE_ADMIN_PASSWORD,
+                 workspace->encoded_key);
   (void)snprintf(workspace->login_request, sizeof(workspace->login_request),
                  "POST /api/login HTTP/1.1\r\n"
                  "Host: remote\r\n"
@@ -453,8 +458,13 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_remote_re
     return HAL_ERROR;
   }
 
+  control_queue_url_encode(device_config_get()->backend_key,
+                           workspace->encoded_key,
+                           sizeof(workspace->encoded_key));
   (void)snprintf(workspace->body, sizeof(workspace->body),
-                 "password=%s", CONTROL_QUEUE_REMOTE_ADMIN_PASSWORD);
+                 "password=%s&scope=service&service_key=%s",
+                 CONTROL_QUEUE_REMOTE_ADMIN_PASSWORD,
+                 workspace->encoded_key);
   (void)snprintf(workspace->login_request, sizeof(workspace->login_request),
                  "POST /api/login HTTP/1.1\r\n"
                  "Host: remote\r\n"
