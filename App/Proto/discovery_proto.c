@@ -95,12 +95,28 @@ int discovery_proto_build_announce(char *buffer,
                                    uint32_t time_seq,
                                    uint32_t gateway_epoch,
                                    uint32_t gateway_node_id,
+                                   uint8_t adc_valid,
+                                   uint8_t adc_ct_valid,
+                                   uint8_t adc_signal_present,
+                                   uint32_t adc_raw,
+                                   uint32_t adc_millivolts,
+                                   uint32_t adc_min,
+                                   uint32_t adc_max,
+                                   uint32_t adc_average,
+                                   uint32_t adc_raw_rms,
+                                   uint32_t adc_rms_millivolts,
+                                   uint32_t adc_current_milliamps,
+                                   uint32_t adc_sample_rate_hz,
+                                   uint32_t adc_window_samples,
+                                   uint32_t adc_sample_count,
+                                   uint32_t adc_dma_overruns,
+                                   uint32_t adc_saturation_count,
                                    const char *ip_text,
                                    uint16_t port,
                                    const uint8_t mac[6])
 {
   return snprintf(buffer, buffer_size,
-                  "type=announce ver=5 service=%s cluster=%s device=%s cloud_cluster=%s cloud_device=%s cloud_key=%s node=%lu role=%u term=%lu load=%lu auth=%lu relay=%lu enabled=%lu auto=%u time=%lu time_valid=%u rtc_lse=%u time_source=%u time_quality=%u time_seq=%lu gateway_epoch=%lu gateway_node=%lu ip=%s port=%u mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                  "type=announce ver=7 service=%s cluster=%s device=%s cloud_cluster=%s cloud_device=%s cloud_key=%s node=%lu role=%u term=%lu load=%lu auth=%lu relay=%lu enabled=%lu auto=%u time=%lu time_valid=%u rtc_lse=%u time_source=%u time_quality=%u time_seq=%lu gateway_epoch=%lu gateway_node=%lu adc_valid=%u adc_ct=%u adc_signal=%u adc_raw=%lu adc_mv=%lu adc_min=%lu adc_max=%lu adc_avg=%lu adc_raw_rms=%lu adc_rms_mv=%lu adc_current_ma=%lu adc_rate=%lu adc_window=%lu adc_samples=%lu adc_overruns=%lu adc_saturation=%lu ip=%s port=%u mac=%02X:%02X:%02X:%02X:%02X:%02X",
                   service,
                   cluster,
                   device,
@@ -123,6 +139,22 @@ int discovery_proto_build_announce(char *buffer,
                   (unsigned long)time_seq,
                   (unsigned long)gateway_epoch,
                   (unsigned long)gateway_node_id,
+                  (unsigned int)adc_valid,
+                  (unsigned int)adc_ct_valid,
+                  (unsigned int)adc_signal_present,
+                  (unsigned long)adc_raw,
+                  (unsigned long)adc_millivolts,
+                  (unsigned long)adc_min,
+                  (unsigned long)adc_max,
+                  (unsigned long)adc_average,
+                  (unsigned long)adc_raw_rms,
+                  (unsigned long)adc_rms_millivolts,
+                  (unsigned long)adc_current_milliamps,
+                  (unsigned long)adc_sample_rate_hz,
+                  (unsigned long)adc_window_samples,
+                  (unsigned long)adc_sample_count,
+                  (unsigned long)adc_dma_overruns,
+                  (unsigned long)adc_saturation_count,
                   ip_text,
                   (unsigned int)port,
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -173,7 +205,7 @@ uint8_t discovery_proto_parse_announce(const void *payload,
   if (!discovery_proto_extract_value(text, "ver=", value, sizeof(value)) ||
       !discovery_proto_parse_u32(value, &parsed_u32) ||
       (parsed_u32 < 2U) ||
-      (parsed_u32 > 5U))
+      (parsed_u32 > 7U))
   {
     return 0U;
   }
@@ -285,6 +317,82 @@ uint8_t discovery_proto_parse_announce(const void *payload,
     if (discovery_proto_extract_optional_value(text, "gateway_node=", value, sizeof(value)) != 0U)
     {
       (void)discovery_proto_parse_u32(value, &announce->gateway_node_id);
+    }
+  }
+  if (version >= 6U)
+  {
+    if ((discovery_proto_extract_optional_value(text, "adc_valid=", value, sizeof(value)) != 0U) &&
+        (discovery_proto_parse_u32(value, &parsed_u32) != 0U) &&
+        (parsed_u32 <= 1U))
+    {
+      announce->adc_valid = (uint8_t)parsed_u32;
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_raw=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_raw);
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_mv=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_millivolts);
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_min=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_min);
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_max=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_max);
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_avg=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_average);
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_samples=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_sample_count);
+    }
+  }
+  if (version >= 7U)
+  {
+    if ((discovery_proto_extract_optional_value(text, "adc_ct=", value, sizeof(value)) != 0U) &&
+        (discovery_proto_parse_u32(value, &parsed_u32) != 0U) &&
+        (parsed_u32 <= 1U))
+    {
+      announce->adc_ct_valid = (uint8_t)parsed_u32;
+    }
+    if ((discovery_proto_extract_optional_value(text, "adc_signal=", value, sizeof(value)) != 0U) &&
+        (discovery_proto_parse_u32(value, &parsed_u32) != 0U) &&
+        (parsed_u32 <= 1U))
+    {
+      announce->adc_signal_present = (uint8_t)parsed_u32;
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_raw_rms=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_raw_rms);
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_rms_mv=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_rms_millivolts);
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_current_ma=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_current_milliamps);
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_rate=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_sample_rate_hz);
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_window=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_window_samples);
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_overruns=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_dma_overruns);
+    }
+    if (discovery_proto_extract_optional_value(text, "adc_saturation=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->adc_saturation_count);
     }
   }
   if (!discovery_proto_extract_value(text, "ip=", value, sizeof(value)))

@@ -3,8 +3,10 @@
 #include "cmsis_os.h"
 
 #include "board_relay.h"
+#include "adc_service.h"
 #include "backend_link_service.h"
 #include "mqtt_link_service.h"
+#include "time_sync_service.h"
 #include "control_proto.h"
 #include "control_queue.h"
 #include "control_service.h"
@@ -30,9 +32,9 @@
 #include <string.h>
 
 #define HTTP_TCP_PORT               80U
-#define HTTP_CONN_POOL_SIZE         2U
+#define HTTP_CONN_POOL_SIZE         4U
 #define HTTP_REQUEST_BUFFER_SIZE    2048U
-#define HTTP_BODY_BUFFER_SIZE       4096U
+#define HTTP_BODY_BUFFER_SIZE       16384U
 #define HTTP_AUTH_TOKEN_SIZE        16U
 #define HTTP_AUTH_SESSION_TTL_MS    (15UL * 60UL * 1000UL)
 #define HTTP_AUTH_SESSION_CAPACITY  8U
@@ -40,6 +42,7 @@
 #define HTTP_AUTH_SCOPE_SERVICE     1U
 #define HTTP_CONNECTION_IDLE_TIMEOUT_MS 10000UL
 #define HTTP_AUTH_PASSWORD          "admin"
+#define HTTP_BACKEND_SYNC_FALLBACK_MS (5UL * 60UL * 1000UL)
 
 extern struct netif gnetif;
 extern UART_HandleTypeDef huart3;
@@ -83,10 +86,12 @@ static http_service_connection_t g_http_connections[HTTP_CONN_POOL_SIZE];
 static http_service_auth_state_t g_http_auth_state;
 static uint8_t g_http_service_started = 0U;
 static uint8_t g_http_last_link_up = 0U;
-static uint8_t g_http_listener_accept_paused = 0U;
 static volatile uint8_t g_http_poll_pending = 0U;
 static uint32_t g_http_poll_skip_count = 0U;
 static uint32_t g_http_backend_sync_last_ms = 0U;
+static uint32_t g_http_backend_sync_member_signature = 0U;
+static uint8_t g_http_backend_sync_active = 0U;
+static uint8_t g_http_backend_sync_cursor = 0U;
 static mqtt_link_stats_t g_http_mqtt_stats_snapshot;
 static void http_service_tcpip_step(void *arg);
 static void http_service_uart_write(const char *text);
@@ -116,7 +121,9 @@ static void http_service_format_relay_config_json(char *buffer, size_t buffer_si
 static err_t http_service_handle_status_request(http_service_connection_t *connection);
 static uint8_t http_service_get_master_ip_text(char *buffer, size_t buffer_size, uint8_t *is_local_master);
 static uint8_t http_service_is_master_control_allowed(char *master_ip_text, size_t buffer_size);
+static void http_service_request_backend_sync(void);
 static void http_service_sync_backend_config_to_cluster_async(void);
+static uint32_t http_service_backend_sync_member_signature(void);
 static size_t http_service_bounded_text_len(const char *text, size_t max_len);
 static void http_service_json_escape_copy(char *dst, size_t dst_size, const char *src, size_t src_max_len);
 
@@ -284,15 +291,6 @@ static void http_service_release_connection(http_service_connection_t *connectio
   }
 
   memset(connection, 0, sizeof(*connection));
-
-  if ((g_http_listener_pcb != NULL) &&
-      (g_http_listener_accept_paused != 0U) &&
-      (http_service_active_connection_count() < HTTP_CONN_POOL_SIZE))
-  {
-    tcp_accept(g_http_listener_pcb, http_service_accept);
-    g_http_listener_accept_paused = 0U;
-    http_service_log_status("[http] accept resume\r\n");
-  }
 }
 
 static void http_service_close(struct tcp_pcb *tpcb, http_service_connection_t *connection)
@@ -353,7 +351,6 @@ static void http_service_close_listener(void)
     tcp_abort(g_http_listener_pcb);
   }
   g_http_listener_pcb = NULL;
-  g_http_listener_accept_paused = 0U;
 }
 
 static uint8_t http_service_parse_u32_value(const char *text, uint32_t *value_out)
@@ -900,6 +897,20 @@ static err_t http_service_send_payload(http_service_connection_t *connection,
     return err;
   }
 
+  /* Use progressive streaming for payloads larger than ~1 KB to avoid
+     tcp_write ERR_MEM when the body exceeds tcp_sndbuf.  The sent callback
+     drives http_service_send_payload_chunk() to push remaining data. */
+  if (body_len > 1024U)
+  {
+    connection->send_data = (const unsigned char *)body;
+    connection->send_total = body_len;
+    connection->send_progress = 0;
+    connection->close_pending = 0U;
+    connection->last_activity_ms = HAL_GetTick();
+    (void)http_service_send_payload_chunk(connection);
+    return ERR_OK;
+  }
+
   err = tcp_write(tpcb, body, (u16_t)body_len, TCP_WRITE_FLAG_COPY);
   if (err != ERR_OK)
   {
@@ -913,7 +924,7 @@ static err_t http_service_send_payload(http_service_connection_t *connection,
   connection->send_progress = 0;
   connection->close_pending = 1U;
   connection->last_activity_ms = HAL_GetTick();
-  
+
   err = tcp_output(tpcb);
   if (err != ERR_OK)
   {
@@ -933,6 +944,8 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
   backend_link_stats_t backend_stats;
   mqtt_link_stats_t *mqtt_stats = &g_http_mqtt_stats_snapshot;
   cluster_service_state_t cluster_state;
+  adc_service_state_t adc_state;
+  time_sync_service_stats_t time_sync_stats;
   size_t heap_free = xPortGetFreeHeapSize();
   size_t heap_min = xPortGetMinimumEverFreeHeapSize();
   uint32_t http_active = 0U;
@@ -947,6 +960,8 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
   backend_link_service_get_stats(&backend_stats);
   mqtt_link_service_get_stats(mqtt_stats);
   cluster_service_get_state(&cluster_state);
+  adc_service_get_state(&adc_state);
+  time_sync_service_get_stats(&time_sync_stats);
   (void)ip4addr_ntoa_r(netif_ip4_addr(&gnetif), ip_text, sizeof(ip_text));
   (void)ip4addr_ntoa_r(netif_ip4_netmask(&gnetif), mask_text, sizeof(mask_text));
   (void)ip4addr_ntoa_r(netif_ip4_gw(&gnetif), gw_text, sizeof(gw_text));
@@ -973,7 +988,9 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  "\"netmask\":\"%s\","
                  "\"gateway\":\"%s\","
                  "\"relay_mask\":%lu,"
-                 "\"cluster\":{\"enabled\":%u,\"name\":\"%s\",\"role\":%u,\"join_mode\":%u,\"self_node_id\":%lu,\"master_node_id\":%lu,\"term\":%lu,\"master_eligible\":%u,\"health_score\":%lu,\"health_lateness_ms\":%lu,\"health_bad_streak\":%lu,\"unix_time\":%lu,\"time_valid\":%u,\"time_source\":%u,\"time_quality\":%u,\"time_sync_count\":%lu,\"time_seq\":%lu,\"gateway_epoch\":%lu,\"gateway_node_id\":%lu,\"last_time_offset_seconds\":%ld,\"rtc_lse_ready\":%u},"
+                 "\"adc\":{\"initialized\":%u,\"channel_count\":%u,\"available_mask\":%lu,\"vref_valid\":%u,\"vref_raw\":%u,\"vdda_millivolts\":%lu,\"valid\":%u,\"ct_valid\":%u,\"signal_present\":%u,\"raw\":%u,\"raw_min\":%u,\"raw_max\":%u,\"raw_average\":%u,\"raw_rms\":%u,\"millivolts\":%u,\"rms_millivolts\":%u,\"current_milliamps\":%lu,\"sample_rate_hz\":%lu,\"window_samples\":%lu,\"sample_count\":%lu,\"batch_count\":%lu,\"error_count\":%lu,\"dma_overrun_count\":%lu,\"saturation_count\":%lu,\"last_sample_ms\":%lu,\"last_hal_status\":%lu},"
+                 "\"cluster\":{\"enabled\":%u,\"name\":\"%s\",\"role\":%u,\"join_mode\":%u,\"self_node_id\":%lu,\"master_node_id\":%lu,\"term\":%lu,\"master_eligible\":%u,\"health_score\":%lu,\"health_lateness_ms\":%lu,\"health_bad_streak\":%lu,\"unix_time\":%lu,\"time_valid\":%u,\"time_source\":%u,\"time_quality\":%u,\"time_sync_count\":%lu,\"time_seq\":%lu,\"gateway_epoch\":%lu,\"gateway_node_id\":%lu,\"last_time_offset_seconds\":%ld,\"rtc_lse_ready\":%u,\"rtc_bdcr\":%lu,\"rtc_lse_drive\":%lu,\"rtc_lse_bypass\":%u},"
+                 "\"time_sync\":{\"active\":%u,\"waiting_backend\":%u,\"last_source\":%u,\"ntp_attempts\":%lu,\"ntp_successes\":%lu,\"ntp_failures\":%lu,\"backend_requests\":%lu,\"backend_successes\":%lu,\"backend_failures\":%lu,\"last_sync_ms\":%lu,\"next_attempt_ms\":%lu,\"last_error\":%lu},"
                  "\"ports\":{\"control\":41000,\"discovery\":40000,\"http\":80},"
                  "\"rtos\":{\"heap_free\":%lu,\"heap_min\":%lu},"
                  "\"control\":{\"connections\":%lu,\"commands\":%lu,\"errors\":%lu,\"listener_up\":%lu},"
@@ -992,6 +1009,32 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  mask_text,
                  gw_text,
                  (unsigned long)board_relay_snapshot(),
+                 (unsigned int)adc_state.initialized,
+                 (unsigned int)adc_state.channel_count,
+                 (unsigned long)adc_state.available_mask,
+                 (unsigned int)adc_state.vref_valid,
+                 (unsigned int)adc_state.vref_raw_average,
+                 (unsigned long)adc_state.vdda_millivolts,
+                 (unsigned int)adc_state.valid,
+                 (unsigned int)adc_state.ct_valid,
+                 (unsigned int)adc_state.signal_present,
+                 (unsigned int)adc_state.raw_latest,
+                 (unsigned int)adc_state.raw_min,
+                 (unsigned int)adc_state.raw_max,
+                 (unsigned int)adc_state.raw_average,
+                 (unsigned int)adc_state.raw_rms,
+                 (unsigned int)adc_state.millivolts,
+                 (unsigned int)adc_state.ac_rms_millivolts,
+                 (unsigned long)adc_state.current_milliamps,
+                 (unsigned long)adc_state.sample_rate_hz,
+                 (unsigned long)adc_state.window_samples,
+                 (unsigned long)adc_state.sample_count,
+                 (unsigned long)adc_state.batch_count,
+                 (unsigned long)adc_state.error_count,
+                 (unsigned long)adc_state.dma_overrun_count,
+                 (unsigned long)adc_state.saturation_count,
+                 (unsigned long)adc_state.last_sample_ms,
+                 (unsigned long)adc_state.last_hal_status,
                  (unsigned int)cluster_state.cluster_enabled,
                  cluster_state.cluster_name,
                  (unsigned int)cluster_state.role,
@@ -1013,6 +1056,24 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)cluster_state.gateway_node_id,
                  (long)cluster_state.last_time_offset_seconds,
                  (unsigned int)cluster_state.rtc_lse_ready,
+                 (unsigned long)RCC->BDCR,
+                 (unsigned long)((RCC->BDCR & RCC_BDCR_LSEDRV) >>
+                                 RCC_BDCR_LSEDRV_Pos),
+                 (unsigned int)(((RCC->BDCR & RCC_BDCR_LSEBYP) != 0U)
+                                ? 1U
+                                : 0U),
+                 (unsigned int)time_sync_stats.active,
+                 (unsigned int)time_sync_stats.waiting_backend,
+                 (unsigned int)time_sync_stats.last_source,
+                 (unsigned long)time_sync_stats.ntp_attempts,
+                 (unsigned long)time_sync_stats.ntp_successes,
+                 (unsigned long)time_sync_stats.ntp_failures,
+                 (unsigned long)time_sync_stats.backend_requests,
+                 (unsigned long)time_sync_stats.backend_successes,
+                 (unsigned long)time_sync_stats.backend_failures,
+                 (unsigned long)time_sync_stats.last_sync_ms,
+                 (unsigned long)time_sync_stats.next_attempt_ms,
+                 (unsigned long)time_sync_stats.last_error,
                  (unsigned long)heap_free,
                  (unsigned long)heap_min,
                  (unsigned long)control_stats.connections,
@@ -1266,6 +1327,12 @@ static uint8_t http_service_is_master_control_allowed(char *master_ip_text, size
   return (is_local_master != 0U) ? 1U : 0U;
 }
 
+static void http_service_request_backend_sync(void)
+{
+  g_http_backend_sync_active = 1U;
+  g_http_backend_sync_cursor = 0U;
+}
+
 static void http_service_sync_backend_config_to_cluster_async(void)
 {
   cluster_service_state_t cluster_state;
@@ -1280,7 +1347,56 @@ static void http_service_sync_backend_config_to_cluster_async(void)
       (config->cluster_enabled == 0U) ||
       (config->backend_key[0] == '\0'))
   {
+    g_http_backend_sync_active = 0U;
+    g_http_backend_sync_cursor = 0U;
     return;
+  }
+
+  nodes = cluster_service_get_nodes(&count);
+  (void)count;
+  local_auth_tag = device_config_password_tag(config);
+  for (index = g_http_backend_sync_cursor;
+       index < CLUSTER_SERVICE_NODE_CAPACITY;
+       ++index)
+  {
+    if ((nodes[index].valid == 0U) ||
+        (nodes[index].online == 0U) ||
+        (nodes[index].ip_addr == 0U) ||
+        (nodes[index].role != CLUSTER_ROLE_MEMBER) ||
+        (strcmp(nodes[index].cluster_name, config->cluster_name) != 0) ||
+        (nodes[index].auth_tag != local_auth_tag))
+    {
+      continue;
+    }
+
+    if (control_queue_submit_backend_sync_async(nodes[index].ip_addr,
+                                                config) == HAL_OK)
+    {
+      g_http_backend_sync_cursor = (uint8_t)(index + 1U);
+    }
+    return;
+  }
+
+  g_http_backend_sync_active = 0U;
+  g_http_backend_sync_cursor = 0U;
+}
+
+static uint32_t http_service_backend_sync_member_signature(void)
+{
+  cluster_service_state_t cluster_state;
+  const cluster_node_t *nodes;
+  const device_config_t *config = device_config_get();
+  uint32_t count = 0U;
+  uint32_t index;
+  uint32_t signature = 2166136261UL;
+  uint32_t member_count = 0U;
+  uint32_t local_auth_tag;
+
+  cluster_service_get_state(&cluster_state);
+  if ((cluster_state.role != CLUSTER_ROLE_MASTER) ||
+      (config->cluster_enabled == 0U))
+  {
+    return 0U;
   }
 
   nodes = cluster_service_get_nodes(&count);
@@ -1298,8 +1414,18 @@ static void http_service_sync_backend_config_to_cluster_async(void)
       continue;
     }
 
-    (void)control_queue_submit_backend_sync_async(nodes[index].ip_addr, config);
+    signature ^= nodes[index].node_id;
+    signature *= 16777619UL;
+    signature ^= nodes[index].ip_addr;
+    signature *= 16777619UL;
+    signature ^= nodes[index].auth_tag;
+    signature *= 16777619UL;
+    member_count++;
   }
+
+  signature ^= member_count;
+  signature *= 16777619UL;
+  return signature;
 }
 
 static void http_service_format_cluster_config_json(char *buffer, size_t buffer_size)
@@ -1441,7 +1567,7 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
     (void)ip4addr_ntoa_r(&ip_addr, ip_text, sizeof(ip_text));
     written = snprintf(buffer + used,
                        buffer_size - used,
-                       "%s{\"node_id\":%lu,\"ip\":%lu,\"ip_text\":\"%s\",\"role\":%u,\"term\":%lu,\"load\":%lu,\"relay_mask\":%lu,\"enabled_mask\":%lu,\"auto\":%u,\"online\":%u,\"device_state\":%u,\"same_cluster\":%u,\"controllable\":%u,\"auth_match\":%u,\"cluster_name\":\"%s\",\"name\":\"%s\",\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
+                       "%s{\"node_id\":%lu,\"ip\":%lu,\"ip_text\":\"%s\",\"role\":%u,\"term\":%lu,\"load\":%lu,\"relay_mask\":%lu,\"enabled_mask\":%lu,\"adc_valid\":%u,\"adc_ct_valid\":%u,\"adc_signal_present\":%u,\"adc_raw\":%lu,\"adc_millivolts\":%lu,\"adc_min\":%lu,\"adc_max\":%lu,\"adc_average\":%lu,\"adc_raw_rms\":%lu,\"adc_rms_millivolts\":%lu,\"adc_current_milliamps\":%lu,\"adc_sample_rate_hz\":%lu,\"adc_window_samples\":%lu,\"adc_sample_count\":%lu,\"adc_dma_overruns\":%lu,\"adc_saturation_count\":%lu,\"auto\":%u,\"online\":%u,\"device_state\":%u,\"same_cluster\":%u,\"controllable\":%u,\"auth_match\":%u,\"cluster_name\":\"%s\",\"name\":\"%s\",\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
                        (used > (size_t)20U) ? "," : "",
                        (unsigned long)nodes[index].node_id,
                        (unsigned long)nodes[index].ip_addr,
@@ -1451,6 +1577,22 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
                        (unsigned long)nodes[index].load_score,
                        (unsigned long)nodes[index].relay_mask,
                        (unsigned long)nodes[index].enabled_mask,
+                       (unsigned int)nodes[index].adc_valid,
+                       (unsigned int)nodes[index].adc_ct_valid,
+                       (unsigned int)nodes[index].adc_signal_present,
+                       (unsigned long)nodes[index].adc_raw,
+                       (unsigned long)nodes[index].adc_millivolts,
+                       (unsigned long)nodes[index].adc_min,
+                       (unsigned long)nodes[index].adc_max,
+                       (unsigned long)nodes[index].adc_average,
+                       (unsigned long)nodes[index].adc_raw_rms,
+                       (unsigned long)nodes[index].adc_rms_millivolts,
+                       (unsigned long)nodes[index].adc_current_milliamps,
+                       (unsigned long)nodes[index].adc_sample_rate_hz,
+                       (unsigned long)nodes[index].adc_window_samples,
+                       (unsigned long)nodes[index].adc_sample_count,
+                       (unsigned long)nodes[index].adc_dma_overruns,
+                       (unsigned long)nodes[index].adc_saturation_count,
                        (unsigned int)nodes[index].auto_join,
                        (unsigned int)nodes[index].online,
                        (unsigned int)nodes[index].device_state,
@@ -1491,17 +1633,31 @@ static void http_service_format_relay_config_json(char *buffer, size_t buffer_si
 
   for (index = 0U; index < DEVICE_CONFIG_RELAY_COUNT; ++index)
   {
+    adc_service_protection_state_t protection_state;
+
+    memset(&protection_state, 0, sizeof(protection_state));
+    (void)adc_service_get_protection_state((uint8_t)(index + 1U),
+                                           &protection_state);
     http_service_json_escape_copy(relay_name_json, sizeof(relay_name_json),
                                   config->relay[index].name, sizeof(config->relay[index].name));
     int written = snprintf(buffer + used,
                            buffer_size - used,
-                           "%s{\"channel\":%lu,\"name\":\"%s\",\"enabled\":%u,\"remember_state\":%u,\"boot_default_on\":%u}",
+                           "%s{\"channel\":%lu,\"name\":\"%s\",\"enabled\":%u,\"remember_state\":%u,\"boot_default_on\":%u,\"adc_channel\":%u,\"protection_enabled\":%u,\"overcurrent_milliamps\":%lu,\"trip_delay_ms\":%lu,\"reset_hysteresis_milliamps\":%lu,\"protection_above_threshold\":%u,\"protection_tripped\":%u,\"protection_trip_count\":%lu,\"protection_last_trip_ms\":%lu}",
                            (index > 0U) ? "," : "",
                            (unsigned long)(index + 1U),
                            relay_name_json,
                            (unsigned int)config->relay[index].enabled,
                            (unsigned int)config->relay[index].remember_state,
-                           (unsigned int)config->relay[index].boot_default_on);
+                           (unsigned int)config->relay[index].boot_default_on,
+                           (unsigned int)config->current[index].adc_channel,
+                           (unsigned int)config->current[index].protection_enabled,
+                           (unsigned long)config->current[index].overcurrent_milliamps,
+                           (unsigned long)config->current[index].trip_delay_ms,
+                           (unsigned long)config->current[index].reset_hysteresis_milliamps,
+                           (unsigned int)protection_state.above_threshold,
+                           (unsigned int)protection_state.tripped,
+                           (unsigned long)protection_state.trip_count,
+                           (unsigned long)protection_state.last_trip_ms);
     if ((written < 0) || ((size_t)written >= (buffer_size - used)))
     {
       break;
@@ -1647,7 +1803,12 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/cluster/nodes") == 0))
   {
     http_service_format_cluster_nodes_json(response_body, response_body_size);
-    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    return http_service_send_payload_streaming(
+      connection,
+      "200 OK",
+      "application/json",
+      (const unsigned char *)response_body,
+      strlen(response_body));
   }
 
   if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/config/relays") == 0))
@@ -1658,7 +1819,12 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
     }
     http_service_format_relay_config_json(response_body, response_body_size);
-    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    return http_service_send_payload_streaming(
+      connection,
+      "200 OK",
+      "application/json",
+      (const unsigned char *)response_body,
+      strlen(response_body));
   }
 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/login") == 0))
@@ -2076,32 +2242,8 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     {
       cluster_service_reload_from_config();
       discovery_service_force_announce();
-      {
-        cluster_service_state_t reloaded_state;
-        const cluster_node_t *nodes;
-        uint32_t count = 0U;
-        uint32_t index;
-        uint32_t local_auth_tag = device_config_password_tag(device_config_get());
-
-        cluster_service_get_state(&reloaded_state);
-        if (reloaded_state.role == CLUSTER_ROLE_MASTER)
-        {
-          nodes = cluster_service_get_nodes(&count);
-          for (index = 0U; index < CLUSTER_SERVICE_NODE_CAPACITY; ++index)
-          {
-            if ((nodes[index].valid == 0U) ||
-                (nodes[index].ip_addr == 0U) ||
-                (strcmp(nodes[index].cluster_name, reloaded_state.cluster_name) != 0) ||
-                (nodes[index].auth_tag != local_auth_tag))
-            {
-              continue;
-            }
-
-            (void)control_queue_submit_backend_sync_async(nodes[index].ip_addr, device_config_get());
-          }
-        }
-      }
     }
+    http_service_request_backend_sync();
     http_service_format_cluster_config_json(response_body, response_body_size);
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
@@ -2141,11 +2283,84 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     {
       config.relay[channel - 1U].boot_default_on = (uint8_t)value;
     }
+    if (http_service_extract_form_value(body, "adc_channel", &value))
+    {
+      if ((value >= ADC_SERVICE_CHANNEL_COUNT) &&
+          (value != DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED))
+      {
+        http_service_format_error_json(response_body, response_body_size,
+                                       "bad_adc_channel");
+        return http_service_send_payload(connection, "400 Bad Request",
+                                         "application/json", response_body);
+      }
+      config.current[channel - 1U].adc_channel = (uint8_t)value;
+    }
+    if (http_service_extract_form_value(body, "protection_enabled", &value))
+    {
+      if (value > 1U)
+      {
+        http_service_format_error_json(response_body, response_body_size,
+                                       "bad_protection_enabled");
+        return http_service_send_payload(connection, "400 Bad Request",
+                                         "application/json", response_body);
+      }
+      config.current[channel - 1U].protection_enabled = (uint8_t)value;
+    }
+    if (http_service_extract_form_value(body, "overcurrent_milliamps", &value))
+    {
+      if ((value < 100U) || (value > 100000U))
+      {
+        http_service_format_error_json(response_body, response_body_size,
+                                       "bad_overcurrent_threshold");
+        return http_service_send_payload(connection, "400 Bad Request",
+                                         "application/json", response_body);
+      }
+      config.current[channel - 1U].overcurrent_milliamps = value;
+    }
+    if (http_service_extract_form_value(body, "trip_delay_ms", &value))
+    {
+      if (value > 600000U)
+      {
+        http_service_format_error_json(response_body, response_body_size,
+                                       "bad_trip_delay");
+        return http_service_send_payload(connection, "400 Bad Request",
+                                         "application/json", response_body);
+      }
+      config.current[channel - 1U].trip_delay_ms = value;
+    }
+    if (http_service_extract_form_value(body, "reset_hysteresis_milliamps", &value))
+    {
+      if (value > 100000U)
+      {
+        http_service_format_error_json(response_body, response_body_size,
+                                       "bad_reset_hysteresis");
+        return http_service_send_payload(connection, "400 Bad Request",
+                                         "application/json", response_body);
+      }
+      config.current[channel - 1U].reset_hysteresis_milliamps = value;
+    }
 
     if (config.relay[channel - 1U].name[0] == '\0')
     {
       http_service_format_error_json(response_body, response_body_size, "bad_relay_name");
       return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+    if ((config.current[channel - 1U].protection_enabled != 0U) &&
+        (config.current[channel - 1U].adc_channel ==
+         DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED))
+    {
+      http_service_format_error_json(response_body, response_body_size,
+                                     "protection_requires_adc_channel");
+      return http_service_send_payload(connection, "400 Bad Request",
+                                       "application/json", response_body);
+    }
+    if (config.current[channel - 1U].reset_hysteresis_milliamps >=
+        config.current[channel - 1U].overcurrent_milliamps)
+    {
+      http_service_format_error_json(response_body, response_body_size,
+                                     "hysteresis_must_be_below_threshold");
+      return http_service_send_payload(connection, "400 Bad Request",
+                                       "application/json", response_body);
     }
 
     if (device_config_update_and_save(&config) == 0U)
@@ -2159,7 +2374,12 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
 
     discovery_service_force_announce();
     http_service_format_relay_config_json(response_body, response_body_size);
-    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    return http_service_send_payload_streaming(
+      connection,
+      "200 OK",
+      "application/json",
+      (const unsigned char *)response_body,
+      strlen(response_body));
   }
 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/cluster/kick") == 0))
@@ -2185,7 +2405,12 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     }
 
     http_service_format_cluster_nodes_json(response_body, response_body_size);
-    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    return http_service_send_payload_streaming(
+      connection,
+      "200 OK",
+      "application/json",
+      (const unsigned char *)response_body,
+      strlen(response_body));
   }
 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/cluster/forget") == 0))
@@ -2211,7 +2436,12 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     }
 
     http_service_format_cluster_nodes_json(response_body, response_body_size);
-    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    return http_service_send_payload_streaming(
+      connection,
+      "200 OK",
+      "application/json",
+      (const unsigned char *)response_body,
+      strlen(response_body));
   }
 
   http_service_format_error_json(response_body, response_body_size, "not_found");
@@ -2452,13 +2682,6 @@ static err_t http_service_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
   tcp_err(newpcb, http_service_error);
   tcp_sent(newpcb, http_service_sent);
   tcp_poll(newpcb, http_service_poll_close, 1);
-  if ((g_http_listener_pcb != NULL) &&
-      (http_service_active_connection_count() >= HTTP_CONN_POOL_SIZE))
-  {
-    tcp_accept(g_http_listener_pcb, NULL);
-    g_http_listener_accept_paused = 1U;
-    http_service_log_status("[http] accept pause\r\n");
-  }
   (void)snprintf(message, sizeof(message), "[http] accept active=%lu\r\n",
                  (unsigned long)http_service_active_connection_count());
   http_service_uart_write(message);
@@ -2514,15 +2737,7 @@ static void http_service_tcpip_step(void *arg)
     }
 
     tcp_accept(g_http_listener_pcb, http_service_accept);
-    g_http_listener_accept_paused = 0U;
     http_service_log_status("[http] up 80\r\n");
-  }
-  else if ((g_http_listener_accept_paused != 0U) &&
-           (http_service_active_connection_count() < HTTP_CONN_POOL_SIZE))
-  {
-    tcp_accept(g_http_listener_pcb, http_service_accept);
-    g_http_listener_accept_paused = 0U;
-    http_service_log_status("[http] accept resume\r\n");
   }
 
   g_http_last_link_up = 1U;
@@ -2546,13 +2761,26 @@ void http_service_poll(void)
 {
   err_t err;
   uint32_t now;
+  uint32_t member_signature;
 
   http_service_init();
   now = HAL_GetTick();
-  if ((int32_t)(now - g_http_backend_sync_last_ms) >= 10000)
+  member_signature = http_service_backend_sync_member_signature();
+  if (member_signature != g_http_backend_sync_member_signature)
+  {
+    g_http_backend_sync_member_signature = member_signature;
+    http_service_request_backend_sync();
+    g_http_backend_sync_last_ms = now;
+  }
+  else if ((int32_t)(now - g_http_backend_sync_last_ms) >=
+           (int32_t)HTTP_BACKEND_SYNC_FALLBACK_MS)
+  {
+    http_service_request_backend_sync();
+    g_http_backend_sync_last_ms = now;
+  }
+  if (g_http_backend_sync_active != 0U)
   {
     http_service_sync_backend_config_to_cluster_async();
-    g_http_backend_sync_last_ms = now;
   }
   if (g_http_poll_pending != 0U)
   {

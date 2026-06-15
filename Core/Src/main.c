@@ -34,6 +34,8 @@
 #include "backend_link_service.h"
 #include "mqtt_link_service.h"
 #include "discovery_service.h"
+#include "adc_service.h"
+#include "time_sync_service.h"
 #include "lwip/stats.h"
 #include "lwip/dhcp.h"
 #include "lwip/ip4_addr.h"
@@ -63,10 +65,13 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
 
 RNG_HandleTypeDef hrng;
 
 RTC_HandleTypeDef hrtc;
+
+TIM_HandleTypeDef htim2;
 
 UART_HandleTypeDef huart3;
 
@@ -108,7 +113,9 @@ static uint8_t g_last_dhcp_state = 0xFFU;
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_TIM2_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_RNG_Init(void);
 static void MX_RTC_Init(void);
@@ -254,10 +261,16 @@ static void log_startup_banner(void)
 
   cluster_service_get_state(&cluster_state);
   (void)snprintf(g_uart_message, sizeof(g_uart_message),
-                 "[boot] rtc lse=%u source=%u quality=%u\r\n",
+                 "[boot] rtc lse=%u source=%u quality=%u bdcr=0x%08lX drive=%lu bypass=%u\r\n",
                  (unsigned int)cluster_state.rtc_lse_ready,
                  (unsigned int)cluster_state.time_source,
-                 (unsigned int)cluster_state.time_quality);
+                 (unsigned int)cluster_state.time_quality,
+                 (unsigned long)RCC->BDCR,
+                 (unsigned long)((RCC->BDCR & RCC_BDCR_LSEDRV) >>
+                                 RCC_BDCR_LSEDRV_Pos),
+                 (unsigned int)(((RCC->BDCR & RCC_BDCR_LSEBYP) != 0U)
+                                ? 1U
+                                : 0U));
   uart3_write(g_uart_message);
   uart3_write("\r\n[boot] autoControl startup complete\r\n");
 }
@@ -278,6 +291,7 @@ static const char *dhcp_state_to_string(uint8_t state)
     case DHCP_STATE_BOUND: return "bound";
     case DHCP_STATE_RELEASING: return "releasing";
     case DHCP_STATE_BACKING_OFF: return "backing_off";
+    case DHCP_STATE_PERMANENT: return "permanent";
     default: return "unknown";
   }
 }
@@ -368,7 +382,9 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
+  MX_TIM2_Init();
   MX_USART3_UART_Init();
   uart3_write("\r\n[boot] uart ready\r\n");
   MX_RNG_Init();
@@ -502,14 +518,14 @@ static void MX_ADC1_Init(void)
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T2_TRGO;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 1;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.NbrOfConversion = 2;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
@@ -520,7 +536,17 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the internal voltage reference as the second conversion.
+  */
+  sConfig.Channel = ADC_CHANNEL_VREFINT;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -529,6 +555,45 @@ static void MX_ADC1_Init(void)
 
   /* USER CODE END ADC1_Init 2 */
 
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 107U;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 499U;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * Enable DMA controller clock.
+  */
+static void MX_DMA_Init(void)
+{
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 6, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 }
 
 /**
@@ -697,6 +762,7 @@ void StartDefaultTask(void const * argument)
   /* init code for LWIP */
   MX_LWIP_Init();
   uart3_write("[boot] lwip initialized\r\n");
+  adc_service_init(&hadc1, &htim2);
   next_dhcp_report_ms = HAL_GetTick() + g_dhcp_report_interval_ms;
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
@@ -729,6 +795,7 @@ void StartDefaultTask(void const * argument)
     }
 
     ethernetif_poll_tx_reclaim();
+    adc_service_poll();
 
     if ((last_stack_log_ms == 0U) || ((int32_t)(now - last_stack_log_ms) >= 5000))
     {
@@ -743,6 +810,7 @@ void StartDefaultTask(void const * argument)
     discovery_service_poll();
     backend_link_service_poll();
     mqtt_link_service_poll();
+    time_sync_service_poll();
     http_service_poll();
     cluster_service_poll();
     device_config_poll();

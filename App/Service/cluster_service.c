@@ -55,6 +55,7 @@ static StackType_t g_cluster_health_task_stack[1024];
 static void cluster_service_health_task(void *argument);
 static void cluster_service_ensure_health_task(void);
 static uint32_t cluster_service_health_score_from_lateness(uint32_t lateness_ms);
+static uint8_t cluster_service_rtc_poll_ready(void);
 
 static uint32_t cluster_service_build_gateway_epoch(uint32_t unix_time)
 {
@@ -247,6 +248,20 @@ static void cluster_service_rtc_init(void)
     reset_backup_domain = 1U;
   }
 
+  if ((RCC->BDCR & RCC_BDCR_LSEBYP) != 0U)
+  {
+    RCC->BDCR &= ~RCC_BDCR_LSEON;
+    start = HAL_GetTick();
+    while ((RCC->BDCR & RCC_BDCR_LSERDY) != 0U)
+    {
+      if ((HAL_GetTick() - start) >= 100U)
+      {
+        return;
+      }
+    }
+    RCC->BDCR &= ~RCC_BDCR_LSEBYP;
+  }
+
   RCC->BDCR |= RCC_BDCR_LSEON;
   start = HAL_GetTick();
   while ((RCC->BDCR & RCC_BDCR_LSERDY) == 0U)
@@ -274,6 +289,48 @@ static void cluster_service_rtc_init(void)
     }
   }
   g_cluster_context.state.rtc_lse_ready = 1U;
+}
+
+static uint8_t cluster_service_rtc_poll_ready(void)
+{
+  uint32_t restored_unix_time;
+
+  if ((g_cluster_context.state.rtc_lse_ready != 0U) ||
+      ((RCC->BDCR & RCC_BDCR_LSERDY) == 0U))
+  {
+    return 0U;
+  }
+
+  RCC->BDCR = (RCC->BDCR & ~RCC_BDCR_RTCSEL) |
+              RCC_BDCR_RTCSEL_0 | RCC_BDCR_RTCEN;
+  g_cluster_context.state.rtc_lse_ready = 1U;
+
+  if (g_cluster_context.software_time_base_unix != 0U)
+  {
+    uint8_t valid;
+    uint32_t unix_time = cluster_service_get_unix_time(&valid);
+
+    if (valid != 0U)
+    {
+      (void)cluster_service_rtc_write(unix_time);
+    }
+  }
+  else if (cluster_service_rtc_read(&restored_unix_time) != 0U)
+  {
+    g_cluster_context.state.time_valid = 1U;
+    g_cluster_context.state.time_source = CLUSTER_TIME_SOURCE_RTC;
+    g_cluster_context.state.time_quality = CLUSTER_TIME_QUALITY_RTC_HOLDOVER;
+    g_cluster_context.state.unix_time = restored_unix_time;
+    g_cluster_context.state.time_seq = 1U;
+    g_cluster_context.state.gateway_epoch =
+      cluster_service_build_gateway_epoch(restored_unix_time);
+    g_cluster_context.state.gateway_node_id =
+      g_cluster_context.state.self_node_id;
+    g_cluster_context.software_time_base_unix = restored_unix_time;
+    g_cluster_context.software_time_base_tick = HAL_GetTick();
+  }
+
+  return 1U;
 }
 
 static void cluster_service_mark_backend_dirty(void)
@@ -869,8 +926,10 @@ void cluster_service_poll(void)
 {
   cluster_role_t previous_role;
   uint32_t previous_master_node_id;
+  uint8_t rtc_became_ready;
 
   cluster_service_init();
+  rtc_became_ready = cluster_service_rtc_poll_ready();
   if (netif_is_link_up(&gnetif) != 0)
   {
     cluster_service_ensure_health_task();
@@ -881,7 +940,8 @@ void cluster_service_poll(void)
   cluster_service_recount_nodes();
   cluster_service_run_election();
   if ((previous_role != g_cluster_context.state.role) ||
-      (previous_master_node_id != g_cluster_context.state.master_node_id))
+      (previous_master_node_id != g_cluster_context.state.master_node_id) ||
+      (rtc_became_ready != 0U))
   {
     cluster_service_mark_backend_dirty();
   }
@@ -995,11 +1055,15 @@ uint8_t cluster_service_set_unix_time(uint32_t unix_time, uint8_t source)
   g_cluster_context.software_time_base_tick = HAL_GetTick();
   g_cluster_context.state.time_valid = 1U;
   g_cluster_context.state.time_source = source;
-  if (source == CLUSTER_TIME_SOURCE_MQTT)
+  if ((source == CLUSTER_TIME_SOURCE_MQTT) ||
+      (source == CLUSTER_TIME_SOURCE_NTP) ||
+      (source == CLUSTER_TIME_SOURCE_BACKEND))
   {
     if ((g_cluster_context.state.gateway_epoch == 0U) ||
         (g_cluster_context.state.gateway_node_id != g_cluster_context.state.self_node_id) ||
-        (previous_source != CLUSTER_TIME_SOURCE_MQTT))
+        ((previous_source != CLUSTER_TIME_SOURCE_MQTT) &&
+         (previous_source != CLUSTER_TIME_SOURCE_NTP) &&
+         (previous_source != CLUSTER_TIME_SOURCE_BACKEND)))
     {
       g_cluster_context.state.gateway_epoch =
         cluster_service_build_gateway_epoch(unix_time);

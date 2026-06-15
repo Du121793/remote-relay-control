@@ -18,7 +18,11 @@ extern "C" {
 #define DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN 96U
 #define DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN   128U
 #define DEVICE_CONFIG_MAGIC                  0x43464731UL
-#define DEVICE_CONFIG_VERSION                5U
+#define DEVICE_CONFIG_VERSION                6U
+#define DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED 255U
+#define DEVICE_CONFIG_OVERCURRENT_DEFAULT_MA 4500U
+#define DEVICE_CONFIG_OVERCURRENT_DELAY_MS   1000U
+#define DEVICE_CONFIG_OVERCURRENT_HYST_MA    500U
 
 typedef struct
 {
@@ -28,6 +32,16 @@ typedef struct
   uint8_t reserved;
   char name[DEVICE_CONFIG_NAME_MAX_LEN];
 } device_config_relay_t;
+
+typedef struct
+{
+  uint8_t adc_channel;
+  uint8_t protection_enabled;
+  uint16_t reserved;
+  uint32_t overcurrent_milliamps;
+  uint32_t trip_delay_ms;
+  uint32_t reset_hysteresis_milliamps;
+} device_config_current_t;
 
 typedef struct
 {
@@ -58,6 +72,7 @@ typedef struct
   char cloud_cluster_binding_secret[DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN];
   uint32_t saved_relay_mask;
   device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
+  device_config_current_t current[DEVICE_CONFIG_RELAY_COUNT];
 } device_config_t;
 
 void device_config_build_defaults(device_config_t *config);

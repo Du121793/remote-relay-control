@@ -58,6 +58,22 @@ typedef struct
   uint32_t time_seq;
   uint32_t gateway_epoch;
   uint32_t gateway_node_id;
+  uint8_t adc_valid;
+  uint8_t adc_ct_valid;
+  uint8_t adc_signal_present;
+  uint32_t adc_raw;
+  uint32_t adc_millivolts;
+  uint32_t adc_min;
+  uint32_t adc_max;
+  uint32_t adc_average;
+  uint32_t adc_raw_rms;
+  uint32_t adc_rms_millivolts;
+  uint32_t adc_current_milliamps;
+  uint32_t adc_sample_rate_hz;
+  uint32_t adc_window_samples;
+  uint32_t adc_sample_count;
+  uint32_t adc_dma_overruns;
+  uint32_t adc_saturation_count;
   char node_name[CLUSTER_SERVICE_DEVICE_NAME_LEN];
   char cluster_name[CLUSTER_SERVICE_CLUSTER_NAME_LEN];
   char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
@@ -97,6 +113,8 @@ typedef struct
 #define CLUSTER_TIME_SOURCE_MQTT       1U
 #define CLUSTER_TIME_SOURCE_MASTER     2U
 #define CLUSTER_TIME_SOURCE_RTC        3U
+#define CLUSTER_TIME_SOURCE_NTP        4U
+#define CLUSTER_TIME_SOURCE_BACKEND    5U
 
 #define CLUSTER_TIME_QUALITY_INVALID       0U
 #define CLUSTER_TIME_QUALITY_CLUSTER       1U

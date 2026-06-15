@@ -1,10 +1,12 @@
 #include "backend_link_service.h"
 
+#include "adc_service.h"
 #include "cluster_service.h"
 #include "control_queue.h"
 #include "control_proto.h"
 #include "discovery_service.h"
 #include "fault_service.h"
+#include "time_sync_service.h"
 #include "../Config/device_config.h"
 #include "../Platform/board_relay.h"
 
@@ -30,7 +32,7 @@
 #define BACKEND_LINK_SEND_TIMEOUT_MS            500UL
 #define BACKEND_LINK_SEND_RETRY_DELAY_MS          5UL
 #define BACKEND_LINK_RX_BUFFER_SIZE            512U
-#define BACKEND_LINK_TX_BUFFER_SIZE            4096U
+#define BACKEND_LINK_TX_BUFFER_SIZE            24576U
 
 extern struct netif gnetif;
 
@@ -41,6 +43,7 @@ typedef struct
   uint8_t status_dirty;
   uint8_t last_should_run;
   uint8_t last_should_run_reason;
+  volatile uint8_t time_request_pending;
   int sock;
   uint32_t last_connect_attempt_ms;
   uint32_t last_heartbeat_ms;
@@ -62,6 +65,21 @@ static backend_link_context_t g_backend_link_context;
 static void backend_link_log(const char *text);
 static void backend_link_log_reason(const char *prefix, uint32_t value);
 static uint8_t backend_link_should_run_reason(void);
+
+uint8_t backend_link_service_request_time(void)
+{
+  taskENTER_CRITICAL();
+  g_backend_link_context.time_request_pending = 1U;
+  taskEXIT_CRITICAL();
+  return 1U;
+}
+
+void backend_link_service_cancel_time_request(void)
+{
+  taskENTER_CRITICAL();
+  g_backend_link_context.time_request_pending = 0U;
+  taskEXIT_CRITICAL();
+}
 
 void backend_link_service_mark_status_dirty(void)
 {
@@ -578,6 +596,7 @@ static int backend_link_send_status(void)
   char cloud_key_id_json[DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U];
   char cloud_cluster_ca_fingerprint_json[DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 2U];
   cluster_service_state_t cluster_state;
+  adc_service_state_t adc_state;
   const cluster_node_t *nodes;
   const device_config_t *config = device_config_get();
   const uint32_t relay_mask = board_relay_snapshot();
@@ -586,6 +605,7 @@ static int backend_link_send_status(void)
   uint32_t index;
 
   cluster_service_get_state(&cluster_state);
+  adc_service_get_state(&adc_state);
   nodes = cluster_service_get_nodes(&count);
   backend_link_build_ip_text(ip_text, sizeof(ip_text));
   backend_link_json_escape_copy(device_json, sizeof(device_json), config->device_name);
@@ -597,7 +617,7 @@ static int backend_link_send_status(void)
 
   used = (size_t)snprintf(g_backend_link_context.tx_buffer,
                           sizeof(g_backend_link_context.tx_buffer),
-                          "{\"type\":\"status\",\"device\":\"%s\",\"cluster\":\"%s\",\"node_id\":%lu,\"master_node_id\":%lu,\"role\":%u,\"term\":%lu,\"relay_mask\":%lu,\"device_state\":%u,\"ip\":\"%s\",\"uptime_ms\":%lu,\"unix_time\":%lu,\"time_valid\":%u,\"time_source\":%u,\"time_quality\":%u,\"time_seq\":%lu,\"gateway_epoch\":%lu,\"gateway_node_id\":%lu,\"cloud_transport\":%u,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\",\"cloud_cluster_ca_fingerprint\":\"%s\",\"nodes\":[{\"node_id\":%lu,\"name\":\"%s\",\"ip\":\"%s\",\"role\":%u,\"online\":1,\"device_state\":%u,\"relay_mask\":%lu,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
+                          "{\"type\":\"status\",\"device\":\"%s\",\"cluster\":\"%s\",\"node_id\":%lu,\"master_node_id\":%lu,\"role\":%u,\"term\":%lu,\"relay_mask\":%lu,\"device_state\":%u,\"ip\":\"%s\",\"uptime_ms\":%lu,\"unix_time\":%lu,\"time_valid\":%u,\"time_source\":%u,\"time_quality\":%u,\"time_seq\":%lu,\"gateway_epoch\":%lu,\"gateway_node_id\":%lu,\"adc_valid\":%u,\"adc_ct_valid\":%u,\"adc_signal_present\":%u,\"adc_raw\":%u,\"adc_millivolts\":%u,\"adc_min\":%u,\"adc_max\":%u,\"adc_average\":%u,\"adc_raw_rms\":%u,\"adc_rms_millivolts\":%u,\"adc_current_milliamps\":%lu,\"adc_sample_rate_hz\":%lu,\"adc_window_samples\":%lu,\"adc_sample_count\":%lu,\"adc_dma_overruns\":%lu,\"adc_saturation_count\":%lu,\"cloud_transport\":%u,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\",\"cloud_cluster_ca_fingerprint\":\"%s\",\"nodes\":[{\"node_id\":%lu,\"name\":\"%s\",\"ip\":\"%s\",\"role\":%u,\"online\":1,\"device_state\":%u,\"relay_mask\":%lu,\"adc_valid\":%u,\"adc_ct_valid\":%u,\"adc_signal_present\":%u,\"adc_raw\":%u,\"adc_millivolts\":%u,\"adc_min\":%u,\"adc_max\":%u,\"adc_average\":%u,\"adc_raw_rms\":%u,\"adc_rms_millivolts\":%u,\"adc_current_milliamps\":%lu,\"adc_sample_rate_hz\":%lu,\"adc_window_samples\":%lu,\"adc_sample_count\":%lu,\"adc_dma_overruns\":%lu,\"adc_saturation_count\":%lu,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
                           device_json,
                           cluster_json,
                           (unsigned long)cluster_state.self_node_id,
@@ -615,6 +635,22 @@ static int backend_link_send_status(void)
                           (unsigned long)cluster_state.time_seq,
                           (unsigned long)cluster_state.gateway_epoch,
                           (unsigned long)cluster_state.gateway_node_id,
+                          (unsigned int)adc_state.valid,
+                          (unsigned int)adc_state.ct_valid,
+                          (unsigned int)adc_state.signal_present,
+                          (unsigned int)adc_state.raw_latest,
+                          (unsigned int)adc_state.millivolts,
+                          (unsigned int)adc_state.raw_min,
+                          (unsigned int)adc_state.raw_max,
+                          (unsigned int)adc_state.raw_average,
+                          (unsigned int)adc_state.raw_rms,
+                          (unsigned int)adc_state.ac_rms_millivolts,
+                          (unsigned long)adc_state.current_milliamps,
+                          (unsigned long)adc_state.sample_rate_hz,
+                          (unsigned long)adc_state.window_samples,
+                          (unsigned long)adc_state.sample_count,
+                          (unsigned long)adc_state.dma_overrun_count,
+                          (unsigned long)adc_state.saturation_count,
                           (unsigned int)config->cloud_transport,
                           cloud_cluster_id_json,
                           cloud_device_id_json,
@@ -626,6 +662,22 @@ static int backend_link_send_status(void)
                           (unsigned int)cluster_state.role,
                           (unsigned int)CLUSTER_DEVICE_STATE_RUNNING,
                           (unsigned long)relay_mask,
+                          (unsigned int)adc_state.valid,
+                          (unsigned int)adc_state.ct_valid,
+                          (unsigned int)adc_state.signal_present,
+                          (unsigned int)adc_state.raw_latest,
+                          (unsigned int)adc_state.millivolts,
+                          (unsigned int)adc_state.raw_min,
+                          (unsigned int)adc_state.raw_max,
+                          (unsigned int)adc_state.raw_average,
+                          (unsigned int)adc_state.raw_rms,
+                          (unsigned int)adc_state.ac_rms_millivolts,
+                          (unsigned long)adc_state.current_milliamps,
+                          (unsigned long)adc_state.sample_rate_hz,
+                          (unsigned long)adc_state.window_samples,
+                          (unsigned long)adc_state.sample_count,
+                          (unsigned long)adc_state.dma_overrun_count,
+                          (unsigned long)adc_state.saturation_count,
                           cloud_cluster_id_json,
                           cloud_device_id_json,
                           cloud_key_id_json);
@@ -654,7 +706,7 @@ static int backend_link_send_status(void)
 
     written = snprintf(g_backend_link_context.tx_buffer + used,
                        sizeof(g_backend_link_context.tx_buffer) - used,
-                       ",{\"node_id\":%lu,\"name\":\"%s\",\"ip\":\"%s\",\"role\":%u,\"online\":%u,\"device_state\":%u,\"relay_mask\":%lu,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
+                       ",{\"node_id\":%lu,\"name\":\"%s\",\"ip\":\"%s\",\"role\":%u,\"online\":%u,\"device_state\":%u,\"relay_mask\":%lu,\"adc_valid\":%u,\"adc_ct_valid\":%u,\"adc_signal_present\":%u,\"adc_raw\":%lu,\"adc_millivolts\":%lu,\"adc_min\":%lu,\"adc_max\":%lu,\"adc_average\":%lu,\"adc_raw_rms\":%lu,\"adc_rms_millivolts\":%lu,\"adc_current_milliamps\":%lu,\"adc_sample_rate_hz\":%lu,\"adc_window_samples\":%lu,\"adc_sample_count\":%lu,\"adc_dma_overruns\":%lu,\"adc_saturation_count\":%lu,\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
                        (unsigned long)nodes[index].node_id,
                        node_name_json,
                        node_ip_text,
@@ -662,6 +714,22 @@ static int backend_link_send_status(void)
                        (unsigned int)nodes[index].online,
                        (unsigned int)nodes[index].device_state,
                        (unsigned long)nodes[index].relay_mask,
+                       (unsigned int)nodes[index].adc_valid,
+                       (unsigned int)nodes[index].adc_ct_valid,
+                       (unsigned int)nodes[index].adc_signal_present,
+                       (unsigned long)nodes[index].adc_raw,
+                       (unsigned long)nodes[index].adc_millivolts,
+                       (unsigned long)nodes[index].adc_min,
+                       (unsigned long)nodes[index].adc_max,
+                       (unsigned long)nodes[index].adc_average,
+                       (unsigned long)nodes[index].adc_raw_rms,
+                       (unsigned long)nodes[index].adc_rms_millivolts,
+                       (unsigned long)nodes[index].adc_current_milliamps,
+                       (unsigned long)nodes[index].adc_sample_rate_hz,
+                       (unsigned long)nodes[index].adc_window_samples,
+                       (unsigned long)nodes[index].adc_sample_count,
+                       (unsigned long)nodes[index].adc_dma_overruns,
+                       (unsigned long)nodes[index].adc_saturation_count,
                        node_cloud_cluster_id_json,
                        node_cloud_device_id_json,
                        node_cloud_key_id_json);
@@ -764,6 +832,20 @@ static void backend_link_handle_command_line(const char *line)
   if (strstr(line, "\"type\":\"ping\"") != NULL)
   {
     (void)backend_link_send_heartbeat();
+    return;
+  }
+
+  if (strstr(line, "\"type\":\"time_sync\"") != NULL)
+  {
+    uint32_t unix_time;
+
+    if ((backend_link_extract_json_u32(line,
+                                       "unix_time",
+                                       &unix_time) == 0U) ||
+        (time_sync_service_apply_backend_time(unix_time) == 0U))
+    {
+      g_backend_link_context.stats.command_errors++;
+    }
     return;
   }
 
@@ -1086,6 +1168,23 @@ static void backend_link_task(void const *argument)
       {
         g_backend_link_context.status_dirty = 0U;
         g_backend_link_context.last_status_ms = now;
+      }
+    }
+
+    if (g_backend_link_context.time_request_pending != 0U)
+    {
+      char request[128];
+      int written = snprintf(request,
+                             sizeof(request),
+                             "{\"type\":\"time_request\",\"uptime_ms\":%lu}\n",
+                             (unsigned long)now);
+      if ((written > 0) &&
+          ((size_t)written < sizeof(request)) &&
+          (backend_link_send_json(request) == 0))
+      {
+        taskENTER_CRITICAL();
+        g_backend_link_context.time_request_pending = 0U;
+        taskEXIT_CRITICAL();
       }
     }
 

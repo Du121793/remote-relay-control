@@ -70,8 +70,8 @@
 #define PBUF_POOL_SIZE 32
 /*----- Value in opt.h for MEM_ALIGNMENT: 1 -----*/
 #define MEM_ALIGNMENT 4
-/*----- Default Value for F7 devices: 0x20048000 -----*/
-#define LWIP_RAM_HEAP_POINTER 0x20048000
+/*----- Reserve the top 48 KiB of SRAM for the lwIP heap -----*/
+#define LWIP_RAM_HEAP_POINTER 0x20070000
 /*----- Value in opt.h for MEMP_NUM_SYS_TIMEOUT: (LWIP_TCP + IP_REASSEMBLY + LWIP_ARP + (2*LWIP_DHCP) + LWIP_AUTOIP + LWIP_IGMP + LWIP_DNS + (PPP_SUPPORT*6*MEMP_NUM_PPP_PCB) + (LWIP_IPV6 ? (1 + LWIP_IPV6_REASS + LWIP_IPV6_MLD) : 0)) -*/
 #define MEMP_NUM_SYS_TIMEOUT 16
 /*----- Value in opt.h for LWIP_ETHERNET: LWIP_ARP || PPPOE_SUPPORT -*/
@@ -92,8 +92,9 @@
 #define LWIP_NETIF_LINK_CALLBACK 1
 /*----- Value in opt.h for LWIP_IGMP: 0 -----*/
 #define LWIP_IGMP 1
-/*----- Value in opt.h for TCPIP_THREAD_STACKSIZE: 0 -----*/
-#define TCPIP_THREAD_STACKSIZE 1024
+/* TLS receive and MQTT callbacks are nested on tcpip_thread. CMSIS-RTOS v1
+   passes this value to FreeRTOS as StackType_t units, so 2560 reserves 10 KiB. */
+#define TCPIP_THREAD_STACKSIZE 2560
 /*----- Value in opt.h for TCPIP_THREAD_PRIO: 1 -----*/
 #define TCPIP_THREAD_PRIO osPriorityNormal
 /*----- Value in opt.h for TCPIP_MBOX_SIZE: 0 -----*/

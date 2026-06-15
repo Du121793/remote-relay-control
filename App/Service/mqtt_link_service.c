@@ -1,5 +1,6 @@
 #include "mqtt_link_service.h"
 
+#include "adc_service.h"
 #include "cluster_service.h"
 #include "control_queue.h"
 #include "fault_service.h"
@@ -31,6 +32,7 @@
 #define MQTT_LINK_KEEP_ALIVE_SECONDS     20U
 #define MQTT_LINK_PSK_MAX_LEN            32U
 #define MQTT_LINK_PAYLOAD_MAX_LEN        512U
+#define MQTT_LINK_STATUS_PAYLOAD_MAX_LEN 1024U
 #define MQTT_LINK_COMMAND_MAX_LEN        384U
 #define MQTT_LINK_REQUEST_ID_MAX_LEN     64U
 #define MQTT_LINK_ACK_TOPIC_MAX_LEN      192U
@@ -608,32 +610,62 @@ static void mqtt_link_publish_heartbeat(void)
 static err_t mqtt_link_publish_status(void)
 {
   err_t error;
-  char payload[MQTT_LINK_PAYLOAD_MAX_LEN];
+  int written;
+  static char payload[MQTT_LINK_STATUS_PAYLOAD_MAX_LEN];
   cluster_service_state_t cluster_state;
+  adc_service_state_t adc_state;
 
   cluster_service_get_state(&cluster_state);
-  (void)snprintf(payload, sizeof(payload),
-                 "{\"type\":\"status\",\"online\":1,\"cluster_id\":\"%s\","
-                 "\"device_id\":\"%s\",\"node_id\":%lu,\"master_node_id\":%lu,"
-                 "\"role\":%u,\"term\":%lu,\"relay_mask\":%lu,"
-                 "\"uptime_ms\":%lu,\"unix_time\":%lu,\"time_valid\":%u,"
-                 "\"time_source\":%u,\"time_quality\":%u,\"time_seq\":%lu,"
-                 "\"gateway_epoch\":%lu,\"gateway_node_id\":%lu}",
-                 g_mqtt_link_context.cloud_cluster_id,
-                 g_mqtt_link_context.cloud_device_id,
-                 (unsigned long)cluster_state.self_node_id,
-                 (unsigned long)cluster_state.master_node_id,
-                 (unsigned int)cluster_state.role,
-                 (unsigned long)cluster_state.term,
-                 (unsigned long)board_relay_snapshot(),
-                 (unsigned long)HAL_GetTick(),
-                 (unsigned long)cluster_state.unix_time,
-                 (unsigned int)cluster_state.time_valid,
-                 (unsigned int)cluster_state.time_source,
-                 (unsigned int)cluster_state.time_quality,
-                 (unsigned long)cluster_state.time_seq,
-                 (unsigned long)cluster_state.gateway_epoch,
-                 (unsigned long)cluster_state.gateway_node_id);
+  adc_service_get_state(&adc_state);
+  written = snprintf(payload, sizeof(payload),
+                     "{\"type\":\"status\",\"online\":1,\"cluster_id\":\"%s\","
+                     "\"device_id\":\"%s\",\"node_id\":%lu,\"master_node_id\":%lu,"
+                     "\"role\":%u,\"term\":%lu,\"relay_mask\":%lu,"
+                     "\"uptime_ms\":%lu,\"unix_time\":%lu,\"time_valid\":%u,"
+                     "\"time_source\":%u,\"time_quality\":%u,\"time_seq\":%lu,"
+                     "\"gateway_epoch\":%lu,\"gateway_node_id\":%lu,"
+                     "\"adc_valid\":%u,\"adc_ct_valid\":%u,\"adc_signal_present\":%u,"
+                     "\"adc_raw\":%u,\"adc_millivolts\":%u,\"adc_min\":%u,"
+                     "\"adc_max\":%u,\"adc_average\":%u,\"adc_raw_rms\":%u,"
+                     "\"adc_rms_millivolts\":%u,\"adc_current_milliamps\":%lu,"
+                     "\"adc_sample_rate_hz\":%lu,\"adc_window_samples\":%lu,"
+                     "\"adc_sample_count\":%lu,\"adc_dma_overruns\":%lu,"
+                     "\"adc_saturation_count\":%lu}",
+                     g_mqtt_link_context.cloud_cluster_id,
+                     g_mqtt_link_context.cloud_device_id,
+                     (unsigned long)cluster_state.self_node_id,
+                     (unsigned long)cluster_state.master_node_id,
+                     (unsigned int)cluster_state.role,
+                     (unsigned long)cluster_state.term,
+                     (unsigned long)board_relay_snapshot(),
+                     (unsigned long)HAL_GetTick(),
+                     (unsigned long)cluster_state.unix_time,
+                     (unsigned int)cluster_state.time_valid,
+                     (unsigned int)cluster_state.time_source,
+                     (unsigned int)cluster_state.time_quality,
+                     (unsigned long)cluster_state.time_seq,
+                     (unsigned long)cluster_state.gateway_epoch,
+                     (unsigned long)cluster_state.gateway_node_id,
+                     (unsigned int)adc_state.valid,
+                     (unsigned int)adc_state.ct_valid,
+                     (unsigned int)adc_state.signal_present,
+                     (unsigned int)adc_state.raw_latest,
+                     (unsigned int)adc_state.millivolts,
+                     (unsigned int)adc_state.raw_min,
+                     (unsigned int)adc_state.raw_max,
+                     (unsigned int)adc_state.raw_average,
+                     (unsigned int)adc_state.raw_rms,
+                     (unsigned int)adc_state.ac_rms_millivolts,
+                     (unsigned long)adc_state.current_milliamps,
+                     (unsigned long)adc_state.sample_rate_hz,
+                     (unsigned long)adc_state.window_samples,
+                     (unsigned long)adc_state.sample_count,
+                     (unsigned long)adc_state.dma_overrun_count,
+                     (unsigned long)adc_state.saturation_count);
+  if ((written < 0) || ((size_t)written >= sizeof(payload)))
+  {
+    return ERR_BUF;
+  }
   error = mqtt_link_publish(g_mqtt_link_context.stats.topic_status,
                             payload,
                             1U,
@@ -827,6 +859,9 @@ static void mqtt_link_publish_ack(const char *request_id,
 
 static void mqtt_link_apply_pending_time(void)
 {
+  cluster_service_state_t cluster_state;
+  uint8_t current_valid;
+  uint32_t current_time;
   uint32_t unix_time;
   uint32_t target_node_id;
   char request_id[MQTT_LINK_REQUEST_ID_MAX_LEN];
@@ -844,6 +879,18 @@ static void mqtt_link_apply_pending_time(void)
          sizeof(request_id));
   g_mqtt_link_context.time_request_pending = 0U;
   taskEXIT_CRITICAL();
+
+  cluster_service_get_state(&cluster_state);
+  current_time = cluster_service_get_unix_time(&current_valid);
+  if ((current_valid != 0U) &&
+      ((cluster_state.time_source == CLUSTER_TIME_SOURCE_NTP) ||
+       (cluster_state.time_source == CLUSTER_TIME_SOURCE_BACKEND)) &&
+      (((int64_t)unix_time - (int64_t)current_time) >= -2LL) &&
+      (((int64_t)unix_time - (int64_t)current_time) <= 2LL))
+  {
+    mqtt_link_enqueue_ack(request_id, 1U, 1U, 1U, "", target_node_id);
+    return;
+  }
 
   if (cluster_service_set_unix_time(unix_time,
                                     CLUSTER_TIME_SOURCE_MQTT) == 0U)
@@ -1043,6 +1090,83 @@ static void mqtt_link_process_command(void)
       {
         relay_config.boot_default_on = (uint8_t)value;
         relay_config.fields |= CONTROL_QUEUE_RELAY_CONFIG_BOOT_PRESENT;
+      }
+    }
+    if (strstr(g_mqtt_link_context.rx_payload, "\"adc_channel\"") != NULL)
+    {
+      if ((mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload,
+                                      "adc_channel",
+                                      &value) == 0U) ||
+          ((value >= ADC_SERVICE_CHANNEL_COUNT) &&
+           (value != DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED)))
+      {
+        malformed = 1U;
+      }
+      else
+      {
+        relay_config.adc_channel = (uint8_t)value;
+        relay_config.fields |= CONTROL_QUEUE_RELAY_CONFIG_ADC_PRESENT;
+      }
+    }
+    if (strstr(g_mqtt_link_context.rx_payload, "\"protection_enabled\"") != NULL)
+    {
+      if ((mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload,
+                                      "protection_enabled",
+                                      &value) == 0U) ||
+          (value > 1U))
+      {
+        malformed = 1U;
+      }
+      else
+      {
+        relay_config.protection_enabled = (uint8_t)value;
+        relay_config.fields |= CONTROL_QUEUE_RELAY_CONFIG_PROTECTION_PRESENT;
+      }
+    }
+    if (strstr(g_mqtt_link_context.rx_payload, "\"overcurrent_milliamps\"") != NULL)
+    {
+      if ((mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload,
+                                      "overcurrent_milliamps",
+                                      &value) == 0U) ||
+          (value < 100U) || (value > 100000U))
+      {
+        malformed = 1U;
+      }
+      else
+      {
+        relay_config.overcurrent_milliamps = value;
+        relay_config.fields |= CONTROL_QUEUE_RELAY_CONFIG_THRESHOLD_PRESENT;
+      }
+    }
+    if (strstr(g_mqtt_link_context.rx_payload, "\"trip_delay_ms\"") != NULL)
+    {
+      if ((mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload,
+                                      "trip_delay_ms",
+                                      &value) == 0U) ||
+          (value > 600000U))
+      {
+        malformed = 1U;
+      }
+      else
+      {
+        relay_config.trip_delay_ms = value;
+        relay_config.fields |= CONTROL_QUEUE_RELAY_CONFIG_DELAY_PRESENT;
+      }
+    }
+    if (strstr(g_mqtt_link_context.rx_payload,
+               "\"reset_hysteresis_milliamps\"") != NULL)
+    {
+      if ((mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload,
+                                      "reset_hysteresis_milliamps",
+                                      &value) == 0U) ||
+          (value > 100000U))
+      {
+        malformed = 1U;
+      }
+      else
+      {
+        relay_config.reset_hysteresis_milliamps = value;
+        relay_config.fields |= CONTROL_QUEUE_RELAY_CONFIG_HYSTERESIS_PRESENT;
       }
     }
 

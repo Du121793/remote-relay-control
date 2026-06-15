@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define DISCOVERY_PROTO_ANNOUNCE_MAX_SIZE 768U
+#define DISCOVERY_PROTO_ANNOUNCE_MAX_SIZE 1024U
 
 int discovery_proto_build_announce(char *buffer,
                                    size_t buffer_size,
@@ -36,6 +36,22 @@ int discovery_proto_build_announce(char *buffer,
                                    uint32_t time_seq,
                                    uint32_t gateway_epoch,
                                    uint32_t gateway_node_id,
+                                   uint8_t adc_valid,
+                                   uint8_t adc_ct_valid,
+                                   uint8_t adc_signal_present,
+                                   uint32_t adc_raw,
+                                   uint32_t adc_millivolts,
+                                   uint32_t adc_min,
+                                   uint32_t adc_max,
+                                   uint32_t adc_average,
+                                   uint32_t adc_raw_rms,
+                                   uint32_t adc_rms_millivolts,
+                                   uint32_t adc_current_milliamps,
+                                   uint32_t adc_sample_rate_hz,
+                                   uint32_t adc_window_samples,
+                                   uint32_t adc_sample_count,
+                                   uint32_t adc_dma_overruns,
+                                   uint32_t adc_saturation_count,
                                    const char *ip_text,
                                    uint16_t port,
                                    const uint8_t mac[6]);
@@ -63,6 +79,22 @@ typedef struct
   uint32_t time_seq;
   uint32_t gateway_epoch;
   uint32_t gateway_node_id;
+  uint8_t adc_valid;
+  uint8_t adc_ct_valid;
+  uint8_t adc_signal_present;
+  uint32_t adc_raw;
+  uint32_t adc_millivolts;
+  uint32_t adc_min;
+  uint32_t adc_max;
+  uint32_t adc_average;
+  uint32_t adc_raw_rms;
+  uint32_t adc_rms_millivolts;
+  uint32_t adc_current_milliamps;
+  uint32_t adc_sample_rate_hz;
+  uint32_t adc_window_samples;
+  uint32_t adc_sample_count;
+  uint32_t adc_dma_overruns;
+  uint32_t adc_saturation_count;
   char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
   char cloud_device_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
   char cloud_key_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];

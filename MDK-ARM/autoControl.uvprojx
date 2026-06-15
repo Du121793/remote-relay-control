@@ -19,7 +19,7 @@
           <Vendor>STMicroelectronics</Vendor>
           <PackID>Keil.STM32F7xx_DFP.3.1.1</PackID>
           <PackURL>https://www.keil.com/pack/</PackURL>
-          <Cpu>IRAM(0x20000000,0x00020000) IRAM2(0x20020000,0x0005C000) IROM(0x08000000,0x00200000) IROM2(0x00200000,0x00200000) XRAM(0x2007C000,0x00004000) XRAM2(0x40024000,0x00001000) XRAM3(0x00000000,0x00004000) CPUTYPE("Cortex-M7") FPU3(DFPU) DSP CLOCK(12000000) ELITTLE</Cpu>
+          <Cpu>IRAM(0x20000000,0x00020000) IRAM2(0x20020000,0x00050000) IROM(0x08000000,0x00200000) IROM2(0x00200000,0x00200000) XRAM(0x2007C000,0x00004000) XRAM2(0x40024000,0x00001000) XRAM3(0x00000000,0x00004000) CPUTYPE("Cortex-M7") FPU3(DFPU) DSP CLOCK(12000000) ELITTLE</Cpu>
           <FlashUtilSpec></FlashUtilSpec>
           <StartupFile></StartupFile>
           <FlashDriverDll>UL2CM3(-S0 -C0 -P0 -FD20020000 -FC1000 -FN2 -FF0STM32F7x_2048 -FS08000000 -FL0200000 -FF1STM32F7xTCM_2048 -FS1200000 -FL1200000 -FP0($$Device:STM32F767ZITx$CMSIS\Flash\STM32F7x_2048.FLM) -FP1($$Device:STM32F767ZITx$CMSIS\Flash\STM32F7xTCM_2048.FLM))</FlashDriverDll>
@@ -308,7 +308,7 @@
               <OCR_RVCT10>
                 <Type>0</Type>
                 <StartAddress>0x20020000</StartAddress>
-                <Size>0x5c000</Size>
+                <Size>0x50000</Size>
               </OCR_RVCT10>
             </OnChipMemories>
             <RvctStartVector></RvctStartVector>
@@ -541,6 +541,16 @@
               <FileType>1</FileType>
               <FilePath>../App/Service/fault_service.c</FilePath>
             </File>
+            <File>
+              <FileName>adc_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Service/adc_service.c</FilePath>
+            </File>
+            <File>
+              <FileName>time_sync_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Service/time_sync_service.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -556,6 +566,11 @@
         <Group>
           <GroupName>Application/User/App/Domain</GroupName>
           <Files>
+            <File>
+              <FileName>ct_measurement.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Domain/ct_measurement.c</FilePath>
+            </File>
             <File>
               <FileName>relay_domain.c</FileName>
               <FileType>1</FileType>

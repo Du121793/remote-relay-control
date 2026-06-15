@@ -28,15 +28,25 @@ typedef struct
 #define CONTROL_QUEUE_RELAY_CONFIG_ENABLED_PRESENT    0x02U
 #define CONTROL_QUEUE_RELAY_CONFIG_REMEMBER_PRESENT   0x04U
 #define CONTROL_QUEUE_RELAY_CONFIG_BOOT_PRESENT       0x08U
+#define CONTROL_QUEUE_RELAY_CONFIG_ADC_PRESENT        0x10U
+#define CONTROL_QUEUE_RELAY_CONFIG_PROTECTION_PRESENT 0x20U
+#define CONTROL_QUEUE_RELAY_CONFIG_THRESHOLD_PRESENT  0x40U
+#define CONTROL_QUEUE_RELAY_CONFIG_DELAY_PRESENT      0x80U
+#define CONTROL_QUEUE_RELAY_CONFIG_HYSTERESIS_PRESENT 0x100U
 #define CONTROL_QUEUE_REQUEST_ID_MAX_LEN               64U
 
 typedef struct
 {
   uint8_t channel;
-  uint8_t fields;
   uint8_t enabled;
   uint8_t remember_state;
   uint8_t boot_default_on;
+  uint8_t adc_channel;
+  uint8_t protection_enabled;
+  uint16_t fields;
+  uint32_t overcurrent_milliamps;
+  uint32_t trip_delay_ms;
+  uint32_t reset_hysteresis_milliamps;
   char name[DEVICE_CONFIG_NAME_MAX_LEN];
 } control_queue_relay_config_t;
 

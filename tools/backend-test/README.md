@@ -223,7 +223,12 @@ relay queue 滿載時，裝置會在 ack 回覆：
     "name": "MqttMember16",
     "enabled": 1,
     "remember_state": 0,
-    "boot_default_on": 0
+    "boot_default_on": 0,
+    "adc_channel": 255,
+    "protection_enabled": 0,
+    "overcurrent_milliamps": 4500,
+    "trip_delay_ms": 1000,
+    "reset_hysteresis_milliamps": 500
   }
 }
 ```

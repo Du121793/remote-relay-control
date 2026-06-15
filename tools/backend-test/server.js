@@ -637,6 +637,22 @@ function clientSummary(client) {
     role: client.role,
     term: Number(client.term || 0),
     relayMask: client.relayMask,
+    adcValid: Number(client.adcValid || 0),
+    adcCtValid: Number(client.adcCtValid || 0),
+    adcSignalPresent: Number(client.adcSignalPresent || 0),
+    adcRaw: Number(client.adcRaw || 0),
+    adcMillivolts: Number(client.adcMillivolts || 0),
+    adcMin: Number(client.adcMin || 0),
+    adcMax: Number(client.adcMax || 0),
+    adcAverage: Number(client.adcAverage || 0),
+    adcRawRms: Number(client.adcRawRms || 0),
+    adcRmsMillivolts: Number(client.adcRmsMillivolts || 0),
+    adcCurrentMilliamps: Number(client.adcCurrentMilliamps || 0),
+    adcSampleRateHz: Number(client.adcSampleRateHz || 0),
+    adcWindowSamples: Number(client.adcWindowSamples || 0),
+    adcSampleCount: Number(client.adcSampleCount || 0),
+    adcDmaOverruns: Number(client.adcDmaOverruns || 0),
+    adcSaturationCount: Number(client.adcSaturationCount || 0),
     session: client.session,
     key: client.key,
     stale: isClientStale(client),
@@ -724,7 +740,7 @@ async function remoteNodeRequest(nodeId, pathText, form) {
     body: form.toString(),
   });
 
-  data = await response.json();
+  data = await readRemoteJson(response);
   if (response.ok && data && data.ok !== false) {
     return data;
   }
@@ -739,7 +755,7 @@ async function remoteNodeRequest(nodeId, pathText, form) {
       },
       body: form.toString(),
     });
-    return response.json();
+    return readRemoteJson(response);
   }
   return data;
 }
@@ -815,7 +831,7 @@ async function remoteNodeGetJson(nodeId, pathText) {
     },
   });
 
-  data = await response.json();
+  data = await readRemoteJson(response);
   if (response.ok && data && data.ok !== false) {
     return data;
   }
@@ -827,9 +843,22 @@ async function remoteNodeGetJson(nodeId, pathText) {
         "X-Auth-Token": String(token),
       },
     });
-    return response.json();
+    return readRemoteJson(response);
   }
   return data;
+}
+
+async function readRemoteJson(response) {
+  const text = await response.text();
+
+  if (!text.trim()) {
+    throw new Error(`remote_empty_response_${response.status}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (_error) {
+    throw new Error(`remote_invalid_json_${response.status}`);
+  }
 }
 
 function isMasterClient(client) {
@@ -1074,6 +1103,22 @@ function knownNodeSummary(node) {
     deviceState,
     deviceStateText: deviceStateText(deviceState),
     relayMask: node.relayMask >>> 0,
+    adcValid: Number(node.adcValid || 0),
+    adcCtValid: Number(node.adcCtValid || 0),
+    adcSignalPresent: Number(node.adcSignalPresent || 0),
+    adcRaw: Number(node.adcRaw || 0),
+    adcMillivolts: Number(node.adcMillivolts || 0),
+    adcMin: Number(node.adcMin || 0),
+    adcMax: Number(node.adcMax || 0),
+    adcAverage: Number(node.adcAverage || 0),
+    adcRawRms: Number(node.adcRawRms || 0),
+    adcRmsMillivolts: Number(node.adcRmsMillivolts || 0),
+    adcCurrentMilliamps: Number(node.adcCurrentMilliamps || 0),
+    adcSampleRateHz: Number(node.adcSampleRateHz || 0),
+    adcWindowSamples: Number(node.adcWindowSamples || 0),
+    adcSampleCount: Number(node.adcSampleCount || 0),
+    adcDmaOverruns: Number(node.adcDmaOverruns || 0),
+    adcSaturationCount: Number(node.adcSaturationCount || 0),
     ip: normalizeIp(node.ip),
     lastSeenAt: node.lastSeenAt,
     sourceMasterNodeId: node.sourceMasterNodeId,
@@ -1246,6 +1291,22 @@ function updateKnownNodeFromClient(client) {
     online: isClientStale(client) ? 0 : 1,
     deviceState: isClientStale(client) ? 0 : Number(client.deviceState || 1),
     relayMask: client.relayMask >>> 0,
+    adcValid: Number(client.adcValid || 0),
+    adcCtValid: Number(client.adcCtValid || 0),
+    adcSignalPresent: Number(client.adcSignalPresent || 0),
+    adcRaw: Number(client.adcRaw || 0),
+    adcMillivolts: Number(client.adcMillivolts || 0),
+    adcMin: Number(client.adcMin || 0),
+    adcMax: Number(client.adcMax || 0),
+    adcAverage: Number(client.adcAverage || 0),
+    adcRawRms: Number(client.adcRawRms || 0),
+    adcRmsMillivolts: Number(client.adcRmsMillivolts || 0),
+    adcCurrentMilliamps: Number(client.adcCurrentMilliamps || 0),
+    adcSampleRateHz: Number(client.adcSampleRateHz || 0),
+    adcWindowSamples: Number(client.adcWindowSamples || 0),
+    adcSampleCount: Number(client.adcSampleCount || 0),
+    adcDmaOverruns: Number(client.adcDmaOverruns || 0),
+    adcSaturationCount: Number(client.adcSaturationCount || 0),
     lastSeenAt: client.lastMessageAt,
     sourceMasterNodeId: Number(client.nodeId) || 0,
   });
@@ -1308,6 +1369,22 @@ function applyClusterStatusSnapshot(client, message) {
       online: Number(node.online ? 1 : 0),
       deviceState: Number(node.device_state || 0),
       relayMask: Number(node.relay_mask || 0) >>> 0,
+      adcValid: Number(node.adc_valid || 0),
+      adcCtValid: Number(node.adc_ct_valid || 0),
+      adcSignalPresent: Number(node.adc_signal_present || 0),
+      adcRaw: Number(node.adc_raw || 0),
+      adcMillivolts: Number(node.adc_millivolts || 0),
+      adcMin: Number(node.adc_min || 0),
+      adcMax: Number(node.adc_max || 0),
+      adcAverage: Number(node.adc_average || 0),
+      adcRawRms: Number(node.adc_raw_rms || 0),
+      adcRmsMillivolts: Number(node.adc_rms_millivolts || 0),
+      adcCurrentMilliamps: Number(node.adc_current_milliamps || 0),
+      adcSampleRateHz: Number(node.adc_sample_rate_hz || 0),
+      adcWindowSamples: Number(node.adc_window_samples || 0),
+      adcSampleCount: Number(node.adc_sample_count || 0),
+      adcDmaOverruns: Number(node.adc_dma_overruns || 0),
+      adcSaturationCount: Number(node.adc_saturation_count || 0),
       lastSeenAt: client.lastMessageAt,
       sourceMasterNodeId: Number(message.node_id || client.nodeId || 0),
     });
@@ -1481,6 +1558,20 @@ const tcpServer = net.createServer((socket) => {
 
       pushEvent("message", { id, message });
 
+      if (message.type === "time_request" && client.key) {
+        const unixTime = Math.floor(Date.now() / 1000);
+        sendJson(client, {
+          type: "time_sync",
+          unix_time: unixTime,
+          source: "backend",
+        });
+        pushEvent("time-sync-response", {
+          nodeId: Number(client.nodeId || 0),
+          unixTime,
+        });
+        continue;
+      }
+
         if (message.type === "hello") {
           const previousClient = findClientByNodeId(message.node_id);
           const keyRecord = findKeyRecordBySecret(message.key);
@@ -1595,6 +1686,22 @@ const tcpServer = net.createServer((socket) => {
           client.role = Number(message.role || client.role || 0);
         client.deviceState = Number(message.device_state || client.deviceState || 1);
         client.relayMask = Number(message.relay_mask || 0) >>> 0;
+        client.adcValid = Number(message.adc_valid || 0);
+        client.adcCtValid = Number(message.adc_ct_valid || 0);
+        client.adcSignalPresent = Number(message.adc_signal_present || 0);
+        client.adcRaw = Number(message.adc_raw || 0);
+        client.adcMillivolts = Number(message.adc_millivolts || 0);
+        client.adcMin = Number(message.adc_min || 0);
+        client.adcMax = Number(message.adc_max || 0);
+        client.adcAverage = Number(message.adc_average || 0);
+        client.adcRawRms = Number(message.adc_raw_rms || 0);
+        client.adcRmsMillivolts = Number(message.adc_rms_millivolts || 0);
+        client.adcCurrentMilliamps = Number(message.adc_current_milliamps || 0);
+        client.adcSampleRateHz = Number(message.adc_sample_rate_hz || 0);
+        client.adcWindowSamples = Number(message.adc_window_samples || 0);
+        client.adcSampleCount = Number(message.adc_sample_count || 0);
+        client.adcDmaOverruns = Number(message.adc_dma_overruns || 0);
+        client.adcSaturationCount = Number(message.adc_saturation_count || 0);
         updateKnownNodeFromClient(client);
         applyClusterStatusSnapshot(client, message);
         continue;
@@ -1874,6 +1981,18 @@ function renderHtml() {
     function pill(text, online) {
       return '<span class="pill ' + (online ? 'on' : 'off') + '">' + text + '</span>';
     }
+    function adcText(item) {
+      if (!item.adcValid) {
+        return '尚無取樣';
+      }
+      const diagnostics = '偏壓 ' + esc(item.adcMillivolts) + ' mV / RMS ' +
+        esc(item.adcRmsMillivolts) + ' mV / ' + esc(item.adcSampleRateHz) + ' Hz';
+      if (!item.adcCtValid) {
+        return 'CT 未就緒 / ' + diagnostics;
+      }
+      return (Number(item.adcCurrentMilliamps || 0) / 1000).toFixed(3) +
+        ' A / ' + diagnostics;
+    }
     function sourceNodeId(item) {
       return Number(item.effectiveMasterNodeId || item.sourceMasterNodeId || item.nodeId || 0);
     }
@@ -2038,7 +2157,12 @@ function renderHtml() {
         name: String(relay.name || ''),
         enabled: Number(relay.enabled ? 1 : 0),
         remember_state: Number(relay.remember_state ? 1 : 0),
-        boot_default_on: Number(relay.boot_default_on ? 1 : 0)
+        boot_default_on: Number(relay.boot_default_on ? 1 : 0),
+        adc_channel: Number(relay.adc_channel),
+        protection_enabled: Number(relay.protection_enabled ? 1 : 0),
+        overcurrent_milliamps: Number(relay.overcurrent_milliamps || 0),
+        trip_delay_ms: Number(relay.trip_delay_ms || 0),
+        reset_hysteresis_milliamps: Number(relay.reset_hysteresis_milliamps || 0)
       })));
     }
     function buildRelayConfigPanelHtml(item, relays) {
@@ -2052,10 +2176,15 @@ function renderHtml() {
           '<td><input id="cfg_enabled_' + item.nodeId + '_' + relay.channel + '" type="checkbox" ' + (relay.enabled ? 'checked' : '') + ' onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
           '<td><input id="cfg_remember_' + item.nodeId + '_' + relay.channel + '" type="checkbox" ' + (relay.remember_state ? 'checked' : '') + ' onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
           '<td><input id="cfg_boot_' + item.nodeId + '_' + relay.channel + '" type="checkbox" ' + (relay.boot_default_on ? 'checked' : '') + ' onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
+          '<td><select id="cfg_adc_' + item.nodeId + '_' + relay.channel + '" onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"><option value="-1" ' + (Number(relay.adc_channel) === 255 ? 'selected' : '') + '>未綁定</option><option value="0" ' + (Number(relay.adc_channel) === 0 ? 'selected' : '') + '>ADC0 / PA0</option></select></td>' +
+          '<td><input id="cfg_protect_' + item.nodeId + '_' + relay.channel + '" type="checkbox" ' + (relay.protection_enabled ? 'checked' : '') + ' onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
+          '<td><input id="cfg_limit_' + item.nodeId + '_' + relay.channel + '" type="number" min="1" value="' + Number(relay.overcurrent_milliamps || 0) + '" onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
+          '<td><input id="cfg_delay_' + item.nodeId + '_' + relay.channel + '" type="number" min="0" value="' + Number(relay.trip_delay_ms || 0) + '" onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
+          '<td><input id="cfg_hysteresis_' + item.nodeId + '_' + relay.channel + '" type="number" min="0" value="' + Number(relay.reset_hysteresis_milliamps || 0) + '" onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
           '<td><button class="secondary" onclick="saveRelayConfig(' + item.nodeId + ',' + relay.channel + ')">保存</button></td>' +
         '</tr>'
       ).join('');
-      return '<div style="margin-bottom:18px"><div style="font-weight:700;margin-bottom:8px">' + esc(item.device) + ' (' + esc(item.nodeId) + ')</div><table><tr><th>CH</th><th>名稱</th><th>啟用</th><th>記憶</th><th>開機預設開</th><th>操作</th></tr>' + rows + '</table></div>';
+      return '<div style="margin-bottom:18px;overflow-x:auto"><div style="font-weight:700;margin-bottom:8px">' + esc(item.device) + ' (' + esc(item.nodeId) + ')</div><table><tr><th>CH</th><th>名稱</th><th>啟用</th><th>記憶</th><th>開機預設開</th><th>ADC</th><th>過流保護</th><th>門檻(mA)</th><th>延遲(ms)</th><th>回差(mA)</th><th>操作</th></tr>' + rows + '</table></div>';
     }
     async function loadRelayConfig(nodeId) {
       return api('/api/config/' + nodeId + '/relays');
@@ -2149,7 +2278,7 @@ function renderHtml() {
         ' 筆 / 雲端叢集身份 ' + (summary.cloudClusters || 0) + ' 筆';
 
       document.getElementById('clientTable').innerHTML =
-        '<tr><th>nodeId</th><th>裝置</th><th>叢集</th><th>Cloud Cluster</th><th>Cloud Device</th><th>Cloud Key</th><th>角色</th><th>鏈路狀態</th><th>relayMask</th><th>session</th><th>最後更新</th></tr>' +
+        '<tr><th>nodeId</th><th>裝置</th><th>叢集</th><th>Cloud Cluster</th><th>Cloud Device</th><th>Cloud Key</th><th>角色</th><th>鏈路狀態</th><th>relayMask</th><th>ADC</th><th>session</th><th>最後更新</th></tr>' +
         currentClients.map((item) => '<tr>' +
           '<td>' + esc(item.nodeId) + '</td>' +
           '<td>' + esc(item.device) + '</td>' +
@@ -2160,6 +2289,7 @@ function renderHtml() {
           '<td>' + esc(item.role) + '</td>' +
           '<td>' + (item.stale ? pill('stale', false) : pill('active', true)) + '</td>' +
           '<td>' + esc(item.relayMask) + '</td>' +
+          '<td>' + adcText(item) + '</td>' +
           '<td>' + esc(item.session) + '</td>' +
           '<td>' + esc(item.lastMessageAt) + '</td>' +
         '</tr>').join('');
@@ -2168,7 +2298,7 @@ function renderHtml() {
 
       if (!hasPendingRelayWork()) {
         document.getElementById('knownNodeTable').innerHTML =
-          '<tr><th>nodeId</th><th>裝置</th><th>叢集</th><th>Cloud Cluster</th><th>Cloud Device</th><th>Cloud Key</th><th>角色</th><th>在線</th><th>狀態</th><th>relayMask</th><th>控制</th><th>最後同步</th></tr>' +
+          '<tr><th>nodeId</th><th>裝置</th><th>叢集</th><th>Cloud Cluster</th><th>Cloud Device</th><th>Cloud Key</th><th>角色</th><th>在線</th><th>狀態</th><th>relayMask</th><th>ADC</th><th>控制</th><th>最後同步</th></tr>' +
           currentKnownNodes.map((item) => '<tr>' +
             '<td>' + esc(item.nodeId) + '</td>' +
             '<td>' + esc(item.device) + '</td>' +
@@ -2180,6 +2310,7 @@ function renderHtml() {
             '<td>' + (item.online ? pill('在線', true) : pill('離線', false)) + '</td>' +
             '<td>' + esc(item.deviceStateText) + '</td>' +
             '<td>' + esc(item.relayMask) + '</td>' +
+            '<td>' + adcText(item) + '</td>' +
             '<td>' + renderKnownNodeActions(item) + '</td>' +
             '<td>' + esc(item.lastSeenAt) + '</td>' +
           '</tr>').join('');
@@ -2511,7 +2642,12 @@ function renderHtml() {
         name: document.getElementById('cfg_name_' + nodeId + '_' + channel).value,
         enabled: document.getElementById('cfg_enabled_' + nodeId + '_' + channel).checked ? 1 : 0,
         remember_state: document.getElementById('cfg_remember_' + nodeId + '_' + channel).checked ? 1 : 0,
-        boot_default_on: document.getElementById('cfg_boot_' + nodeId + '_' + channel).checked ? 1 : 0
+        boot_default_on: document.getElementById('cfg_boot_' + nodeId + '_' + channel).checked ? 1 : 0,
+        adc_channel: Number(document.getElementById('cfg_adc_' + nodeId + '_' + channel).value),
+        protection_enabled: document.getElementById('cfg_protect_' + nodeId + '_' + channel).checked ? 1 : 0,
+        overcurrent_milliamps: Number(document.getElementById('cfg_limit_' + nodeId + '_' + channel).value),
+        trip_delay_ms: Number(document.getElementById('cfg_delay_' + nodeId + '_' + channel).value),
+        reset_hysteresis_milliamps: Number(document.getElementById('cfg_hysteresis_' + nodeId + '_' + channel).value)
       };
       const result = await api('/api/config/' + nodeId + '/relay', {
         method: 'POST',
@@ -3138,7 +3274,10 @@ app.get("/api/config/:nodeId/relays", async (req, res) => {
     }
     return res.json(data);
   } catch (_error) {
-    return res.status(502).json({ ok: false, error: "remote_fetch_failed" });
+    return res.status(502).json({
+      ok: false,
+      error: _error.message || "remote_fetch_failed",
+    });
   }
 });
 
@@ -3193,6 +3332,31 @@ app.post("/api/config/:nodeId/relay", async (req, res) => {
   }
   if (typeof req.body.boot_default_on !== "undefined") {
     form.set("boot_default_on", Number(req.body.boot_default_on) ? "1" : "0");
+  }
+  if (typeof req.body.adc_channel !== "undefined") {
+    const adcChannel = Number(req.body.adc_channel);
+    if (!Number.isInteger(adcChannel) || (adcChannel !== -1 && adcChannel !== 0)) {
+      return res.status(400).json({ ok: false, error: "bad_adc_channel" });
+    }
+    form.set("adc_channel", adcChannel < 0 ? "255" : String(adcChannel));
+  }
+  if (typeof req.body.protection_enabled !== "undefined") {
+    form.set("protection_enabled", Number(req.body.protection_enabled) ? "1" : "0");
+  }
+  for (const field of [
+    "overcurrent_milliamps",
+    "trip_delay_ms",
+    "reset_hysteresis_milliamps",
+  ]) {
+    if (typeof req.body[field] !== "undefined") {
+      const fieldValue = Number(req.body[field]);
+      const minimum = field === "overcurrent_milliamps" ? 100 : 0;
+      const maximum = field === "trip_delay_ms" ? 600000 : 100000;
+      if (!Number.isInteger(fieldValue) || fieldValue < minimum || fieldValue > maximum) {
+        return res.status(400).json({ ok: false, error: `bad_${field}` });
+      }
+      form.set(field, String(fieldValue));
+    }
   }
 
   try {

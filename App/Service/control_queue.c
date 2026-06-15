@@ -1,4 +1,5 @@
 #include "control_queue.h"
+#include "adc_service.h"
 #include "backend_link_service.h"
 #include "mqtt_link_service.h"
 #include "cluster_service.h"
@@ -52,7 +53,7 @@ typedef struct
   char login_request[512];
   char login_response[512];
   char config_request[1280];
-  char config_response[2048];
+  char config_response[6144];
   char encoded_host[(DEVICE_CONFIG_BACKEND_HOST_MAX_LEN * 3U) + 1U];
   char encoded_key[(DEVICE_CONFIG_BACKEND_KEY_MAX_LEN * 3U) + 1U];
   char encoded_cloud_host[(DEVICE_CONFIG_CLOUD_HOST_MAX_LEN * 3U) + 1U];
@@ -402,6 +403,7 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_local_rel
 {
   device_config_t *config = &g_control_queue_relay_config_snapshot;
   device_config_relay_t *relay;
+  device_config_current_t *current;
 
   if ((relay_config == NULL) ||
       (relay_config->channel == 0U) ||
@@ -413,6 +415,7 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_local_rel
 
   *config = *device_config_get();
   relay = &config->relay[relay_config->channel - 1U];
+  current = &config->current[relay_config->channel - 1U];
   if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_NAME_PRESENT) != 0U)
   {
     if (relay_config->name[0] == '\0')
@@ -433,6 +436,59 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_local_rel
   if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_BOOT_PRESENT) != 0U)
   {
     relay->boot_default_on = relay_config->boot_default_on;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_ADC_PRESENT) != 0U)
+  {
+    if ((relay_config->adc_channel >= ADC_SERVICE_CHANNEL_COUNT) &&
+        (relay_config->adc_channel != DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED))
+    {
+      return HAL_ERROR;
+    }
+    current->adc_channel = relay_config->adc_channel;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_PROTECTION_PRESENT) != 0U)
+  {
+    if (relay_config->protection_enabled > 1U)
+    {
+      return HAL_ERROR;
+    }
+    current->protection_enabled = relay_config->protection_enabled;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_THRESHOLD_PRESENT) != 0U)
+  {
+    if ((relay_config->overcurrent_milliamps < 100U) ||
+        (relay_config->overcurrent_milliamps > 100000U))
+    {
+      return HAL_ERROR;
+    }
+    current->overcurrent_milliamps = relay_config->overcurrent_milliamps;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_DELAY_PRESENT) != 0U)
+  {
+    if (relay_config->trip_delay_ms > 600000U)
+    {
+      return HAL_ERROR;
+    }
+    current->trip_delay_ms = relay_config->trip_delay_ms;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_HYSTERESIS_PRESENT) != 0U)
+  {
+    if (relay_config->reset_hysteresis_milliamps > 100000U)
+    {
+      return HAL_ERROR;
+    }
+    current->reset_hysteresis_milliamps =
+      relay_config->reset_hysteresis_milliamps;
+  }
+  if ((current->protection_enabled != 0U) &&
+      (current->adc_channel == DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED))
+  {
+    return HAL_ERROR;
+  }
+  if (current->reset_hysteresis_milliamps >=
+      current->overcurrent_milliamps)
+  {
+    return HAL_ERROR;
   }
 
   return (device_config_update_and_save(config) != 0U) ? HAL_OK : HAL_ERROR;
@@ -541,6 +597,61 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_remote_re
     written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
                        "&boot_default_on=%u",
                        (unsigned int)relay_config->boot_default_on);
+    if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
+    {
+      return HAL_ERROR;
+    }
+    used += (size_t)written;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_ADC_PRESENT) != 0U)
+  {
+    written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
+                       "&adc_channel=%u",
+                       (unsigned int)relay_config->adc_channel);
+    if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
+    {
+      return HAL_ERROR;
+    }
+    used += (size_t)written;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_PROTECTION_PRESENT) != 0U)
+  {
+    written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
+                       "&protection_enabled=%u",
+                       (unsigned int)relay_config->protection_enabled);
+    if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
+    {
+      return HAL_ERROR;
+    }
+    used += (size_t)written;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_THRESHOLD_PRESENT) != 0U)
+  {
+    written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
+                       "&overcurrent_milliamps=%lu",
+                       (unsigned long)relay_config->overcurrent_milliamps);
+    if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
+    {
+      return HAL_ERROR;
+    }
+    used += (size_t)written;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_DELAY_PRESENT) != 0U)
+  {
+    written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
+                       "&trip_delay_ms=%lu",
+                       (unsigned long)relay_config->trip_delay_ms);
+    if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
+    {
+      return HAL_ERROR;
+    }
+    used += (size_t)written;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_HYSTERESIS_PRESENT) != 0U)
+  {
+    written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
+                       "&reset_hysteresis_milliamps=%lu",
+                       (unsigned long)relay_config->reset_hysteresis_milliamps);
     if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
     {
       return HAL_ERROR;

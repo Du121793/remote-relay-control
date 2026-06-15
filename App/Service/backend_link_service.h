@@ -27,6 +27,8 @@ void backend_link_service_init(void);
 void backend_link_service_poll(void);
 void backend_link_service_get_stats(backend_link_stats_t *stats);
 void backend_link_service_mark_status_dirty(void);
+uint8_t backend_link_service_request_time(void);
+void backend_link_service_cancel_time_request(void);
 
 #ifdef __cplusplus
 }

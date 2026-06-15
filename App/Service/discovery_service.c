@@ -3,6 +3,7 @@
 #include "cmsis_os.h"
 
 #include "board_relay.h"
+#include "adc_service.h"
 #include "cluster_service.h"
 #include "control_service.h"
 #include "../Config/device_config.h"
@@ -37,6 +38,7 @@ static uint8_t g_discovery_last_link_up = 0U;
 static uint8_t g_discovery_multicast_joined = 0U;
 static ip4_addr_t g_discovery_group_addr;
 static discovery_service_stats_t g_discovery_stats;
+static char g_discovery_rx_payload[DISCOVERY_ANNOUNCE_BUFFER_SIZE];
 static osThreadId g_discovery_task_handle = NULL;
 static volatile uint8_t g_discovery_force_announce = 0U;
 
@@ -57,6 +59,7 @@ static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t por
   uint32_t load_score;
   uint32_t auth_tag;
   uint32_t enabled_mask = 0U;
+  adc_service_state_t adc_state;
   const device_config_t *config = device_config_get();
   uint32_t relay_index;
 
@@ -66,6 +69,7 @@ static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t por
   }
 
   cluster_service_get_state(&cluster_state);
+  adc_service_get_state(&adc_state);
   http_service_get_stats(&http_stats);
   control_service_get_stats(&control_stats);
   load_score = cluster_service_compute_load_score(http_stats.active_connections,
@@ -105,6 +109,22 @@ static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t por
                                                cluster_state.time_seq,
                                                cluster_state.gateway_epoch,
                                                cluster_state.gateway_node_id,
+                                               adc_state.valid,
+                                               adc_state.ct_valid,
+                                               adc_state.signal_present,
+                                               adc_state.raw_latest,
+                                               adc_state.millivolts,
+                                               adc_state.raw_min,
+                                               adc_state.raw_max,
+                                               adc_state.raw_average,
+                                               adc_state.raw_rms,
+                                               adc_state.ac_rms_millivolts,
+                                               adc_state.current_milliamps,
+                                               adc_state.sample_rate_hz,
+                                               adc_state.window_samples,
+                                               adc_state.sample_count,
+                                               adc_state.dma_overrun_count,
+                                               adc_state.saturation_count,
                                                ip_text,
                                                DISCOVERY_UDP_PORT,
                                                gnetif.hwaddr);
@@ -175,7 +195,6 @@ static void discovery_service_ensure_multicast_membership(void)
 
 static void discovery_service_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port)
 {
-  char payload[DISCOVERY_ANNOUNCE_BUFFER_SIZE];
   u16_t copy_len;
   discovery_proto_announce_t announce;
   cluster_node_t node;
@@ -191,16 +210,20 @@ static void discovery_service_udp_recv(void *arg, struct udp_pcb *pcb, struct pb
   g_discovery_stats.rx_packets++;
   g_discovery_stats.last_src_port = port;
   g_discovery_stats.last_src_ip = ip4_addr_get_u32(ip_2_ip4(addr));
-  copy_len = (p->tot_len < (sizeof(payload) - 1U)) ? p->tot_len : (u16_t)(sizeof(payload) - 1U);
-  pbuf_copy_partial(p, payload, copy_len, 0U);
-  payload[copy_len] = '\0';
+  copy_len = (p->tot_len < (sizeof(g_discovery_rx_payload) - 1U)) ?
+             p->tot_len :
+             (u16_t)(sizeof(g_discovery_rx_payload) - 1U);
+  pbuf_copy_partial(p, g_discovery_rx_payload, copy_len, 0U);
+  g_discovery_rx_payload[copy_len] = '\0';
 
-  if (discovery_proto_is_discover(payload, copy_len) != 0U)
+  if (discovery_proto_is_discover(g_discovery_rx_payload, copy_len) != 0U)
   {
     g_discovery_stats.discover_packets++;
     discovery_service_udp_send_announce(addr, port);
   }
-  else if (discovery_proto_parse_announce(payload, copy_len, &announce) != 0U)
+  else if (discovery_proto_parse_announce(g_discovery_rx_payload,
+                                          copy_len,
+                                          &announce) != 0U)
   {
     if (strcmp(announce.service, DISCOVERY_SERVICE_TYPE) == 0)
     {
@@ -225,6 +248,22 @@ static void discovery_service_udp_recv(void *arg, struct udp_pcb *pcb, struct pb
       node.time_seq = announce.time_seq;
       node.gateway_epoch = announce.gateway_epoch;
       node.gateway_node_id = announce.gateway_node_id;
+      node.adc_valid = announce.adc_valid;
+      node.adc_ct_valid = announce.adc_ct_valid;
+      node.adc_signal_present = announce.adc_signal_present;
+      node.adc_raw = announce.adc_raw;
+      node.adc_millivolts = announce.adc_millivolts;
+      node.adc_min = announce.adc_min;
+      node.adc_max = announce.adc_max;
+      node.adc_average = announce.adc_average;
+      node.adc_raw_rms = announce.adc_raw_rms;
+      node.adc_rms_millivolts = announce.adc_rms_millivolts;
+      node.adc_current_milliamps = announce.adc_current_milliamps;
+      node.adc_sample_rate_hz = announce.adc_sample_rate_hz;
+      node.adc_window_samples = announce.adc_window_samples;
+      node.adc_sample_count = announce.adc_sample_count;
+      node.adc_dma_overruns = announce.adc_dma_overruns;
+      node.adc_saturation_count = announce.adc_saturation_count;
       memcpy(node.node_name, announce.device, sizeof(node.node_name));
       memcpy(node.cluster_name, announce.cluster, sizeof(node.cluster_name));
       memcpy(node.cloud_cluster_id, announce.cloud_cluster_id, sizeof(node.cloud_cluster_id));
