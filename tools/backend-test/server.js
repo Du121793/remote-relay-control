@@ -3451,6 +3451,67 @@ app.post("/broadcast/ping", (_req, res) => {
   res.json({ ok: true, count: clients.size });
 });
 
+// ── MCU Provisioning API ──────────────────────────────────────────
+// Path A in the dual-path architecture: the MCU calls this over HTTPS
+// (through Cloudflare) to obtain its PSK and broker configuration.
+//
+// MCU sends:   POST /api/provision
+//              { device_id, cluster_id, device_fingerprint }
+//
+// Server replies with binding_secret, broker host/port, CA fingerprint,
+// and CA root cert PEM so the MCU can verify the MQTT broker on connect.
+
+app.post("/api/provision", (req, res) => {
+  const clusterId = String(req.body.cluster_id || "").trim();
+  const deviceId = String(req.body.device_id || "").trim();
+  const deviceFingerprint = String(req.body.device_fingerprint || "").trim();
+
+  if (!clusterId || !deviceId) {
+    return res.status(400).json({ ok: false, error: "missing_cluster_or_device_id" });
+  }
+
+  const deviceRecord = findCloudDeviceRecord(clusterId, deviceId);
+  if (!deviceRecord) {
+    return res.status(404).json({ ok: false, error: "device_not_registered" });
+  }
+
+  if (!deviceRecord.enabled) {
+    return res.status(403).json({ ok: false, error: "device_disabled" });
+  }
+
+  // Optional fingerprint verification (strict when fingerprint is set)
+  if (deviceFingerprint && deviceRecord.deviceFingerprint) {
+    if (deviceFingerprint !== deviceRecord.deviceFingerprint) {
+      return res.status(403).json({ ok: false, error: "fingerprint_mismatch" });
+    }
+  }
+
+  const clusterRecord = findCloudClusterRecord(clusterId);
+  if (!clusterRecord) {
+    return res.status(500).json({ ok: false, error: "cluster_not_found" });
+  }
+
+  pushEvent("mcu-provision-request", {
+    clusterId,
+    deviceId,
+    ip: req.ip,
+    timestamp: new Date().toISOString(),
+  });
+
+  return res.json({
+    ok: true,
+    cluster_id: clusterId,
+    device_id: deviceId,
+    cloud_key_id: deviceRecord.keyId || "",
+    cloud_transport: clusterRecord.transport || CLOUD_TRANSPORT,
+    cloud_broker_host: clusterRecord.brokerHost || CLOUD_BROKER_HOST,
+    cloud_broker_port: clusterRecord.brokerPort || CLOUD_BROKER_PORT,
+    cloud_cluster_ca_fingerprint: clusterRecord.caFingerprint || "",
+    cloud_cluster_ca_cert_pem: clusterRecord.caPublicPem || "",
+    cloud_cluster_binding_secret: clusterRecord.bindingSecret || "",
+  });
+});
+
 loadKeyStore();
 loadCloudRegistry();
 
