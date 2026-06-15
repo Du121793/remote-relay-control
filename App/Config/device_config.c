@@ -12,6 +12,8 @@
 #include "semphr.h"
 #include "task.h"
 
+#include "mbedtls/sha256.h"
+
 static device_config_t g_device_config;
 static uint32_t g_device_config_last_flash_error = 0U;
 static QueueHandle_t g_device_config_queue = NULL;
@@ -412,27 +414,29 @@ static void device_config_build_current_defaults(device_config_t *config)
 
 void device_config_hash_password_text(const char *text, uint8_t hash_out[DEVICE_CONFIG_PASSWORD_HASH_LEN])
 {
-  uint32_t crc;
-  uint32_t index;
-
   if (hash_out == NULL)
   {
     return;
   }
 
-  if (text == NULL)
+  if ((text == NULL) || (text[0] == '\0'))
   {
     memset(hash_out, 0, DEVICE_CONFIG_PASSWORD_HASH_LEN);
     return;
   }
 
-  crc = device_config_crc32_bytes((const uint8_t *)text, (uint32_t)strlen(text));
-  for (index = 0U; index < DEVICE_CONFIG_PASSWORD_HASH_LEN; index += 4U)
+  /* Use mbedTLS SHA-256 instead of CRC32 so the stored password hash
+     is a proper cryptographic digest.  An attacker cannot reverse or
+     collide SHA-256 the way they could with a 32-bit CRC. */
   {
-    hash_out[index + 0U] = (uint8_t)((crc >> 24) & 0xFFU);
-    hash_out[index + 1U] = (uint8_t)((crc >> 16) & 0xFFU);
-    hash_out[index + 2U] = (uint8_t)((crc >> 8) & 0xFFU);
-    hash_out[index + 3U] = (uint8_t)(crc & 0xFFU);
+    int ret = mbedtls_sha256_ret((const unsigned char *)text,
+                                 strlen(text),
+                                 hash_out,
+                                 0 /* 0 = SHA-256, 1 = SHA-224 */);
+    if (ret != 0)
+    {
+      memset(hash_out, 0, DEVICE_CONFIG_PASSWORD_HASH_LEN);
+    }
   }
 }
 
@@ -490,6 +494,7 @@ void device_config_build_defaults(device_config_t *config)
   config->cloud_key_id[0] = '\0';
   config->cloud_cluster_ca_fingerprint[0] = '\0';
   config->cloud_cluster_binding_secret[0] = '\0';
+  config->cloud_cluster_ca_cert[0] = '\0';
   config->saved_relay_mask = 0U;
 
   for (i = 0U; i < DEVICE_CONFIG_RELAY_COUNT; ++i)

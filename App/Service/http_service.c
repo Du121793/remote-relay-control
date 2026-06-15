@@ -1441,7 +1441,9 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
   static char cloud_device_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
   static char cloud_key_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
   static char cloud_cluster_ca_fingerprint_json[(DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 2U) + 8U];
-  static char cloud_cluster_binding_secret_json[(DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN * 2U) + 8U];
+  /* binding_secret is no longer returned in GET responses — only
+     secret_configured boolean.  The JSON-escape buffer is retained for
+     the POST path where the field is still accepted. */
   uint8_t is_local_master = 0U;
 
   cluster_service_get_state(&cluster_state);
@@ -1462,8 +1464,6 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                                 config->cloud_key_id, sizeof(config->cloud_key_id));
   http_service_json_escape_copy(cloud_cluster_ca_fingerprint_json, sizeof(cloud_cluster_ca_fingerprint_json),
                                 config->cloud_cluster_ca_fingerprint, sizeof(config->cloud_cluster_ca_fingerprint));
-  http_service_json_escape_copy(cloud_cluster_binding_secret_json, sizeof(cloud_cluster_binding_secret_json),
-                                config->cloud_cluster_binding_secret, sizeof(config->cloud_cluster_binding_secret));
   (void)snprintf(buffer, buffer_size,
                  "{"
                  "\"ok\":true,"
@@ -1490,7 +1490,8 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                  "\"cloud_device_id\":\"%s\","
                  "\"cloud_key_id\":\"%s\","
                  "\"cloud_cluster_ca_fingerprint\":\"%s\","
-                 "\"cloud_cluster_binding_secret\":\"%s\""
+                 "\"cloud_cluster_binding_secret_configured\":%u,"
+                 "\"cloud_cluster_ca_cert_configured\":%u"
                  "}",
                  device_name_json,
                  (unsigned int)config->cluster_enabled,
@@ -1515,7 +1516,8 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                  cloud_device_id_json,
                  cloud_key_id_json,
                  cloud_cluster_ca_fingerprint_json,
-                 cloud_cluster_binding_secret_json);
+                 (unsigned int)(config->cloud_cluster_binding_secret[0] != '\0' ? 1U : 0U),
+                 (unsigned int)(config->cloud_cluster_ca_cert[0] != '\0' ? 1U : 0U));
 }
 
 static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_size)
@@ -2121,6 +2123,15 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     {
       memset(config.cloud_cluster_binding_secret, 0, sizeof(config.cloud_cluster_binding_secret));
       strncpy(config.cloud_cluster_binding_secret, cloud_cluster_binding_secret, sizeof(config.cloud_cluster_binding_secret) - 1U);
+    }
+
+    {
+      static char cloud_cluster_ca_cert_body[DEVICE_CONFIG_CA_CERT_MAX_LEN];
+      if (http_service_extract_form_text(body, "cloud_cluster_ca_cert", cloud_cluster_ca_cert_body, sizeof(cloud_cluster_ca_cert_body)))
+      {
+        memset(config.cloud_cluster_ca_cert, 0, sizeof(config.cloud_cluster_ca_cert));
+        strncpy(config.cloud_cluster_ca_cert, cloud_cluster_ca_cert_body, sizeof(config.cloud_cluster_ca_cert) - 1U);
+      }
     }
 
     if (config.device_name[0] == '\0')

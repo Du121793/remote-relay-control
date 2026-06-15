@@ -7,6 +7,7 @@
 #include "task.h"
 #include "lwip/netif.h"
 #include <string.h>
+#include "mbedtls/md.h"
 
 #include "stm32f7xx_hal.h"
 
@@ -548,10 +549,66 @@ static uint8_t cluster_service_node_is_eligible(const cluster_node_t *node,
     return 0U;
   }
 
-  if ((strcmp(node->cluster_name, state->cluster_name) != 0) ||
-      (node->auth_tag != g_cluster_context.local_auth_tag))
+  if (strcmp(node->cluster_name, state->cluster_name) != 0)
   {
     return 0U;
+  }
+
+  /* HMAC-SHA256 anti-replay: the node's auth_tag is the first 4 bytes of
+     HMAC(unix_time|node_id|cluster_name) keyed with the cluster password.
+     Re-compute the expected tag and reject if mismatched or if the
+     timestamp has drifted beyond ±30 seconds. */
+  {
+    const device_config_t *config = device_config_get();
+
+    if ((config != NULL) &&
+        (config->cluster_password_hash[0] != 0U) &&
+        (node->unix_time != 0U) &&
+        (node->time_valid != 0U))
+    {
+      uint8_t hmac_out[32];
+      char hmac_input[128];
+      int hmac_len;
+      uint32_t expected_tag;
+      int32_t time_diff;
+
+      time_diff = (int32_t)(state->unix_time - node->unix_time);
+      if ((time_diff > 30) || (time_diff < -30))
+      {
+        return 0U;
+      }
+
+      hmac_len = snprintf(hmac_input, sizeof(hmac_input),
+                          "%lu|%lu|%s",
+                          (unsigned long)node->unix_time,
+                          (unsigned long)node->node_id,
+                          node->cluster_name);
+      if ((hmac_len > 0) &&
+          ((size_t)hmac_len < sizeof(hmac_input)) &&
+          (mbedtls_md_hmac(
+            mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+            config->cluster_password_hash,
+            DEVICE_CONFIG_PASSWORD_HASH_LEN,
+            (const unsigned char *)hmac_input, (size_t)hmac_len,
+            hmac_out) == 0))
+      {
+        memcpy(&expected_tag, hmac_out, sizeof(expected_tag));
+        if (node->auth_tag != expected_tag)
+        {
+          return 0U;
+        }
+      }
+    }
+    else
+    {
+      /* Fallback: if no password is set, compare the (deprecated)
+         password_tag directly for backward compatibility with nodes
+         running older firmware. */
+      if (node->auth_tag != g_cluster_context.local_auth_tag)
+      {
+        return 0U;
+      }
+    }
   }
 
   return 1U;
