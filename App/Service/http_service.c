@@ -1526,7 +1526,9 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
   const device_config_t *config = device_config_get();
   uint32_t count = 0U;
   uint32_t index;
-  uint32_t local_auth_tag = device_config_password_tag(config);
+  /* local_auth_tag is no longer a simple FNV1a — nodes now use
+     HMAC-SHA256.  The per-node check below recomputes via the shared
+     device_config_compute_auth_tag(). */
   size_t used;
   static char ip_text[16];
   static char cluster_name_json[(CLUSTER_SERVICE_CLUSTER_NAME_LEN * 2U) + 8U];
@@ -1552,9 +1554,16 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
       continue;
     }
 
-    same_cluster = ((config->cluster_enabled != 0U) &&
-                    (strcmp(nodes[index].cluster_name, config->cluster_name) == 0) &&
-                    (nodes[index].auth_tag == local_auth_tag)) ? 1U : 0U;
+    {
+      uint32_t expected_tag =
+        device_config_compute_auth_tag(config->cluster_password_hash,
+                                       nodes[index].unix_time,
+                                       nodes[index].node_id,
+                                       nodes[index].cluster_name);
+      same_cluster = ((config->cluster_enabled != 0U) &&
+                      (strcmp(nodes[index].cluster_name, config->cluster_name) == 0) &&
+                      (nodes[index].auth_tag == expected_tag)) ? 1U : 0U;
+    }
     http_service_json_escape_copy(cluster_name_json, sizeof(cluster_name_json),
                                   nodes[index].cluster_name, sizeof(nodes[index].cluster_name));
     http_service_json_escape_copy(node_name_json, sizeof(node_name_json),
@@ -1600,7 +1609,7 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
                        (unsigned int)nodes[index].device_state,
                        (unsigned int)same_cluster,
                        (unsigned int)same_cluster,
-                       (unsigned int)(nodes[index].auth_tag == local_auth_tag ? 1U : 0U),
+                       (unsigned int)same_cluster,
                        cluster_name_json,
                        node_name_json,
                        cloud_cluster_id_json,
