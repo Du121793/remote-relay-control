@@ -1340,8 +1340,6 @@ static void http_service_sync_backend_config_to_cluster_async(void)
   const device_config_t *config = device_config_get();
   uint32_t count = 0U;
   uint32_t index;
-  uint32_t local_auth_tag;
-
   cluster_service_get_state(&cluster_state);
   if ((cluster_state.role != CLUSTER_ROLE_MASTER) ||
       (config->cluster_enabled == 0U) ||
@@ -1354,7 +1352,6 @@ static void http_service_sync_backend_config_to_cluster_async(void)
 
   nodes = cluster_service_get_nodes(&count);
   (void)count;
-  local_auth_tag = device_config_password_tag(config);
   for (index = g_http_backend_sync_cursor;
        index < CLUSTER_SERVICE_NODE_CAPACITY;
        ++index)
@@ -1363,10 +1360,20 @@ static void http_service_sync_backend_config_to_cluster_async(void)
         (nodes[index].online == 0U) ||
         (nodes[index].ip_addr == 0U) ||
         (nodes[index].role != CLUSTER_ROLE_MEMBER) ||
-        (strcmp(nodes[index].cluster_name, config->cluster_name) != 0) ||
-        (nodes[index].auth_tag != local_auth_tag))
+        (strcmp(nodes[index].cluster_name, config->cluster_name) != 0))
     {
       continue;
+    }
+    {
+      uint32_t expected_tag =
+        device_config_compute_auth_tag(config->cluster_password_hash,
+                                       nodes[index].unix_time,
+                                       nodes[index].node_id,
+                                       nodes[index].cluster_name);
+      if (nodes[index].auth_tag != expected_tag)
+      {
+        continue;
+      }
     }
 
     if (control_queue_submit_backend_sync_async(nodes[index].ip_addr,
@@ -1390,8 +1397,6 @@ static uint32_t http_service_backend_sync_member_signature(void)
   uint32_t index;
   uint32_t signature = 2166136261UL;
   uint32_t member_count = 0U;
-  uint32_t local_auth_tag;
-
   cluster_service_get_state(&cluster_state);
   if ((cluster_state.role != CLUSTER_ROLE_MASTER) ||
       (config->cluster_enabled == 0U))
@@ -1401,17 +1406,26 @@ static uint32_t http_service_backend_sync_member_signature(void)
 
   nodes = cluster_service_get_nodes(&count);
   (void)count;
-  local_auth_tag = device_config_password_tag(config);
   for (index = 0U; index < CLUSTER_SERVICE_NODE_CAPACITY; ++index)
   {
     if ((nodes[index].valid == 0U) ||
         (nodes[index].online == 0U) ||
         (nodes[index].ip_addr == 0U) ||
         (nodes[index].role != CLUSTER_ROLE_MEMBER) ||
-        (strcmp(nodes[index].cluster_name, config->cluster_name) != 0) ||
-        (nodes[index].auth_tag != local_auth_tag))
+        (strcmp(nodes[index].cluster_name, config->cluster_name) != 0))
     {
       continue;
+    }
+    {
+      uint32_t expected_tag =
+        device_config_compute_auth_tag(config->cluster_password_hash,
+                                       nodes[index].unix_time,
+                                       nodes[index].node_id,
+                                       nodes[index].cluster_name);
+      if (nodes[index].auth_tag != expected_tag)
+      {
+        continue;
+      }
     }
 
     signature ^= nodes[index].node_id;
@@ -1976,11 +1990,22 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
 
     remote_node = cluster_service_find_node(node_id);
     if ((remote_node == NULL) ||
-        (strcmp(remote_node->cluster_name, active_config->cluster_name) != 0) ||
-        (remote_node->auth_tag != local_auth_tag))
+        (strcmp(remote_node->cluster_name, active_config->cluster_name) != 0))
     {
       http_service_format_error_json(response_body, response_body_size, "remote_node_unavailable");
       return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+    }
+    {
+      uint32_t expected_tag =
+        device_config_compute_auth_tag(active_config->cluster_password_hash,
+                                       remote_node->unix_time,
+                                       remote_node->node_id,
+                                       remote_node->cluster_name);
+      if (remote_node->auth_tag != expected_tag)
+      {
+        http_service_format_error_json(response_body, response_body_size, "remote_node_unavailable");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
     }
 
     command.channel = (uint8_t)channel;
