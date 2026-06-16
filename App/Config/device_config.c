@@ -541,7 +541,7 @@ void device_config_build_defaults(device_config_t *config)
   config->auto_join_cluster = 1U;
   config->cluster_enabled = 1U;
   memcpy(config->cluster_name, "default", sizeof("default"));
-  memcpy(config->backend_host, "192.168.0.139", sizeof("192.168.0.139"));
+  config->backend_host[0] = '\0';
   config->backend_port = 42001U;
   memcpy(config->backend_key, "dev-key", sizeof("dev-key"));
   config->cloud_enabled = 0U;
@@ -927,7 +927,7 @@ static uint8_t device_config_normalize_runtime_defaults(device_config_t *config)
 
   if (config->backend_host[0] == '\0')
   {
-    memcpy(config->backend_host, "192.168.0.139", sizeof("192.168.0.139"));
+    config->backend_host[0] = '\0';
     changed = 1U;
   }
 
