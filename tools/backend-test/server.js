@@ -3516,6 +3516,8 @@ app.post("/api/provision", (req, res) => {
     cloud_cluster_ca_fingerprint: clusterRecord.caFingerprint || "",
     cloud_cluster_ca_cert_pem: clusterRecord.caPublicPem || "",
     cloud_cluster_binding_secret: clusterRecord.bindingSecret || "",
+    provisioning_revision: Number(clusterRecord.revision || 0),
+    ca_revocation_tag: Number(clusterRecord.caRevocationTag || 0),
   });
 });
 
@@ -3553,6 +3555,35 @@ app.post("/api/devices/:deviceId/claim", (req, res) => {
   scheduleCloudRegistrySave();
   pushEvent("device-claimed", { deviceId, owner, timestamp: new Date().toISOString() });
   return res.json({ ok: true, deviceId, owner });
+});
+
+// ── PSK Rotation ──────────────────────────────────────────────────
+// Increments the cluster revision, generates a new binding secret,
+// and stores the old secret for a 5-minute transition window.
+app.post("/api/cloud/clusters/:clusterId/rotate-psk", (req, res) => {
+  const clusterRecord = findCloudClusterRecord(req.params.clusterId);
+  if (!clusterRecord) {
+    return res.status(404).json({ ok: false, error: "cluster_not_found" });
+  }
+
+  const oldSecret = clusterRecord.bindingSecret || "";
+  clusterRecord.bindingSecret = crypto.randomBytes(32).toString("base64url").slice(0, 43);
+  clusterRecord.previousSecret = oldSecret;
+  clusterRecord.revision = (Number(clusterRecord.revision || 0)) + 1;
+  clusterRecord.secretRotatedAt = Date.now();
+
+  cloudClusters.set(clusterRecord.clusterId, clusterRecord);
+  scheduleCloudRegistrySave();
+  pushEvent("psk-rotated", {
+    clusterId: clusterRecord.clusterId,
+    revision: clusterRecord.revision,
+    timestamp: new Date().toISOString(),
+  });
+  return res.json({
+    ok: true,
+    revision: clusterRecord.revision,
+    rotatedAt: clusterRecord.secretRotatedAt,
+  });
 });
 
 loadKeyStore();

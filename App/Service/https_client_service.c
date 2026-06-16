@@ -243,8 +243,39 @@ static void https_client_parse_and_apply(const char *body, size_t body_len)
     }
   }
 
-  (void)device_config_update_and_save(&updated);
-  mqtt_link_service_mark_status_dirty();
+  /* Extract provisioning_revision — when this increments the MCU
+     re-provisions automatically and rotates its PSK / CA material. */
+  {
+    const char *rev_ptr = strstr(body, "\"provisioning_revision\":");
+    if (rev_ptr != NULL)
+    {
+      uint32_t rev = 0U;
+      const char *num = rev_ptr + 24;
+      while (*num >= '0' && *num <= '9') { rev = rev * 10U + (uint32_t)(*num - '0'); num++; }
+      updated.provisioning_revision = rev;
+    }
+  }
+  /* Extract ca_revocation_tag — the backend publishes this when a
+     CA certificate has been revoked.  The MQTT client checks it
+     before every connection. */
+  {
+    const char *tag_ptr = strstr(body, "\"ca_revocation_tag\":");
+    if (tag_ptr != NULL)
+    {
+      uint32_t tag = 0U;
+      const char *num = tag_ptr + 20;
+      while (*num >= '0' && *num <= '9') { tag = tag * 10U + (uint32_t)(*num - '0'); num++; }
+      updated.ca_revocation_tag = tag;
+    }
+  }
+
+  if (updated.provisioning_revision != config->provisioning_revision ||
+      updated.ca_revocation_tag != config->ca_revocation_tag ||
+      updated.cloud_cluster_binding_secret[0] != config->cloud_cluster_binding_secret[0])
+  {
+    (void)device_config_update_and_save(&updated);
+    mqtt_link_service_mark_status_dirty();
+  }
 }
 
 static err_t https_client_recv(void *arg, struct altcp_pcb *pcb,

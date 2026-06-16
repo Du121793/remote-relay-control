@@ -72,6 +72,8 @@ typedef struct
   char cloud_cluster_ca_fingerprint[DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN];
   char cloud_cluster_binding_secret[DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN];
   char cloud_cluster_ca_cert[DEVICE_CONFIG_CA_CERT_MAX_LEN];
+  uint32_t provisioning_revision;
+  uint32_t ca_revocation_tag;
   uint32_t saved_relay_mask;
   device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
   device_config_current_t current[DEVICE_CONFIG_RELAY_COUNT];
