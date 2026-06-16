@@ -77,54 +77,10 @@ static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t por
                                                   control_stats.connections,
                                                   control_stats.commands);
   cluster_service_set_local_load_score(load_score);
-  {
-    /* When a cluster password is set, use HMAC-SHA256 to bind the
-       auth_tag to the current unix_time, node_id and cluster_name.
-       Without a password, fall back to the legacy FNV1a tag for
-       interoperability with nodes that have no password configured. */
-    uint8_t has_password = 0U;
-    uint32_t index;
-
-    for (index = 0U; index < DEVICE_CONFIG_PASSWORD_HASH_LEN; ++index)
-    {
-      if (config->cluster_password_hash[index] != 0U)
-      {
-        has_password = 1U;
-        break;
-      }
-    }
-
-    if (has_password != 0U)
-    {
-      uint8_t hmac_out[32];
-      char hmac_input[128];
-      int hmac_len;
-
-      hmac_len = snprintf(hmac_input, sizeof(hmac_input),
-                          "%lu|%lu|%s",
-                          (unsigned long)cluster_state.unix_time,
-                          (unsigned long)cluster_state.self_node_id,
-                          cluster_state.cluster_name);
-      if ((hmac_len > 0) &&
-          ((size_t)hmac_len < sizeof(hmac_input)) &&
-          (mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                           config->cluster_password_hash,
-                           DEVICE_CONFIG_PASSWORD_HASH_LEN,
-                           (const unsigned char *)hmac_input, (size_t)hmac_len,
-                           hmac_out) == 0))
-      {
-        memcpy(&auth_tag, hmac_out, sizeof(auth_tag));
-      }
-      else
-      {
-        auth_tag = 0U;
-      }
-    }
-    else
-    {
-      auth_tag = device_config_password_tag(config);
-    }
-  }
+  auth_tag = device_config_compute_auth_tag(config->cluster_password_hash,
+                                            cluster_state.unix_time,
+                                            cluster_state.self_node_id,
+                                            cluster_state.cluster_name);
   for (relay_index = 0U; relay_index < DEVICE_CONFIG_RELAY_COUNT; ++relay_index)
   {
     if (config->relay[relay_index].enabled != 0U)

@@ -89,6 +89,10 @@ uint8_t device_config_save(const device_config_t *config);
 void device_config_reset(void);
 void device_config_hash_password_text(const char *text, uint8_t hash_out[DEVICE_CONFIG_PASSWORD_HASH_LEN]);
 uint32_t device_config_password_tag(const device_config_t *config);
+uint32_t device_config_compute_auth_tag(const uint8_t password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN],
+                                        uint32_t unix_time,
+                                        uint32_t node_id,
+                                        const char *cluster_name);
 uint32_t device_config_last_flash_error(void);
 uint32_t device_config_build_startup_relay_mask(const device_config_t *config);
 uint8_t device_config_persist_runtime_relay_mask(uint32_t relay_mask);

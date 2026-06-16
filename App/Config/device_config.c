@@ -13,6 +13,7 @@
 #include "task.h"
 
 #include "mbedtls/sha256.h"
+#include "mbedtls/md.h"
 
 static device_config_t g_device_config __attribute__((aligned(8)));
 static uint32_t g_device_config_last_flash_error = 0U;
@@ -463,6 +464,64 @@ uint32_t device_config_password_tag(const device_config_t *config)
   }
 
   return (non_zero != 0U) ? hash : 0U;
+}
+
+uint32_t device_config_compute_auth_tag(
+  const uint8_t password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN],
+  uint32_t unix_time,
+  uint32_t node_id,
+  const char *cluster_name)
+{
+  uint8_t has_password = 0U;
+  uint32_t index;
+
+  if ((password_hash == NULL) || (cluster_name == NULL))
+  {
+    return 0U;
+  }
+
+  for (index = 0U; index < DEVICE_CONFIG_PASSWORD_HASH_LEN; ++index)
+  {
+    if (password_hash[index] != 0U)
+    {
+      has_password = 1U;
+      break;
+    }
+  }
+
+  if (has_password != 0U)
+  {
+    uint8_t hmac_out[32];
+    char input_buf[128];
+    int len = snprintf(input_buf, sizeof(input_buf),
+                       "%lu|%lu|%s",
+                       (unsigned long)unix_time,
+                       (unsigned long)node_id,
+                       cluster_name);
+    if ((len > 0) && ((size_t)len < sizeof(input_buf)) &&
+        (mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                         password_hash,
+                         DEVICE_CONFIG_PASSWORD_HASH_LEN,
+                         (const unsigned char *)input_buf, (size_t)len,
+                         hmac_out) == 0))
+    {
+      uint32_t tag;
+      memcpy(&tag, hmac_out, sizeof(tag));
+      return tag;
+    }
+    return 0U;
+  }
+
+  /* No password → deterministic FNV1a of the zero hash. */
+  {
+    uint32_t hash = 2166136261UL;
+    for (index = 0U; index < DEVICE_CONFIG_PASSWORD_HASH_LEN; ++index)
+    {
+      hash ^= password_hash[index];
+      hash *= 16777619UL;
+    }
+    return hash;
+  }
 }
 
 void device_config_build_defaults(device_config_t *config)
