@@ -3479,6 +3479,13 @@ app.post("/api/provision", (req, res) => {
     return res.status(403).json({ ok: false, error: "device_disabled" });
   }
 
+  /* Devices must be claimed by a user before they can provision.
+     An unclaimed device is registered but has no owner — it cannot
+     obtain a PSK and therefore cannot connect to the MQTT broker. */
+  if (!deviceRecord.owner || String(deviceRecord.owner).trim() === "") {
+    return res.status(403).json({ ok: false, error: "device_not_claimed" });
+  }
+
   // Optional fingerprint verification (strict when fingerprint is set)
   if (deviceFingerprint && deviceRecord.deviceFingerprint) {
     if (deviceFingerprint !== deviceRecord.deviceFingerprint) {
@@ -3510,6 +3517,42 @@ app.post("/api/provision", (req, res) => {
     cloud_cluster_ca_cert_pem: clusterRecord.caPublicPem || "",
     cloud_cluster_binding_secret: clusterRecord.bindingSecret || "",
   });
+});
+
+// ── Device Claim API ──────────────────────────────────────────────
+// A user claims ownership of a registered device.  Until claimed,
+// the device cannot obtain a PSK through /api/provision and cannot
+// connect to the MQTT broker.
+
+app.post("/api/devices/:deviceId/claim", (req, res) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  const owner = String(req.body.owner || "").trim();
+
+  if (!deviceId || !owner) {
+    return res.status(400).json({ ok: false, error: "missing_device_id_or_owner" });
+  }
+
+  let foundRecord = null;
+  for (const [key, record] of Array.from(cloudDevices.entries())) {
+    if (String(record.deviceId || "").trim() === deviceId) {
+      foundRecord = record;
+      break;
+    }
+  }
+  if (!foundRecord) {
+    return res.status(404).json({ ok: false, error: "device_not_found" });
+  }
+
+  const currentOwner = String(foundRecord.owner || "").trim();
+  if (currentOwner && currentOwner !== owner) {
+    return res.status(403).json({ ok: false, error: "device_already_claimed", currentOwner });
+  }
+
+  foundRecord.owner = owner;
+  cloudDevices.set(foundRecord.registryKey, foundRecord);
+  scheduleCloudRegistrySave();
+  pushEvent("device-claimed", { deviceId, owner, timestamp: new Date().toISOString() });
+  return res.json({ ok: true, deviceId, owner });
 });
 
 loadKeyStore();

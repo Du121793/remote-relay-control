@@ -65,6 +65,10 @@ function lookupIdentity(identity) {
   if (!device || device.enabled === false) {
     return null;
   }
+  // Reject unclaimed devices — they cannot connect to the MQTT broker
+  if (!device.owner || String(device.owner).trim() === "") {
+    return null;
+  }
   const cluster = registry.clusters.get(String(device.clusterId || ""));
   if (!cluster || cluster.enabled === false || !cluster.bindingSecret) {
     return null;
