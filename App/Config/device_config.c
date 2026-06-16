@@ -896,6 +896,13 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   src32 = (const uint32_t *)&temp;
   g_device_config_last_flash_error = 0U;
 
+  /* Disable interrupts during the entire flash erase+program sequence.
+     On STM32F7, any interrupt that tries to fetch code from flash while
+     a sector is being erased or programmed will cause an imprecise bus
+     fault (CFSR=0x00000400).  The HAL flash helpers do not guarantee
+     full interrupt masking for the complete operation window. */
+  __disable_irq();
+
   HAL_FLASH_Unlock();
   __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
                          FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_ERSERR);
@@ -903,6 +910,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   if (device_config_flash_erase() == 0U)
   {
     HAL_FLASH_Lock();
+    __enable_irq();
     return 0U;
   }
 
@@ -914,11 +922,13 @@ static uint8_t device_config_save_direct(const device_config_t *config)
     {
       g_device_config_last_flash_error = HAL_FLASH_GetError();
       HAL_FLASH_Lock();
+      __enable_irq();
       return 0U;
     }
   }
 
   HAL_FLASH_Lock();
+  __enable_irq();
   return 1U;
 }
 
