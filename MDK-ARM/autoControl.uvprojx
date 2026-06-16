@@ -551,6 +551,11 @@
               <FileType>1</FileType>
               <FilePath>../App/Service/time_sync_service.c</FilePath>
             </File>
+            <File>
+              <FileName>https_client_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Service/https_client_service.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

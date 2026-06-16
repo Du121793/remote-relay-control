@@ -36,6 +36,7 @@
 #include "discovery_service.h"
 #include "adc_service.h"
 #include "time_sync_service.h"
+#include "https_client_service.h"
 #include "lwip/stats.h"
 #include "lwip/dhcp.h"
 #include "lwip/ip4_addr.h"
@@ -810,6 +811,7 @@ void StartDefaultTask(void const * argument)
     discovery_service_poll();
     backend_link_service_poll();
     mqtt_link_service_poll();
+    https_client_service_poll();
     time_sync_service_poll();
     http_service_poll();
     cluster_service_poll();

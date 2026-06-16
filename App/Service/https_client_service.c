@@ -244,7 +244,7 @@ static void https_client_parse_and_apply(const char *body, size_t body_len)
   }
 
   (void)device_config_update_and_save(&updated);
-  mqtt_link_service_mark_dirty();
+  mqtt_link_service_mark_status_dirty();
 }
 
 static err_t https_client_recv(void *arg, struct altcp_pcb *pcb,
@@ -319,14 +319,27 @@ static void https_client_connect_to(const ip_addr_t *address)
     return;
   }
 
-  g_https_client_context.pcb =
-    altcp_tls_new(altcp_tls_create_config_client_2wayauth(
-                    (const u8_t *)config->cloud_cluster_ca_cert,
-                    (size_t)(config->cloud_cluster_ca_cert[0] != '\0' ? 1U : 0U) *
-                      strlen(config->cloud_cluster_ca_cert),
-                    NULL, 0U,
-                    NULL, 0U),
-                  IPADDR_TYPE_V4);
+  {
+    const u8_t *ca_cert = (const u8_t *)config->cloud_cluster_ca_cert;
+    size_t ca_cert_len = (config->cloud_cluster_ca_cert[0] != '\0')
+                         ? strlen(config->cloud_cluster_ca_cert)
+                         : 0U;
+
+    if (ca_cert_len > 0U)
+    {
+      g_https_client_context.pcb =
+        altcp_tls_new(altcp_tls_create_config_client(ca_cert, ca_cert_len),
+                      IPADDR_TYPE_V4);
+    }
+    else
+    {
+      /* No CA cert configured — TLS without server verification.
+         The connection is still encrypted but vulnerable to MITM. */
+      g_https_client_context.pcb =
+        altcp_tls_new(altcp_tls_create_config_client(NULL, 0U),
+                      IPADDR_TYPE_V4);
+    }
+  }
   if (g_https_client_context.pcb == NULL)
   {
     return;
