@@ -420,10 +420,10 @@ int main(void)
   /* defaultTask stack is now statically allocated to guard against heap-
      edge corruption of the FreeRTOS stack canary.  3072 words (12 KB)
      provides headroom for the 3616-byte device_config_t copy in save paths. */
-  static StackType_t defaultTaskStack[3072];
+  static StackType_t defaultTaskStack[4096];
   static StaticTask_t defaultTaskTCB;
   defaultTaskHandle = xTaskCreateStatic((TaskFunction_t)StartDefaultTask, "defaultTask",
-                                        3072, NULL,
+                                        4096, NULL,
                                         osPriorityNormal, defaultTaskStack,
                                         &defaultTaskTCB);
 
