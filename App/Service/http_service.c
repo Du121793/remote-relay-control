@@ -2051,6 +2051,9 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     {
       memset(config.cluster_name, 0, sizeof(config.cluster_name));
       strncpy(config.cluster_name, cluster_name, sizeof(config.cluster_name) - 1U);
+      /* Keep cloud_cluster_id in sync with cluster_name */
+      memset(config.cloud_cluster_id, 0, sizeof(config.cloud_cluster_id));
+      strncpy(config.cloud_cluster_id, cluster_name, sizeof(config.cloud_cluster_id) - 1U);
     }
 
     if (http_service_extract_form_value(body, "cluster_enabled", &value) && (value <= 1U))
@@ -2129,23 +2132,9 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       }
     }
 
-    if (http_service_extract_form_text(body, "cloud_cluster_id", cloud_cluster_id, sizeof(cloud_cluster_id)))
-    {
-      memset(config.cloud_cluster_id, 0, sizeof(config.cloud_cluster_id));
-      strncpy(config.cloud_cluster_id, cloud_cluster_id, sizeof(config.cloud_cluster_id) - 1U);
-    }
-
-    if (http_service_extract_form_text(body, "cloud_device_id", cloud_device_id, sizeof(cloud_device_id)))
-    {
-      memset(config.cloud_device_id, 0, sizeof(config.cloud_device_id));
-      strncpy(config.cloud_device_id, cloud_device_id, sizeof(config.cloud_device_id) - 1U);
-    }
-
-    if (http_service_extract_form_text(body, "cloud_key_id", cloud_key_id, sizeof(cloud_key_id)))
-    {
-      memset(config.cloud_key_id, 0, sizeof(config.cloud_key_id));
-      strncpy(config.cloud_key_id, cloud_key_id, sizeof(config.cloud_key_id) - 1U);
-    }
+    /* cloud_cluster_id / cloud_device_id / cloud_key_id are read-only —
+       they are auto-generated from the MCU UID at factory-defaults time
+       and the cluster name.  The user cannot override them. */
 
     if (http_service_extract_form_text(body, "cloud_cluster_ca_fingerprint", cloud_cluster_ca_fingerprint, sizeof(cloud_cluster_ca_fingerprint)))
     {

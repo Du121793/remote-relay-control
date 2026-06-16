@@ -31,7 +31,6 @@ extern struct netif gnetif;
 typedef struct
 {
   uint8_t initialized;
-  uint32_t local_auth_tag;
   uint32_t local_load_score;
   uint32_t pending_master_node_id;
   uint32_t pending_master_since_ms;
@@ -859,7 +858,6 @@ void cluster_service_reload_from_config(void)
   memcpy(g_cluster_context.state.cluster_name, config->cluster_name, sizeof(g_cluster_context.state.cluster_name));
   memset(g_cluster_context.nodes, 0, sizeof(g_cluster_context.nodes));
   memset(g_cluster_context.banned_node_ids, 0, sizeof(g_cluster_context.banned_node_ids));
-  g_cluster_context.local_auth_tag = device_config_password_tag(config);
   g_cluster_context.local_load_score = 0U;
   g_cluster_context.state.has_master = 0U;
   g_cluster_context.state.master_node_id = 0U;
@@ -906,7 +904,6 @@ void cluster_service_init(void)
   g_cluster_context.state.health_lateness_ms = 0U;
   g_cluster_context.state.health_bad_streak = 0U;
   memcpy(g_cluster_context.state.cluster_name, config->cluster_name, sizeof(g_cluster_context.state.cluster_name));
-  g_cluster_context.local_auth_tag = device_config_password_tag(config);
   g_cluster_context.local_load_score = 0U;
   g_cluster_context.pending_master_node_id = 0U;
   g_cluster_context.pending_master_since_ms = 0U;

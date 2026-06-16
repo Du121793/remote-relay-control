@@ -548,9 +548,21 @@ void device_config_build_defaults(device_config_t *config)
   config->cloud_transport = 1U;
   memcpy(config->cloud_broker_host, "broker.example.com", sizeof("broker.example.com"));
   config->cloud_broker_port = 8883U;
-  config->cloud_cluster_id[0] = '\0';
-  config->cloud_device_id[0] = '\0';
-  config->cloud_key_id[0] = '\0';
+  /* Auto-generate cloud identity from MCU UID so every device has a
+     unique, non-editable cloud_device_id.  The UID is 96 bits. */
+  {
+    const uint32_t uid0 = *(const uint32_t *)0x1FF0F420UL;
+    const uint32_t uid1 = *(const uint32_t *)0x1FF0F424UL;
+    const uint32_t uid2 = *(const uint32_t *)0x1FF0F428UL;
+    (void)snprintf(config->cloud_device_id, sizeof(config->cloud_device_id),
+                   "node-%lu-%lu",
+                   (unsigned long)(((uid0 ^ uid2) >> 3U) & 0x3FFFFFFFUL),
+                   (unsigned long)((uid1 & 0x0FFFFFFFUL)));
+    (void)snprintf(config->cloud_key_id, sizeof(config->cloud_key_id),
+                   "key-%08lx", (unsigned long)((uid0 ^ uid1 ^ uid2) & 0xFFFFFFFFUL));
+  }
+  /* cloud_cluster_id follows cluster_name — defaults to "default" cluster */
+  memcpy(config->cloud_cluster_id, "default", sizeof("default"));
   config->cloud_cluster_ca_fingerprint[0] = '\0';
   config->cloud_cluster_binding_secret[0] = '\0';
   config->cloud_cluster_ca_cert[0] = '\0';
