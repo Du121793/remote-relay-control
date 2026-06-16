@@ -38,7 +38,7 @@ static StaticQueue_t g_device_config_queue_buffer;
 static uint8_t g_device_config_queue_storage[
   DEVICE_CONFIG_QUEUE_LENGTH * sizeof(device_config_request_t)];
 static StaticTask_t g_device_config_task_buffer;
-static StackType_t g_device_config_task_stack[1024];
+static StackType_t g_device_config_task_stack[1536];
 static StaticSemaphore_t g_device_config_save_mutex_buffer;
 static SemaphoreHandle_t g_device_config_save_mutex = NULL;
 static uint8_t g_device_config_sync_result = 0U;
