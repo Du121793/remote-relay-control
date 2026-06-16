@@ -31,6 +31,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Forward: config-sync AES-GCM decrypt helper (defined in control_queue.c) */
+size_t control_queue_decrypt_body(const char *enc_body, size_t enc_len,
+                                   const uint8_t key[16],
+                                   char *plain_out, size_t plain_out_size);
+
 #define HTTP_TCP_PORT               80U
 #define HTTP_CONN_POOL_SIZE         4U
 #define HTTP_REQUEST_BUFFER_SIZE    2048U
@@ -2040,6 +2045,58 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     }
 
     config = *current_config;
+
+    /* Decrypt config-sync body if the master encrypted it with the
+       cluster password.  The body starts with _enc=1&_data=<base64>. */
+    if ((strncmp(body, "_enc=1&_data=", 13) == 0) &&
+        (current_config->cluster_password_hash[0] != 0U))
+    {
+      static char enc_body[2048];
+      static char plain_body[2048];
+      const char *data_ptr = body + 13;
+      size_t di = 0U;
+      while (*data_ptr && *data_ptr != '&' && di < sizeof(enc_body))
+      {
+        enc_body[di++] = *data_ptr++;
+      }
+      enc_body[di] = '\0';
+      /* Base64url decode */
+      {
+        uint32_t acc = 0U; uint8_t bits = 0U; size_t out_len = 0U;
+        for (size_t si = 0U; si < di && out_len < sizeof(enc_body); ++si)
+        {
+          char c = enc_body[si];
+          int val = -1;
+          if (c >= 'A' && c <= 'Z') val = c - 'A';
+          else if (c >= 'a' && c <= 'z') val = c - 'a' + 26;
+          else if (c >= '0' && c <= '9') val = c - '0' + 52;
+          else if (c == '-') val = 62;
+          else if (c == '_') val = 63;
+          if (val < 0) continue;
+          acc = (acc << 6) | (uint32_t)val;
+          bits += 6;
+          if (bits >= 8)
+          {
+            bits -= 8;
+            enc_body[out_len++] = (uint8_t)(acc >> bits);
+            acc &= (1U << bits) - 1U;
+          }
+        }
+        di = out_len;
+      }
+      {
+        uint8_t key[16];
+        size_t plain_len;
+        memcpy(key, current_config->cluster_password_hash, sizeof(key));
+        plain_len = control_queue_decrypt_body(enc_body, di, key,
+                                               plain_body, sizeof(plain_body));
+        if (plain_len > 0U && plain_len < sizeof(plain_body))
+        {
+          plain_body[plain_len] = '\0';
+          body = plain_body;
+        }
+      }
+    }
 
     if (http_service_extract_form_text(body, "device_name", device_name, sizeof(device_name)))
     {

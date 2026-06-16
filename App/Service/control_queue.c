@@ -10,6 +10,10 @@
 #include "FreeRTOS.h"
 #include "queue.h"
 #include "semphr.h"
+
+#include "mbedtls/gcm.h"
+
+extern RNG_HandleTypeDef hrng;
 #include "task.h"
 #include "../Config/device_config.h"
 
@@ -171,6 +175,65 @@ static size_t control_queue_url_encode(const char *src, char *dst, size_t dst_si
 
   dst[di] = '\0';
   return di;
+}
+
+/* ── Config-sync AES-128-GCM encrypt / decrypt ──────────────────
+   Key = first 16 bytes of cluster_password_hash (must match on both
+   master and member for the cluster to be authenticated anyway). */
+
+size_t control_queue_encrypt_body(const char *plain_body, size_t plain_len,
+                                   const uint8_t key[16],
+                                   char *enc_out, size_t enc_out_size)
+{
+  uint8_t iv[12], tag[16], ct_buf[1536];
+  size_t ct_len = plain_len, out_pos = 0U;
+  mbedtls_gcm_context ctx;
+  int ret; uint32_t i;
+
+  if (!plain_body || !key || !enc_out || plain_len > sizeof(ct_buf)) return 0U;
+  for (i = 0U; i < 12U; ++i) {
+    uint32_t r = 0U;
+    if (HAL_RNG_GenerateRandomNumber(&hrng, &r) == HAL_OK) iv[i] = (uint8_t)r;
+    else iv[i] = (uint8_t)(HAL_GetTick() >> (i & 7U));
+  }
+  mbedtls_gcm_init(&ctx);
+  ret = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 128U);
+  if (ret) { mbedtls_gcm_free(&ctx); return 0U; }
+  ret = mbedtls_gcm_crypt_and_tag(&ctx, MBEDTLS_GCM_ENCRYPT, plain_len,
+                                  iv, 12U, NULL, 0,
+                                  (const unsigned char *)plain_body, ct_buf,
+                                  16U, tag);
+  mbedtls_gcm_free(&ctx);
+  if (ret) return 0U;
+  if (enc_out_size < (12U + plain_len + 16U)) return 0U;
+  memcpy(enc_out, iv, 12U);
+  memcpy(enc_out + 12U, ct_buf, plain_len);
+  memcpy(enc_out + 12U + plain_len, tag, 16U);
+  return 12U + plain_len + 16U;
+}
+
+size_t control_queue_decrypt_body(const char *enc_body, size_t enc_len,
+                                   const uint8_t key[16],
+                                   char *plain_out, size_t plain_out_size)
+{
+  mbedtls_gcm_context ctx;
+  const uint8_t *iv, *tag, *ct;
+  size_t ct_len; int ret;
+  if (!enc_body || !key || !plain_out || enc_len < 28U) return 0U;
+  iv  = (const uint8_t *)enc_body;
+  tag = (const uint8_t *)(enc_body + enc_len - 16U);
+  ct  = (const uint8_t *)(enc_body + 12U);
+  ct_len = enc_len - 28U;
+  if (ct_len > plain_out_size) return 0U;
+  mbedtls_gcm_init(&ctx);
+  ret = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 128U);
+  if (ret) { mbedtls_gcm_free(&ctx); return 0U; }
+  ret = mbedtls_gcm_auth_decrypt(&ctx, ct_len, iv, 12U, NULL, 0,
+                                 tag, 16U, ct, (unsigned char *)plain_out);
+  mbedtls_gcm_free(&ctx);
+  if (ret) return 0U;
+  plain_out[ct_len] = '\0';
+  return ct_len;
 }
 
 static uint8_t control_queue_http_response_complete(const char *response, size_t used)
@@ -368,6 +431,43 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_sync_remote_bac
                  workspace->encoded_cloud_cluster_id,
                  workspace->encoded_cloud_cluster_ca_fingerprint,
                  workspace->encoded_cloud_cluster_binding_secret);
+
+  /* Encrypt the config-sync body with AES-128-GCM when a cluster password
+     is set, so the binding_secret never traverses the LAN in plaintext. */
+  {
+    const device_config_t *dc = device_config_get();
+    if ((dc != NULL) && (dc->cluster_password_hash[0] != 0U))
+    {
+      uint8_t key[16];
+      char enc_buf[2048];
+      size_t enc_len;
+      memcpy(key, dc->cluster_password_hash, sizeof(key));
+      enc_len = control_queue_encrypt_body(workspace->body,
+                                           strlen(workspace->body),
+                                           key, enc_buf, sizeof(enc_buf));
+      if (enc_len > 0U)
+      {
+        static const char b64[] =
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        size_t out = (size_t)snprintf(workspace->body, sizeof(workspace->body),
+                                      "_enc=1&_data=");
+        size_t si = 0U;
+        while (si < enc_len && (out + 3U) < sizeof(workspace->body))
+        {
+          uint32_t triple = (uint32_t)((unsigned char)enc_buf[si]) << 16;
+          if (si + 1U < enc_len) triple |= (uint32_t)((unsigned char)enc_buf[si+1U]) << 8;
+          if (si + 2U < enc_len) triple |= (uint32_t)((unsigned char)enc_buf[si+2U]);
+          workspace->body[out++] = b64[(triple >> 18) & 0x3F];
+          workspace->body[out++] = b64[(triple >> 12) & 0x3F];
+          workspace->body[out++] = (si + 1U < enc_len) ? b64[(triple >> 6) & 0x3F] : '=';
+          workspace->body[out++] = (si + 2U < enc_len) ? b64[triple & 0x3F] : '=';
+          si += 3U;
+        }
+        workspace->body[out] = '\0';
+      }
+    }
+  }
+
   (void)snprintf(workspace->config_request, sizeof(workspace->config_request),
                  "POST /api/config/cluster HTTP/1.1\r\n"
                  "Host: remote\r\n"
