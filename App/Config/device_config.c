@@ -14,7 +14,7 @@
 
 #include "mbedtls/sha256.h"
 
-static device_config_t g_device_config;
+static device_config_t g_device_config __attribute__((aligned(8)));
 static uint32_t g_device_config_last_flash_error = 0U;
 static QueueHandle_t g_device_config_queue = NULL;
 static TaskHandle_t g_device_config_task_handle = NULL;

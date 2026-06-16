@@ -2148,6 +2148,11 @@
               </FileOption>
             </File>
             <File>
+              <FileName>bss_align.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/bss_align.c</FilePath>
+            </File>
+            <File>
               <FileName>heap_4.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Middlewares/Third_Party/FreeRTOS/Source/portable/MemMang/heap_4.c</FilePath>
