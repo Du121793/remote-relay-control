@@ -984,7 +984,7 @@ static void device_config_worker_init(void)
     g_device_config_task_handle =
       xTaskCreateStatic(device_config_worker_task,
                         "CfgSave",
-                        1024U,
+                        1536U,
                         NULL,
                         tskIDLE_PRIORITY + 1U,
                         g_device_config_task_stack,
