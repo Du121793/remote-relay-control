@@ -1169,6 +1169,30 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)g_eth_last_rx_ms,
                  (unsigned long)heth.Instance->DMASR,
                  (unsigned long)heth.RxDescList.RxBuildDescCnt);
+
+  /* Append per-channel ADC data after the main JSON closes */
+  {
+    size_t pos = strlen(buffer);
+    if (pos > 1U && buffer[pos - 1U] == '}')
+    {
+      int w; uint8_t ch;
+      buffer[pos - 1U] = '\0';
+      w = snprintf(buffer + pos - 1U, buffer_size - (pos - 1U), ",\"adc_channels\":[");
+      if (w > 0) pos = (pos - 1U) + (size_t)w;
+      for (ch = 0U; ch < ADC_SERVICE_CHANNEL_COUNT; ++ch)
+      {
+        adc_service_channel_state_t cs;
+        (void)adc_service_get_channel_state(ch, &cs);
+        w = snprintf(buffer + pos, buffer_size - pos,
+                     "%s{\"ch\":%u,\"ct\":%u,\"mA\":%lu}",
+                     (ch == 0U) ? "" : ",", (unsigned int)ch,
+                     (unsigned int)cs.ct_valid, (unsigned long)cs.current_milliamps);
+        if (w > 0 && (size_t)w < (buffer_size - pos)) pos += (size_t)w;
+        else break;
+      }
+      w = snprintf(buffer + pos, buffer_size - pos, "]}");
+    }
+  }
 }
 
 __attribute__((noinline)) static err_t http_service_handle_status_request(http_service_connection_t *connection)

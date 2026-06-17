@@ -71,7 +71,7 @@ typedef struct
   uint32_t last_hal_status;
 } adc_service_state_t;
 
-void adc_service_init(ADC_HandleTypeDef *adc_handle, TIM_HandleTypeDef *timer_handle);
+void adc_service_init(ADC_HandleTypeDef *adc1, ADC_HandleTypeDef *adc3, TIM_HandleTypeDef *timer);
 void adc_service_poll(void);
 void adc_service_get_state(adc_service_state_t *state);
 uint8_t adc_service_get_channel_state(uint8_t channel,

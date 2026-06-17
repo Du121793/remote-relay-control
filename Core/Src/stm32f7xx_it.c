@@ -205,6 +205,7 @@ static void fault_dump_and_reset(const char *label,
 /* External variables --------------------------------------------------------*/
 extern ETH_HandleTypeDef heth;
 extern DMA_HandleTypeDef hdma_adc1;
+extern DMA_HandleTypeDef hdma_adc3;
 extern TIM_HandleTypeDef htim6;
 /* USER CODE BEGIN EV */
 
@@ -332,9 +333,11 @@ void DMA2_Stream0_IRQHandler(void)
   HAL_DMA_IRQHandler(&hdma_adc1);
 }
 
-/**
-  * @brief This function handles TIM6 global interrupt, DAC1 and DAC2 underrun errors.
-  */
+void DMA2_Stream1_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_adc3);
+}
+
 void TIM6_DAC_IRQHandler(void)
 {
   HAL_TIM_IRQHandler(&htim6);
