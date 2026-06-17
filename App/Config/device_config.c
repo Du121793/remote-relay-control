@@ -400,8 +400,7 @@ static void device_config_build_current_defaults(device_config_t *config)
 
   for (index = 0U; index < DEVICE_CONFIG_RELAY_COUNT; ++index)
   {
-    config->current[index].adc_channel =
-      DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED;
+    config->current[index].adc_channel = (uint8_t)index;
     config->current[index].protection_enabled = 0U;
     config->current[index].reserved = 0U;
     config->current[index].overcurrent_milliamps =
