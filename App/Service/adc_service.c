@@ -154,8 +154,9 @@ static void adc_service_publish_channel(uint8_t sw_ch, uint32_t vdda_mv,
   {
     const device_config_t *config = device_config_get();
     const device_config_current_t *current = &config->current[sw_ch];
-    uint8_t prot_en = ((current->adc_channel == sw_ch) &&
-                       (result.ct_valid != 0U) &&
+    /* ADC channels are hard-bound to relays: relay N → ADC(N-1).
+       adc_channel in flash config is ignored for channel routing. */
+    uint8_t prot_en = ((result.ct_valid != 0U) &&
                        (current->protection_enabled != 0U)) ? 1U : 0U;
     if (ct_overcurrent_update(&g_adc_protection_state[sw_ch],
                               prot_en, result.current_milliamps,

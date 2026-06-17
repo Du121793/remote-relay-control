@@ -2406,18 +2406,8 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     {
       config.relay[channel - 1U].boot_default_on = (uint8_t)value;
     }
-    if (http_service_extract_form_value(body, "adc_channel", &value))
-    {
-      if ((value >= ADC_SERVICE_CHANNEL_COUNT) &&
-          (value != DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED))
-      {
-        http_service_format_error_json(response_body, response_body_size,
-                                       "bad_adc_channel");
-        return http_service_send_payload(connection, "400 Bad Request",
-                                         "application/json", response_body);
-      }
-      config.current[channel - 1U].adc_channel = (uint8_t)value;
-    }
+    /* adc_channel is hard-bound to relay index (relay N → ADC N-1).
+       User-supplied adc_channel values are ignored. */
     if (http_service_extract_form_value(body, "protection_enabled", &value))
     {
       if (value > 1U)
