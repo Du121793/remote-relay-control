@@ -1169,6 +1169,37 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)g_eth_last_rx_ms,
                  (unsigned long)heth.Instance->DMASR,
                  (unsigned long)heth.RxDescList.RxBuildDescCnt);
+
+  /* Append per-channel ADC currents after the main JSON object.
+     The closing "}" is overwritten with the channel array, then re-added. */
+  {
+    size_t end_pos = strlen(buffer);
+    if (end_pos > 1U && buffer[end_pos - 1U] == '}')
+    {
+      uint8_t ch;
+      int w;
+      buffer[end_pos - 1U] = '\0'; /* remove closing } */
+      w = snprintf(buffer + end_pos - 1U, buffer_size - (end_pos - 1U),
+                   ",\"adc_channels\":[");
+      if (w > 0) { end_pos = (end_pos - 1U) + (size_t)w; }
+      for (ch = 0U; ch < ADC_SERVICE_CHANNEL_COUNT; ++ch)
+      {
+        adc_service_channel_state_t cs;
+        (void)adc_service_get_channel_state(ch, &cs);
+        w = snprintf(buffer + end_pos, buffer_size - end_pos,
+                     "%s{\"ch\":%u,\"mA\":%lu}",
+                     (ch == 0U) ? "" : ",",
+                     (unsigned int)ch,
+                     (unsigned long)cs.current_milliamps);
+        if (w > 0 && (size_t)w < (buffer_size - end_pos))
+          end_pos += (size_t)w;
+        else break;
+      }
+      /* Re-close JSON */
+      w = snprintf(buffer + end_pos, buffer_size - end_pos, "]}");
+      if (w > 0) end_pos += (size_t)w;
+    }
+  }
 }
 
 __attribute__((noinline)) static err_t http_service_handle_status_request(http_service_connection_t *connection)
