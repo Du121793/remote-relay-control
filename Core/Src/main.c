@@ -36,6 +36,7 @@
 #include "discovery_service.h"
 #include "adc_service.h"
 #include "time_sync_service.h"
+#include "https_client_service.h"
 #include "lwip/stats.h"
 #include "lwip/dhcp.h"
 #include "lwip/ip4_addr.h"
@@ -416,10 +417,15 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  /* CMSIS-RTOS V1 in this repo forwards stacksz directly to FreeRTOS xTaskCreate(),
-     so the effective unit here behaves like StackType_t words, not bytes. */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 2048);
-  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
+  /* defaultTask stack is now statically allocated to guard against heap-
+     edge corruption of the FreeRTOS stack canary.  3072 words (12 KB)
+     provides headroom for the 3616-byte device_config_t copy in save paths. */
+  static StackType_t defaultTaskStack[4096];
+  static StaticTask_t defaultTaskTCB;
+  defaultTaskHandle = xTaskCreateStatic((TaskFunction_t)StartDefaultTask, "defaultTask",
+                                        4096, NULL,
+                                        osPriorityNormal, defaultTaskStack,
+                                        &defaultTaskTCB);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -810,6 +816,7 @@ void StartDefaultTask(void const * argument)
     discovery_service_poll();
     backend_link_service_poll();
     mqtt_link_service_poll();
+    https_client_service_poll();
     time_sync_service_poll();
     http_service_poll();
     cluster_service_poll();

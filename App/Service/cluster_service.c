@@ -7,6 +7,7 @@
 #include "task.h"
 #include "lwip/netif.h"
 #include <string.h>
+#include "mbedtls/md.h"
 
 #include "stm32f7xx_hal.h"
 
@@ -30,7 +31,6 @@ extern struct netif gnetif;
 typedef struct
 {
   uint8_t initialized;
-  uint32_t local_auth_tag;
   uint32_t local_load_score;
   uint32_t pending_master_node_id;
   uint32_t pending_master_since_ms;
@@ -548,10 +548,41 @@ static uint8_t cluster_service_node_is_eligible(const cluster_node_t *node,
     return 0U;
   }
 
-  if ((strcmp(node->cluster_name, state->cluster_name) != 0) ||
-      (node->auth_tag != g_cluster_context.local_auth_tag))
+  if (strcmp(node->cluster_name, state->cluster_name) != 0)
   {
     return 0U;
+  }
+
+  /* Compute the expected auth_tag with the same shared function the
+     sender uses.  The tag binds the announce to the sender's unix_time,
+     node_id and cluster_name, keyed with the cluster password.  Reject
+     if the tag mismatches or the timestamp is outside ±30 seconds. */
+  {
+    const device_config_t *config = device_config_get();
+    int32_t time_diff;
+
+    if (config == NULL)
+    {
+      return 0U;
+    }
+
+    time_diff = (int32_t)(state->unix_time - node->unix_time);
+    if ((time_diff > 30) || (time_diff < -30))
+    {
+      return 0U;
+    }
+
+    {
+      uint32_t expected_tag =
+        device_config_compute_auth_tag(config->cluster_password_hash,
+                                       node->unix_time,
+                                       node->node_id,
+                                       node->cluster_name);
+      if (node->auth_tag != expected_tag)
+      {
+        return 0U;
+      }
+    }
   }
 
   return 1U;
@@ -827,7 +858,6 @@ void cluster_service_reload_from_config(void)
   memcpy(g_cluster_context.state.cluster_name, config->cluster_name, sizeof(g_cluster_context.state.cluster_name));
   memset(g_cluster_context.nodes, 0, sizeof(g_cluster_context.nodes));
   memset(g_cluster_context.banned_node_ids, 0, sizeof(g_cluster_context.banned_node_ids));
-  g_cluster_context.local_auth_tag = device_config_password_tag(config);
   g_cluster_context.local_load_score = 0U;
   g_cluster_context.state.has_master = 0U;
   g_cluster_context.state.master_node_id = 0U;
@@ -874,7 +904,6 @@ void cluster_service_init(void)
   g_cluster_context.state.health_lateness_ms = 0U;
   g_cluster_context.state.health_bad_streak = 0U;
   memcpy(g_cluster_context.state.cluster_name, config->cluster_name, sizeof(g_cluster_context.state.cluster_name));
-  g_cluster_context.local_auth_tag = device_config_password_tag(config);
   g_cluster_context.local_load_score = 0U;
   g_cluster_context.pending_master_node_id = 0U;
   g_cluster_context.pending_master_since_ms = 0U;

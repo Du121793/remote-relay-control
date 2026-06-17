@@ -8,6 +8,7 @@
 #include "control_service.h"
 #include "../Config/device_config.h"
 #include "discovery_proto.h"
+#include "mbedtls/md.h"
 #include "http_service.h"
 #include "lwip.h"
 
@@ -76,7 +77,10 @@ static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t por
                                                   control_stats.connections,
                                                   control_stats.commands);
   cluster_service_set_local_load_score(load_score);
-  auth_tag = device_config_password_tag(config);
+  auth_tag = device_config_compute_auth_tag(config->cluster_password_hash,
+                                            cluster_state.unix_time,
+                                            cluster_state.self_node_id,
+                                            cluster_state.cluster_name);
   for (relay_index = 0U; relay_index < DEVICE_CONFIG_RELAY_COUNT; ++relay_index)
   {
     if (config->relay[relay_index].enabled != 0U)

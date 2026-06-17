@@ -17,6 +17,7 @@ extern "C" {
 #define DEVICE_CONFIG_CLOUD_HOST_MAX_LEN     64U
 #define DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN 96U
 #define DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN   128U
+#define DEVICE_CONFIG_CA_CERT_MAX_LEN        2048U
 #define DEVICE_CONFIG_MAGIC                  0x43464731UL
 #define DEVICE_CONFIG_VERSION                6U
 #define DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED 255U
@@ -70,6 +71,9 @@ typedef struct
   char cloud_key_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
   char cloud_cluster_ca_fingerprint[DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN];
   char cloud_cluster_binding_secret[DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN];
+  char cloud_cluster_ca_cert[DEVICE_CONFIG_CA_CERT_MAX_LEN];
+  uint32_t provisioning_revision;
+  uint32_t ca_revocation_tag;
   uint32_t saved_relay_mask;
   device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
   device_config_current_t current[DEVICE_CONFIG_RELAY_COUNT];
@@ -87,6 +91,10 @@ uint8_t device_config_save(const device_config_t *config);
 void device_config_reset(void);
 void device_config_hash_password_text(const char *text, uint8_t hash_out[DEVICE_CONFIG_PASSWORD_HASH_LEN]);
 uint32_t device_config_password_tag(const device_config_t *config);
+uint32_t device_config_compute_auth_tag(const uint8_t password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN],
+                                        uint32_t unix_time,
+                                        uint32_t node_id,
+                                        const char *cluster_name);
 uint32_t device_config_last_flash_error(void);
 uint32_t device_config_build_startup_relay_mask(const device_config_t *config);
 uint8_t device_config_persist_runtime_relay_mask(uint32_t relay_mask);

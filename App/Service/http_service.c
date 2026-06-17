@@ -31,6 +31,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Forward: config-sync AES-GCM decrypt helper (defined in control_queue.c) */
+size_t control_queue_decrypt_body(const char *enc_body, size_t enc_len,
+                                   const uint8_t key[16],
+                                   char *plain_out, size_t plain_out_size);
+
 #define HTTP_TCP_PORT               80U
 #define HTTP_CONN_POOL_SIZE         4U
 #define HTTP_REQUEST_BUFFER_SIZE    2048U
@@ -1340,8 +1345,6 @@ static void http_service_sync_backend_config_to_cluster_async(void)
   const device_config_t *config = device_config_get();
   uint32_t count = 0U;
   uint32_t index;
-  uint32_t local_auth_tag;
-
   cluster_service_get_state(&cluster_state);
   if ((cluster_state.role != CLUSTER_ROLE_MASTER) ||
       (config->cluster_enabled == 0U) ||
@@ -1354,7 +1357,6 @@ static void http_service_sync_backend_config_to_cluster_async(void)
 
   nodes = cluster_service_get_nodes(&count);
   (void)count;
-  local_auth_tag = device_config_password_tag(config);
   for (index = g_http_backend_sync_cursor;
        index < CLUSTER_SERVICE_NODE_CAPACITY;
        ++index)
@@ -1363,10 +1365,20 @@ static void http_service_sync_backend_config_to_cluster_async(void)
         (nodes[index].online == 0U) ||
         (nodes[index].ip_addr == 0U) ||
         (nodes[index].role != CLUSTER_ROLE_MEMBER) ||
-        (strcmp(nodes[index].cluster_name, config->cluster_name) != 0) ||
-        (nodes[index].auth_tag != local_auth_tag))
+        (strcmp(nodes[index].cluster_name, config->cluster_name) != 0))
     {
       continue;
+    }
+    {
+      uint32_t expected_tag =
+        device_config_compute_auth_tag(config->cluster_password_hash,
+                                       nodes[index].unix_time,
+                                       nodes[index].node_id,
+                                       nodes[index].cluster_name);
+      if (nodes[index].auth_tag != expected_tag)
+      {
+        continue;
+      }
     }
 
     if (control_queue_submit_backend_sync_async(nodes[index].ip_addr,
@@ -1390,8 +1402,6 @@ static uint32_t http_service_backend_sync_member_signature(void)
   uint32_t index;
   uint32_t signature = 2166136261UL;
   uint32_t member_count = 0U;
-  uint32_t local_auth_tag;
-
   cluster_service_get_state(&cluster_state);
   if ((cluster_state.role != CLUSTER_ROLE_MASTER) ||
       (config->cluster_enabled == 0U))
@@ -1401,17 +1411,26 @@ static uint32_t http_service_backend_sync_member_signature(void)
 
   nodes = cluster_service_get_nodes(&count);
   (void)count;
-  local_auth_tag = device_config_password_tag(config);
   for (index = 0U; index < CLUSTER_SERVICE_NODE_CAPACITY; ++index)
   {
     if ((nodes[index].valid == 0U) ||
         (nodes[index].online == 0U) ||
         (nodes[index].ip_addr == 0U) ||
         (nodes[index].role != CLUSTER_ROLE_MEMBER) ||
-        (strcmp(nodes[index].cluster_name, config->cluster_name) != 0) ||
-        (nodes[index].auth_tag != local_auth_tag))
+        (strcmp(nodes[index].cluster_name, config->cluster_name) != 0))
     {
       continue;
+    }
+    {
+      uint32_t expected_tag =
+        device_config_compute_auth_tag(config->cluster_password_hash,
+                                       nodes[index].unix_time,
+                                       nodes[index].node_id,
+                                       nodes[index].cluster_name);
+      if (nodes[index].auth_tag != expected_tag)
+      {
+        continue;
+      }
     }
 
     signature ^= nodes[index].node_id;
@@ -1441,7 +1460,9 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
   static char cloud_device_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
   static char cloud_key_id_json[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 2U) + 8U];
   static char cloud_cluster_ca_fingerprint_json[(DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 2U) + 8U];
-  static char cloud_cluster_binding_secret_json[(DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN * 2U) + 8U];
+  /* binding_secret is no longer returned in GET responses — only
+     secret_configured boolean.  The JSON-escape buffer is retained for
+     the POST path where the field is still accepted. */
   uint8_t is_local_master = 0U;
 
   cluster_service_get_state(&cluster_state);
@@ -1462,8 +1483,6 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                                 config->cloud_key_id, sizeof(config->cloud_key_id));
   http_service_json_escape_copy(cloud_cluster_ca_fingerprint_json, sizeof(cloud_cluster_ca_fingerprint_json),
                                 config->cloud_cluster_ca_fingerprint, sizeof(config->cloud_cluster_ca_fingerprint));
-  http_service_json_escape_copy(cloud_cluster_binding_secret_json, sizeof(cloud_cluster_binding_secret_json),
-                                config->cloud_cluster_binding_secret, sizeof(config->cloud_cluster_binding_secret));
   (void)snprintf(buffer, buffer_size,
                  "{"
                  "\"ok\":true,"
@@ -1490,7 +1509,8 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                  "\"cloud_device_id\":\"%s\","
                  "\"cloud_key_id\":\"%s\","
                  "\"cloud_cluster_ca_fingerprint\":\"%s\","
-                 "\"cloud_cluster_binding_secret\":\"%s\""
+                 "\"cloud_cluster_binding_secret_configured\":%u,"
+                 "\"cloud_cluster_ca_cert_configured\":%u"
                  "}",
                  device_name_json,
                  (unsigned int)config->cluster_enabled,
@@ -1515,7 +1535,8 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                  cloud_device_id_json,
                  cloud_key_id_json,
                  cloud_cluster_ca_fingerprint_json,
-                 cloud_cluster_binding_secret_json);
+                 (unsigned int)(config->cloud_cluster_binding_secret[0] != '\0' ? 1U : 0U),
+                 (unsigned int)(config->cloud_cluster_ca_cert[0] != '\0' ? 1U : 0U));
 }
 
 static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_size)
@@ -1524,7 +1545,9 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
   const device_config_t *config = device_config_get();
   uint32_t count = 0U;
   uint32_t index;
-  uint32_t local_auth_tag = device_config_password_tag(config);
+  /* local_auth_tag is no longer a simple FNV1a — nodes now use
+     HMAC-SHA256.  The per-node check below recomputes via the shared
+     device_config_compute_auth_tag(). */
   size_t used;
   static char ip_text[16];
   static char cluster_name_json[(CLUSTER_SERVICE_CLUSTER_NAME_LEN * 2U) + 8U];
@@ -1550,9 +1573,16 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
       continue;
     }
 
-    same_cluster = ((config->cluster_enabled != 0U) &&
-                    (strcmp(nodes[index].cluster_name, config->cluster_name) == 0) &&
-                    (nodes[index].auth_tag == local_auth_tag)) ? 1U : 0U;
+    {
+      uint32_t expected_tag =
+        device_config_compute_auth_tag(config->cluster_password_hash,
+                                       nodes[index].unix_time,
+                                       nodes[index].node_id,
+                                       nodes[index].cluster_name);
+      same_cluster = ((config->cluster_enabled != 0U) &&
+                      (strcmp(nodes[index].cluster_name, config->cluster_name) == 0) &&
+                      (nodes[index].auth_tag == expected_tag)) ? 1U : 0U;
+    }
     http_service_json_escape_copy(cluster_name_json, sizeof(cluster_name_json),
                                   nodes[index].cluster_name, sizeof(nodes[index].cluster_name));
     http_service_json_escape_copy(node_name_json, sizeof(node_name_json),
@@ -1598,7 +1628,7 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
                        (unsigned int)nodes[index].device_state,
                        (unsigned int)same_cluster,
                        (unsigned int)same_cluster,
-                       (unsigned int)(nodes[index].auth_tag == local_auth_tag ? 1U : 0U),
+                       (unsigned int)same_cluster,
                        cluster_name_json,
                        node_name_json,
                        cloud_cluster_id_json,
@@ -1965,11 +1995,22 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
 
     remote_node = cluster_service_find_node(node_id);
     if ((remote_node == NULL) ||
-        (strcmp(remote_node->cluster_name, active_config->cluster_name) != 0) ||
-        (remote_node->auth_tag != local_auth_tag))
+        (strcmp(remote_node->cluster_name, active_config->cluster_name) != 0))
     {
       http_service_format_error_json(response_body, response_body_size, "remote_node_unavailable");
       return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+    }
+    {
+      uint32_t expected_tag =
+        device_config_compute_auth_tag(active_config->cluster_password_hash,
+                                       remote_node->unix_time,
+                                       remote_node->node_id,
+                                       remote_node->cluster_name);
+      if (remote_node->auth_tag != expected_tag)
+      {
+        http_service_format_error_json(response_body, response_body_size, "remote_node_unavailable");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
     }
 
     command.channel = (uint8_t)channel;
@@ -2005,6 +2046,58 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
 
     config = *current_config;
 
+    /* Decrypt config-sync body if the master encrypted it with the
+       cluster password.  The body starts with _enc=1&_data=<base64>. */
+    if ((strncmp(body, "_enc=1&_data=", 13) == 0) &&
+        (current_config->cluster_password_hash[0] != 0U))
+    {
+      static char enc_body[2048];
+      static char plain_body[2048];
+      const char *data_ptr = body + 13;
+      size_t di = 0U;
+      while (*data_ptr && *data_ptr != '&' && di < sizeof(enc_body))
+      {
+        enc_body[di++] = *data_ptr++;
+      }
+      enc_body[di] = '\0';
+      /* Base64url decode */
+      {
+        uint32_t acc = 0U; uint8_t bits = 0U; size_t out_len = 0U;
+        for (size_t si = 0U; si < di && out_len < sizeof(enc_body); ++si)
+        {
+          char c = enc_body[si];
+          int val = -1;
+          if (c >= 'A' && c <= 'Z') val = c - 'A';
+          else if (c >= 'a' && c <= 'z') val = c - 'a' + 26;
+          else if (c >= '0' && c <= '9') val = c - '0' + 52;
+          else if (c == '-') val = 62;
+          else if (c == '_') val = 63;
+          if (val < 0) continue;
+          acc = (acc << 6) | (uint32_t)val;
+          bits += 6;
+          if (bits >= 8)
+          {
+            bits -= 8;
+            enc_body[out_len++] = (uint8_t)(acc >> bits);
+            acc &= (1U << bits) - 1U;
+          }
+        }
+        di = out_len;
+      }
+      {
+        uint8_t key[16];
+        size_t plain_len;
+        memcpy(key, current_config->cluster_password_hash, sizeof(key));
+        plain_len = control_queue_decrypt_body(enc_body, di, key,
+                                               plain_body, sizeof(plain_body));
+        if (plain_len > 0U && plain_len < sizeof(plain_body))
+        {
+          plain_body[plain_len] = '\0';
+          body = plain_body;
+        }
+      }
+    }
+
     if (http_service_extract_form_text(body, "device_name", device_name, sizeof(device_name)))
     {
       memset(config.device_name, 0, sizeof(config.device_name));
@@ -2015,6 +2108,9 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     {
       memset(config.cluster_name, 0, sizeof(config.cluster_name));
       strncpy(config.cluster_name, cluster_name, sizeof(config.cluster_name) - 1U);
+      /* Keep cloud_cluster_id in sync with cluster_name */
+      memset(config.cloud_cluster_id, 0, sizeof(config.cloud_cluster_id));
+      strncpy(config.cloud_cluster_id, cluster_name, sizeof(config.cloud_cluster_id) - 1U);
     }
 
     if (http_service_extract_form_value(body, "cluster_enabled", &value) && (value <= 1U))
@@ -2093,23 +2189,9 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       }
     }
 
-    if (http_service_extract_form_text(body, "cloud_cluster_id", cloud_cluster_id, sizeof(cloud_cluster_id)))
-    {
-      memset(config.cloud_cluster_id, 0, sizeof(config.cloud_cluster_id));
-      strncpy(config.cloud_cluster_id, cloud_cluster_id, sizeof(config.cloud_cluster_id) - 1U);
-    }
-
-    if (http_service_extract_form_text(body, "cloud_device_id", cloud_device_id, sizeof(cloud_device_id)))
-    {
-      memset(config.cloud_device_id, 0, sizeof(config.cloud_device_id));
-      strncpy(config.cloud_device_id, cloud_device_id, sizeof(config.cloud_device_id) - 1U);
-    }
-
-    if (http_service_extract_form_text(body, "cloud_key_id", cloud_key_id, sizeof(cloud_key_id)))
-    {
-      memset(config.cloud_key_id, 0, sizeof(config.cloud_key_id));
-      strncpy(config.cloud_key_id, cloud_key_id, sizeof(config.cloud_key_id) - 1U);
-    }
+    /* cloud_cluster_id / cloud_device_id / cloud_key_id are read-only —
+       they are auto-generated from the MCU UID at factory-defaults time
+       and the cluster name.  The user cannot override them. */
 
     if (http_service_extract_form_text(body, "cloud_cluster_ca_fingerprint", cloud_cluster_ca_fingerprint, sizeof(cloud_cluster_ca_fingerprint)))
     {
@@ -2121,6 +2203,15 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     {
       memset(config.cloud_cluster_binding_secret, 0, sizeof(config.cloud_cluster_binding_secret));
       strncpy(config.cloud_cluster_binding_secret, cloud_cluster_binding_secret, sizeof(config.cloud_cluster_binding_secret) - 1U);
+    }
+
+    {
+      static char cloud_cluster_ca_cert_body[DEVICE_CONFIG_CA_CERT_MAX_LEN];
+      if (http_service_extract_form_text(body, "cloud_cluster_ca_cert", cloud_cluster_ca_cert_body, sizeof(cloud_cluster_ca_cert_body)))
+      {
+        memset(config.cloud_cluster_ca_cert, 0, sizeof(config.cloud_cluster_ca_cert));
+        strncpy(config.cloud_cluster_ca_cert, cloud_cluster_ca_cert_body, sizeof(config.cloud_cluster_ca_cert) - 1U);
+      }
     }
 
     if (config.device_name[0] == '\0')

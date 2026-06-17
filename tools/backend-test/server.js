@@ -3451,6 +3451,141 @@ app.post("/broadcast/ping", (_req, res) => {
   res.json({ ok: true, count: clients.size });
 });
 
+// ── MCU Provisioning API ──────────────────────────────────────────
+// Path A in the dual-path architecture: the MCU calls this over HTTPS
+// (through Cloudflare) to obtain its PSK and broker configuration.
+//
+// MCU sends:   POST /api/provision
+//              { device_id, cluster_id, device_fingerprint }
+//
+// Server replies with binding_secret, broker host/port, CA fingerprint,
+// and CA root cert PEM so the MCU can verify the MQTT broker on connect.
+
+app.post("/api/provision", (req, res) => {
+  const clusterId = String(req.body.cluster_id || "").trim();
+  const deviceId = String(req.body.device_id || "").trim();
+  const deviceFingerprint = String(req.body.device_fingerprint || "").trim();
+
+  if (!clusterId || !deviceId) {
+    return res.status(400).json({ ok: false, error: "missing_cluster_or_device_id" });
+  }
+
+  const deviceRecord = findCloudDeviceRecord(clusterId, deviceId);
+  if (!deviceRecord) {
+    return res.status(404).json({ ok: false, error: "device_not_registered" });
+  }
+
+  if (!deviceRecord.enabled) {
+    return res.status(403).json({ ok: false, error: "device_disabled" });
+  }
+
+  /* Devices must be claimed by a user before they can provision.
+     An unclaimed device is registered but has no owner — it cannot
+     obtain a PSK and therefore cannot connect to the MQTT broker. */
+  if (!deviceRecord.owner || String(deviceRecord.owner).trim() === "") {
+    return res.status(403).json({ ok: false, error: "device_not_claimed" });
+  }
+
+  // Optional fingerprint verification (strict when fingerprint is set)
+  if (deviceFingerprint && deviceRecord.deviceFingerprint) {
+    if (deviceFingerprint !== deviceRecord.deviceFingerprint) {
+      return res.status(403).json({ ok: false, error: "fingerprint_mismatch" });
+    }
+  }
+
+  const clusterRecord = findCloudClusterRecord(clusterId);
+  if (!clusterRecord) {
+    return res.status(500).json({ ok: false, error: "cluster_not_found" });
+  }
+
+  pushEvent("mcu-provision-request", {
+    clusterId,
+    deviceId,
+    ip: req.ip,
+    timestamp: new Date().toISOString(),
+  });
+
+  return res.json({
+    ok: true,
+    cluster_id: clusterId,
+    device_id: deviceId,
+    cloud_key_id: deviceRecord.keyId || "",
+    cloud_transport: clusterRecord.transport || CLOUD_TRANSPORT,
+    cloud_broker_host: clusterRecord.brokerHost || CLOUD_BROKER_HOST,
+    cloud_broker_port: clusterRecord.brokerPort || CLOUD_BROKER_PORT,
+    cloud_cluster_ca_fingerprint: clusterRecord.caFingerprint || "",
+    cloud_cluster_ca_cert_pem: clusterRecord.caPublicPem || "",
+    cloud_cluster_binding_secret: clusterRecord.bindingSecret || "",
+    provisioning_revision: Number(clusterRecord.revision || 0),
+    ca_revocation_tag: Number(clusterRecord.caRevocationTag || 0),
+  });
+});
+
+// ── Device Claim API ──────────────────────────────────────────────
+// A user claims ownership of a registered device.  Until claimed,
+// the device cannot obtain a PSK through /api/provision and cannot
+// connect to the MQTT broker.
+
+app.post("/api/devices/:deviceId/claim", (req, res) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  const owner = String(req.body.owner || "").trim();
+
+  if (!deviceId || !owner) {
+    return res.status(400).json({ ok: false, error: "missing_device_id_or_owner" });
+  }
+
+  let foundRecord = null;
+  for (const [key, record] of Array.from(cloudDevices.entries())) {
+    if (String(record.deviceId || "").trim() === deviceId) {
+      foundRecord = record;
+      break;
+    }
+  }
+  if (!foundRecord) {
+    return res.status(404).json({ ok: false, error: "device_not_found" });
+  }
+
+  const currentOwner = String(foundRecord.owner || "").trim();
+  if (currentOwner && currentOwner !== owner) {
+    return res.status(403).json({ ok: false, error: "device_already_claimed", currentOwner });
+  }
+
+  foundRecord.owner = owner;
+  cloudDevices.set(foundRecord.registryKey, foundRecord);
+  scheduleCloudRegistrySave();
+  pushEvent("device-claimed", { deviceId, owner, timestamp: new Date().toISOString() });
+  return res.json({ ok: true, deviceId, owner });
+});
+
+// ── PSK Rotation ──────────────────────────────────────────────────
+// Increments the cluster revision, generates a new binding secret,
+// and stores the old secret for a 5-minute transition window.
+app.post("/api/cloud/clusters/:clusterId/rotate-psk", (req, res) => {
+  const clusterRecord = findCloudClusterRecord(req.params.clusterId);
+  if (!clusterRecord) {
+    return res.status(404).json({ ok: false, error: "cluster_not_found" });
+  }
+
+  const oldSecret = clusterRecord.bindingSecret || "";
+  clusterRecord.bindingSecret = crypto.randomBytes(32).toString("base64url").slice(0, 43);
+  clusterRecord.previousSecret = oldSecret;
+  clusterRecord.revision = (Number(clusterRecord.revision || 0)) + 1;
+  clusterRecord.secretRotatedAt = Date.now();
+
+  cloudClusters.set(clusterRecord.clusterId, clusterRecord);
+  scheduleCloudRegistrySave();
+  pushEvent("psk-rotated", {
+    clusterId: clusterRecord.clusterId,
+    revision: clusterRecord.revision,
+    timestamp: new Date().toISOString(),
+  });
+  return res.json({
+    ok: true,
+    revision: clusterRecord.revision,
+    rotatedAt: clusterRecord.secretRotatedAt,
+  });
+});
+
 loadKeyStore();
 loadCloudRegistry();
 

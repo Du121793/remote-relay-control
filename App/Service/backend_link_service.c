@@ -295,6 +295,15 @@ static void backend_link_apply_cloud_config(const char *line)
       updated = 1U;
     }
   }
+  if (backend_link_extract_json_string(line, "cloud_cluster_ca_cert", text_buffer, sizeof(text_buffer)) != 0U)
+  {
+    if (strncmp(config.cloud_cluster_ca_cert, text_buffer, sizeof(config.cloud_cluster_ca_cert)) != 0)
+    {
+      memset(config.cloud_cluster_ca_cert, 0, sizeof(config.cloud_cluster_ca_cert));
+      strncpy(config.cloud_cluster_ca_cert, text_buffer, sizeof(config.cloud_cluster_ca_cert) - 1U);
+      updated = 1U;
+    }
+  }
 
   if ((updated != 0U) && (device_config_update_and_save(&config) != 0U))
   {
@@ -413,6 +422,15 @@ static uint8_t backend_link_should_run_reason(void)
   {
     g_backend_link_context.master_since_ms = 0U;
     return 5U;
+  }
+
+  {
+    const device_config_t *config = device_config_get();
+    if ((config != NULL) && (config->cloud_transport != 0U))
+    {
+      g_backend_link_context.master_since_ms = 0U;
+      return 8U;
+    }
   }
 
   now = HAL_GetTick();

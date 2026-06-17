@@ -65,6 +65,10 @@ function lookupIdentity(identity) {
   if (!device || device.enabled === false) {
     return null;
   }
+  // Reject unclaimed devices — they cannot connect to the MQTT broker
+  if (!device.owner || String(device.owner).trim() === "") {
+    return null;
+  }
   const cluster = registry.clusters.get(String(device.clusterId || ""));
   if (!cluster || cluster.enabled === false || !cluster.bindingSecret) {
     return null;
@@ -240,8 +244,25 @@ function handleConnect(client, body) {
   const identityRecord = lookupIdentity(client.pskIdentity);
   if (!identityRecord ||
       client.pskIdentity !== identityRecord.device.deviceId ||
-      username !== String(identityRecord.device.keyId || "") ||
-      password !== String(identityRecord.cluster.bindingSecret || "")) {
+      username !== String(identityRecord.device.keyId || "")) {
+    client.socket.write(Buffer.from([0x20, 0x02, 0x00, 0x05]));
+    pushEvent("connect-rejected", {
+      identity: client.pskIdentity,
+      clientId: client.clientId,
+    });
+    return;
+  }
+
+  /* Accept either the current or the previous PSK during the 5-minute
+     rotation window.  After that window the old secret is cleared. */
+  const currentSecret = String(identityRecord.cluster.bindingSecret || "");
+  const previousSecret = String(identityRecord.cluster.previousSecret || "");
+  const rotatedAt = Number(identityRecord.cluster.secretRotatedAt || 0);
+  const transitionWindowMs = 5 * 60 * 1000;
+
+  if (password !== currentSecret &&
+      (!previousSecret || password !== previousSecret ||
+       (rotatedAt > 0 && (Date.now() - rotatedAt) > transitionWindowMs))) {
     client.socket.write(Buffer.from([0x20, 0x02, 0x00, 0x05]));
     client.socket.end();
     pushEvent("connect-rejected", {

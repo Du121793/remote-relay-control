@@ -56,3 +56,5 @@ tools/backend-test/data/keys.json
 tools/backend-test/data/cloud-clusters.json
 tools/backend-test/data/cloud-devices.json
 tools/backend-test/server copy.js
+tools/codex-session-import.md
+tools/export_codex_session.py

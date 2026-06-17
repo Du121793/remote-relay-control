@@ -12,7 +12,10 @@
 #include "semphr.h"
 #include "task.h"
 
-static device_config_t g_device_config;
+#include "mbedtls/sha256.h"
+#include "mbedtls/md.h"
+
+static device_config_t g_device_config __attribute__((aligned(8)));
 static uint32_t g_device_config_last_flash_error = 0U;
 static QueueHandle_t g_device_config_queue = NULL;
 static TaskHandle_t g_device_config_task_handle = NULL;
@@ -36,7 +39,7 @@ static StaticQueue_t g_device_config_queue_buffer;
 static uint8_t g_device_config_queue_storage[
   DEVICE_CONFIG_QUEUE_LENGTH * sizeof(device_config_request_t)];
 static StaticTask_t g_device_config_task_buffer;
-static StackType_t g_device_config_task_stack[1024];
+static StackType_t g_device_config_task_stack[2048];
 static StaticSemaphore_t g_device_config_save_mutex_buffer;
 static SemaphoreHandle_t g_device_config_save_mutex = NULL;
 static uint8_t g_device_config_sync_result = 0U;
@@ -412,27 +415,29 @@ static void device_config_build_current_defaults(device_config_t *config)
 
 void device_config_hash_password_text(const char *text, uint8_t hash_out[DEVICE_CONFIG_PASSWORD_HASH_LEN])
 {
-  uint32_t crc;
-  uint32_t index;
-
   if (hash_out == NULL)
   {
     return;
   }
 
-  if (text == NULL)
+  if ((text == NULL) || (text[0] == '\0'))
   {
     memset(hash_out, 0, DEVICE_CONFIG_PASSWORD_HASH_LEN);
     return;
   }
 
-  crc = device_config_crc32_bytes((const uint8_t *)text, (uint32_t)strlen(text));
-  for (index = 0U; index < DEVICE_CONFIG_PASSWORD_HASH_LEN; index += 4U)
+  /* Use mbedTLS SHA-256 instead of CRC32 so the stored password hash
+     is a proper cryptographic digest.  An attacker cannot reverse or
+     collide SHA-256 the way they could with a 32-bit CRC. */
   {
-    hash_out[index + 0U] = (uint8_t)((crc >> 24) & 0xFFU);
-    hash_out[index + 1U] = (uint8_t)((crc >> 16) & 0xFFU);
-    hash_out[index + 2U] = (uint8_t)((crc >> 8) & 0xFFU);
-    hash_out[index + 3U] = (uint8_t)(crc & 0xFFU);
+    int ret = mbedtls_sha256_ret((const unsigned char *)text,
+                                 strlen(text),
+                                 hash_out,
+                                 0 /* 0 = SHA-256, 1 = SHA-224 */);
+    if (ret != 0)
+    {
+      memset(hash_out, 0, DEVICE_CONFIG_PASSWORD_HASH_LEN);
+    }
   }
 }
 
@@ -461,6 +466,64 @@ uint32_t device_config_password_tag(const device_config_t *config)
   return (non_zero != 0U) ? hash : 0U;
 }
 
+uint32_t device_config_compute_auth_tag(
+  const uint8_t password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN],
+  uint32_t unix_time,
+  uint32_t node_id,
+  const char *cluster_name)
+{
+  uint8_t has_password = 0U;
+  uint32_t index;
+
+  if ((password_hash == NULL) || (cluster_name == NULL))
+  {
+    return 0U;
+  }
+
+  for (index = 0U; index < DEVICE_CONFIG_PASSWORD_HASH_LEN; ++index)
+  {
+    if (password_hash[index] != 0U)
+    {
+      has_password = 1U;
+      break;
+    }
+  }
+
+  if (has_password != 0U)
+  {
+    uint8_t hmac_out[32];
+    char input_buf[128];
+    int len = snprintf(input_buf, sizeof(input_buf),
+                       "%lu|%lu|%s",
+                       (unsigned long)unix_time,
+                       (unsigned long)node_id,
+                       cluster_name);
+    if ((len > 0) && ((size_t)len < sizeof(input_buf)) &&
+        (mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                         password_hash,
+                         DEVICE_CONFIG_PASSWORD_HASH_LEN,
+                         (const unsigned char *)input_buf, (size_t)len,
+                         hmac_out) == 0))
+    {
+      uint32_t tag;
+      memcpy(&tag, hmac_out, sizeof(tag));
+      return tag;
+    }
+    return 0U;
+  }
+
+  /* No password → deterministic FNV1a of the zero hash. */
+  {
+    uint32_t hash = 2166136261UL;
+    for (index = 0U; index < DEVICE_CONFIG_PASSWORD_HASH_LEN; ++index)
+    {
+      hash ^= password_hash[index];
+      hash *= 16777619UL;
+    }
+    return hash;
+  }
+}
+
 void device_config_build_defaults(device_config_t *config)
 {
   uint32_t i;
@@ -478,18 +541,31 @@ void device_config_build_defaults(device_config_t *config)
   config->auto_join_cluster = 1U;
   config->cluster_enabled = 1U;
   memcpy(config->cluster_name, "default", sizeof("default"));
-  memcpy(config->backend_host, "192.168.0.139", sizeof("192.168.0.139"));
+  config->backend_host[0] = '\0';
   config->backend_port = 42001U;
   memcpy(config->backend_key, "dev-key", sizeof("dev-key"));
   config->cloud_enabled = 0U;
   config->cloud_transport = 1U;
   memcpy(config->cloud_broker_host, "broker.example.com", sizeof("broker.example.com"));
   config->cloud_broker_port = 8883U;
-  config->cloud_cluster_id[0] = '\0';
-  config->cloud_device_id[0] = '\0';
-  config->cloud_key_id[0] = '\0';
+  /* Auto-generate cloud identity from MCU UID so every device has a
+     unique, non-editable cloud_device_id.  The UID is 96 bits. */
+  {
+    const uint32_t uid0 = *(const uint32_t *)0x1FF0F420UL;
+    const uint32_t uid1 = *(const uint32_t *)0x1FF0F424UL;
+    const uint32_t uid2 = *(const uint32_t *)0x1FF0F428UL;
+    (void)snprintf(config->cloud_device_id, sizeof(config->cloud_device_id),
+                   "node-%lu-%lu",
+                   (unsigned long)(((uid0 ^ uid2) >> 3U) & 0x3FFFFFFFUL),
+                   (unsigned long)((uid1 & 0x0FFFFFFFUL)));
+    (void)snprintf(config->cloud_key_id, sizeof(config->cloud_key_id),
+                   "key-%08lx", (unsigned long)((uid0 ^ uid1 ^ uid2) & 0xFFFFFFFFUL));
+  }
+  /* cloud_cluster_id follows cluster_name — defaults to "default" cluster */
+  memcpy(config->cloud_cluster_id, "default", sizeof("default"));
   config->cloud_cluster_ca_fingerprint[0] = '\0';
   config->cloud_cluster_binding_secret[0] = '\0';
+  config->cloud_cluster_ca_cert[0] = '\0';
   config->saved_relay_mask = 0U;
 
   for (i = 0U; i < DEVICE_CONFIG_RELAY_COUNT; ++i)
@@ -851,7 +927,7 @@ static uint8_t device_config_normalize_runtime_defaults(device_config_t *config)
 
   if (config->backend_host[0] == '\0')
   {
-    memcpy(config->backend_host, "192.168.0.139", sizeof("192.168.0.139"));
+    config->backend_host[0] = '\0';
     changed = 1U;
   }
 
@@ -891,6 +967,13 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   src32 = (const uint32_t *)&temp;
   g_device_config_last_flash_error = 0U;
 
+  /* Disable interrupts during the entire flash erase+program sequence.
+     On STM32F7, any interrupt that tries to fetch code from flash while
+     a sector is being erased or programmed will cause an imprecise bus
+     fault (CFSR=0x00000400).  The HAL flash helpers do not guarantee
+     full interrupt masking for the complete operation window. */
+  __disable_irq();
+
   HAL_FLASH_Unlock();
   __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
                          FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_ERSERR);
@@ -898,6 +981,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   if (device_config_flash_erase() == 0U)
   {
     HAL_FLASH_Lock();
+    __enable_irq();
     return 0U;
   }
 
@@ -909,11 +993,13 @@ static uint8_t device_config_save_direct(const device_config_t *config)
     {
       g_device_config_last_flash_error = HAL_FLASH_GetError();
       HAL_FLASH_Lock();
+      __enable_irq();
       return 0U;
     }
   }
 
   HAL_FLASH_Lock();
+  __enable_irq();
   return 1U;
 }
 
@@ -969,7 +1055,7 @@ static void device_config_worker_init(void)
     g_device_config_task_handle =
       xTaskCreateStatic(device_config_worker_task,
                         "CfgSave",
-                        1024U,
+                        2048U,
                         NULL,
                         tskIDLE_PRIORITY + 1U,
                         g_device_config_task_stack,
