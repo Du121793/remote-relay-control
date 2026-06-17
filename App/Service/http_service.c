@@ -1187,9 +1187,10 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
         adc_service_channel_state_t cs;
         (void)adc_service_get_channel_state(ch, &cs);
         w = snprintf(buffer + end_pos, buffer_size - end_pos,
-                     "%s{\"ch\":%u,\"mA\":%lu}",
+                     "%s{\"ch\":%u,\"ct\":%u,\"mA\":%lu}",
                      (ch == 0U) ? "" : ",",
                      (unsigned int)ch,
+                     (unsigned int)cs.ct_valid,
                      (unsigned long)cs.current_milliamps);
         if (w > 0 && (size_t)w < (buffer_size - end_pos))
           end_pos += (size_t)w;
