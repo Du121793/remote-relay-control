@@ -811,7 +811,7 @@ void StartDefaultTask(void const * argument)
   /* init code for LWIP */
   MX_LWIP_Init();
   uart3_write("[boot] lwip initialized\r\n");
-  adc_service_init(&hadc1, &htim2);
+  adc_service_init(&hadc1, &hadc3, &htim2);
   next_dhcp_report_ms = HAL_GetTick() + g_dhcp_report_interval_ms;
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
