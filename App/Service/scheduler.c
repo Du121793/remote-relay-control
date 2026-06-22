@@ -24,6 +24,22 @@ void scheduler_init(void)
     for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
         g_weekly_schedule[i].channel = i + 1;
     }
+    /* Flash load: v1 is RAM-only. Auto Hold cleared per §25.
+       Future: load schedule/pause from device_config flash sector. */
+}
+
+/* ── Flash stubs (v2) ── */
+void scheduler_load_from_flash(void)
+{
+    /* TODO: load schedule_enabled, weekly_schedule, pause_until,
+       pause_blocks_auto_trigger from device_config flash sector.
+       Auto Hold is NOT persisted (short-term lease, monotonic time). */
+}
+
+void scheduler_save_to_flash(void)
+{
+    /* TODO: save schedule_enabled, weekly_schedule, pause_until,
+       pause_blocks_auto_trigger to device_config flash sector. */
 }
 
 /* ── state access ── */
