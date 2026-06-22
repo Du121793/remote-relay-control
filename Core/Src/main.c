@@ -36,6 +36,7 @@
 #include "discovery_service.h"
 #include "adc_service.h"
 #include "relay_protection.h"
+#include "scheduler.h"
 #include "time_sync_service.h"
 #include "https_client_service.h"
 #include "lwip/stats.h"
@@ -397,6 +398,7 @@ int main(void)
   MX_MBEDTLS_Init();
   /* USER CODE BEGIN 2 */
   relay_protection_init();  /* force all relays OFF before config applies startup mask */
+  scheduler_init();
   device_config_init();
   /* Startup relay mask is now managed by relay_protection:
      boot_default_on / remember_state become pending requests
@@ -864,6 +866,13 @@ void StartDefaultTask(void const * argument)
     ethernetif_poll_tx_reclaim();
     adc_service_poll();
     relay_protection_poll();
+
+    /* Scheduler + Auto Hold tick */
+    {
+      uint8_t time_valid;
+      uint32_t unix_time = cluster_service_get_unix_time(&time_valid);
+      scheduler_tick(HAL_GetTick(), unix_time, time_valid);
+    }
 
     if ((last_stack_log_ms == 0U) || ((int32_t)(now - last_stack_log_ms) >= 5000))
     {

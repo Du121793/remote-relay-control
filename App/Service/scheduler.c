@@ -1,0 +1,321 @@
+#include "scheduler.h"
+#include "../Config/device_config.h"
+#include "control_queue.h"
+#include "relay_protection.h"
+#include "cluster_service.h"
+#include "board_relay.h"
+#include <string.h>
+
+/* ── Per-channel state arrays ── */
+static channel_scheduler_state_t g_scheduler_state[SCHEDULER_CHANNEL_COUNT];
+static weekly_schedule_t g_weekly_schedule[SCHEDULER_CHANNEL_COUNT];
+
+/* ── Monotonic time helpers ── */
+static bool time_after_or_equal(uint32_t a, uint32_t b)
+{
+    return (int32_t)(a - b) >= 0;
+}
+
+/* ── init ── */
+void scheduler_init(void)
+{
+    memset(g_scheduler_state, 0, sizeof(g_scheduler_state));
+    memset(g_weekly_schedule, 0, sizeof(g_weekly_schedule));
+    for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
+        g_weekly_schedule[i].channel = i + 1;
+    }
+}
+
+/* ── state access ── */
+channel_scheduler_state_t *scheduler_get_state(uint8_t channel)
+{
+    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
+    return &g_scheduler_state[channel - 1];
+}
+
+weekly_schedule_t *scheduler_get_weekly(uint8_t channel)
+{
+    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
+    return &g_weekly_schedule[channel - 1];
+}
+
+/* ── interval validation ── */
+bool scheduler_validate_intervals(const daily_schedule_t *day)
+{
+    if (day->interval_count > SCHEDULER_MAX_INTERVALS) return false;
+    for (uint8_t i = 0; i < day->interval_count; i++) {
+        uint16_t s = day->intervals[i].start_minute;
+        uint16_t e = day->intervals[i].end_minute;
+        if (s >= 1440 || e == 0 || e > 1440 || s >= e) return false;
+        if (i > 0) {
+            uint16_t ps = day->intervals[i - 1].start_minute;
+            uint16_t pe = day->intervals[i - 1].end_minute;
+            /* check sorted and non-overlapping */
+            if (s < ps) return false;
+            if (s < pe) return false;  /* overlap: can be adjacent (s==pe ok) */
+        }
+    }
+    return true;
+}
+
+/* ── interval matching ── */
+static bool interval_match(const daily_schedule_t *day, uint16_t minute_of_day)
+{
+    for (uint8_t i = 0; i < day->interval_count; i++) {
+        if (minute_of_day >= day->intervals[i].start_minute &&
+            minute_of_day <  day->intervals[i].end_minute) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ── weekday from unix time (Monday=0) ── */
+static uint8_t weekday_from_unix(uint32_t unix_time)
+{
+    /* 1970-01-01 was Thursday (3).  (unix/86400 + 3) % 7 */
+    return (uint8_t)(((unix_time / 86400UL) + 3UL) % 7UL);
+}
+
+/* ── minute of day from unix time ── */
+static uint16_t minute_of_day(uint32_t unix_time)
+{
+    return (uint16_t)((unix_time % 86400UL) / 60UL);
+}
+
+/* ── reason copy with validation ── */
+static void copy_reason(char *dst, const char *src)
+{
+    if (!src || src[0] == '\0') {
+        strncpy(dst, "auto-hold control", SCHEDULER_REASON_MAX_LEN);
+        dst[SCHEDULER_REASON_MAX_LEN] = '\0';
+        return;
+    }
+    size_t len = strlen(src);
+    if (len > SCHEDULER_REASON_MAX_LEN) len = SCHEDULER_REASON_MAX_LEN;
+    /* validate: only printable ASCII + UTF-8 multi-byte */
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c < 0x20 && c != '\0') {
+            /* invalid character, use default */
+            strncpy(dst, "auto-hold control", SCHEDULER_REASON_MAX_LEN);
+            dst[SCHEDULER_REASON_MAX_LEN] = '\0';
+            return;
+        }
+    }
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+/* ── request relay state through control queue ── */
+static void request_relay(uint8_t channel, uint8_t target)
+{
+    control_proto_command_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = CONTROL_PROTO_CMD_SET_RELAY;
+    cmd.channel = channel;
+    cmd.value = target;
+    (void)control_queue_submit_async(&cmd);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Auto Hold handler
+   ═══════════════════════════════════════════════════════════════ */
+
+static void auto_hold_clear(uint8_t channel)
+{
+    channel_scheduler_state_t *st = &g_scheduler_state[channel - 1];
+    st->auto_hold.session = 0;
+    st->auto_hold.target_state = 0;
+    st->auto_hold.start_state = 0;
+    st->auto_hold.until_ms = 0;
+    st->auto_hold.reason[0] = '\0';
+}
+
+static uint8_t relay_actual_state(uint8_t channel)
+{
+    uint32_t mask = board_relay_snapshot();
+    return ((mask >> (channel - 1)) & 1U) ? 1U : 0U;
+}
+
+void scheduler_handle_auto_hold(const auto_hold_cmd_t *cmd, uint32_t monotonic_ms, uint32_t unix_time)
+{
+    (void)unix_time;
+    if (cmd->channel == 0 || cmd->channel > SCHEDULER_CHANNEL_COUNT) return;
+    if (cmd->session == 0) return;  /* session=0 is invalid */
+
+    channel_scheduler_state_t *st = &g_scheduler_state[cmd->channel - 1];
+    auto_hold_state_t *hold = &st->auto_hold;
+
+    /* stale packet check */
+    if (cmd->command_ts < st->last_auto_hold_command_ts) return;
+    st->last_auto_hold_command_ts = cmd->command_ts;
+
+    /* clear request */
+    if (cmd->duration_seconds == 0) {
+        if (hold->session == cmd->session) {
+            auto_hold_clear(cmd->channel);
+        }
+        return;
+    }
+
+    /* validate duration */
+    if (cmd->duration_seconds < SCHEDULER_AUTO_HOLD_MIN_SEC ||
+        cmd->duration_seconds > SCHEDULER_AUTO_HOLD_MAX_SEC) {
+        return;
+    }
+
+    /* user pause blocks auto trigger? */
+    if (st->schedule_pause_until != 0 &&
+        st->pause_blocks_auto_trigger &&
+        unix_time < st->schedule_pause_until) {
+        return;
+    }
+
+    /* different session already active? */
+    if (hold->session != 0 && hold->session != cmd->session) {
+        return;  /* CHANNEL_BUSY */
+    }
+
+    /* same session, different target? */
+    if (hold->session == cmd->session && hold->target_state != cmd->target) {
+        return;  /* SESSION_TARGET_MISMATCH */
+    }
+
+    /* new session */
+    if (hold->session == 0) {
+        hold->session = cmd->session;
+        hold->target_state = cmd->target;
+        hold->start_state = relay_actual_state(cmd->channel);
+    }
+
+    /* update lease (new or renew) */
+    hold->until_ms = monotonic_ms + (cmd->duration_seconds * 1000U);
+    copy_reason(hold->reason, cmd->reason);
+
+    /* request target state */
+    request_relay(cmd->channel, hold->target_state);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Auto Hold finish
+   ═══════════════════════════════════════════════════════════════ */
+
+static void auto_hold_finish(uint8_t channel, uint32_t unix_time, uint8_t time_valid)
+{
+    channel_scheduler_state_t *st = &g_scheduler_state[channel - 1];
+    auto_hold_state_t *hold = &st->auto_hold;
+
+    if (hold->session == 0) return;
+
+    uint8_t restore_state = hold->start_state;
+
+    hold->session = 0;
+    hold->target_state = 0;
+    hold->start_state = 0;
+    hold->until_ms = 0;
+    hold->reason[0] = '\0';
+
+    /* don't restore if channel is in fault or cooldown */
+    uint32_t fault_mask = relay_protection_fault_lock_mask();
+    if ((fault_mask >> (channel - 1)) & 1U) return;
+    if (relay_protection_is_cooldown(channel, HAL_GetTick())) return;
+
+    /* hand back to scheduler if possible */
+    if (st->schedule_enabled &&
+        (st->schedule_pause_until == 0 || unix_time >= st->schedule_pause_until) &&
+        time_valid) {
+        /* scheduler will pick up desired state on next tick */
+        return;
+    }
+
+    /* otherwise restore start_state */
+    request_relay(channel, restore_state);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   User control (atomic)
+   ═══════════════════════════════════════════════════════════════ */
+
+void scheduler_user_control(uint8_t channel, uint8_t target,
+                            scheduler_pause_mode_t pause_mode,
+                            uint32_t pause_duration_seconds,
+                            uint32_t pause_until_unix,
+                            uint8_t pause_blocks_auto_trigger)
+{
+    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return;
+    channel_scheduler_state_t *st = &g_scheduler_state[channel - 1];
+
+    /* 1. clear Auto Hold */
+    auto_hold_clear(channel);
+
+    /* 2. set pause */
+    uint8_t tv;
+    switch (pause_mode) {
+        case SCHEDULER_PAUSE_CURRENT_SEGMENT:
+            /* pause until end of current schedule segment + 1 minute */
+            /* simplified: pause for 1 minute */
+            st->schedule_pause_until = cluster_service_get_unix_time(&time_valid) + 60;
+            break;
+        case SCHEDULER_PAUSE_DURATION:
+            st->schedule_pause_until = cluster_service_get_unix_time(&time_valid) + pause_duration_seconds;
+            break;
+        case SCHEDULER_PAUSE_UNTIL:
+            st->schedule_pause_until = pause_until_unix;
+            break;
+        case SCHEDULER_PAUSE_FOREVER_MODE:
+            st->schedule_pause_until = SCHEDULER_PAUSE_FOREVER;
+            break;
+    }
+    st->pause_blocks_auto_trigger = pause_blocks_auto_trigger;
+
+    /* 3. send relay command */
+    request_relay(channel, target);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Main tick
+   ═══════════════════════════════════════════════════════════════ */
+
+void scheduler_tick(uint32_t monotonic_ms, uint32_t unix_time, uint8_t time_valid)
+{
+    for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
+        uint8_t ch = i + 1;
+        channel_scheduler_state_t *st = &g_scheduler_state[i];
+
+        /* ── Auto Hold expiry check ── */
+        if (st->auto_hold.session != 0 &&
+            time_after_or_equal(monotonic_ms, st->auto_hold.until_ms)) {
+            auto_hold_finish(ch, unix_time, time_valid);
+        }
+
+        /* ── Auto Hold active: override scheduler ── */
+        if (st->auto_hold.session != 0) {
+            uint8_t desired = st->auto_hold.target_state;
+            if (relay_actual_state(ch) != desired) {
+                request_relay(ch, desired);
+            }
+            continue;
+        }
+
+        /* ── Scheduler disabled ── */
+        if (!st->schedule_enabled) continue;
+
+        /* ── Pause active ── */
+        if (st->schedule_pause_until != 0 &&
+            unix_time < st->schedule_pause_until) continue;
+
+        /* ── Time invalid ── */
+        if (!time_valid) continue;
+
+        /* ── Interval match ── */
+        uint8_t wd = weekday_from_unix(unix_time);
+        uint16_t minute = minute_of_day(unix_time);
+        daily_schedule_t *day = &g_weekly_schedule[i].days[wd];
+
+        uint8_t desired = interval_match(day, minute) ? 1 : 0;
+        if (relay_actual_state(ch) != desired) {
+            request_relay(ch, desired);
+        }
+    }
+}

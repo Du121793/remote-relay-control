@@ -13,6 +13,7 @@
 #include "cluster_service.h"
 #include "discovery_service.h"
 #include "relay_protection.h"
+#include "scheduler.h"
 #include "relay_domain.h"
 #include "../Config/device_config.h"
 
@@ -2745,6 +2746,256 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       "application/json",
       (const unsigned char *)response_body,
       strlen(response_body));
+  }
+
+  /* ═══════════════════ Scheduler API (§22) ═══════════════════ */
+
+  /* Helper: extract channel from /api/relay/channels/N/... */
+  #define SCHEDULER_PATH_PREFIX "/api/relay/channels/"
+  #define SCHEDULER_PATH_PREFIX_LEN 22
+
+  if (strncmp(path, SCHEDULER_PATH_PREFIX, SCHEDULER_PATH_PREFIX_LEN) == 0) {
+    const char *rest = path + SCHEDULER_PATH_PREFIX_LEN;
+    uint32_t channel = 0;
+    while (*rest >= '0' && *rest <= '9') {
+      channel = channel * 10 + (uint32_t)(*rest - '0');
+      rest++;
+    }
+    if (channel == 0 || channel > 16) {
+      http_service_format_error_json(response_body, response_body_size, "bad_channel");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+
+    /* ── 22.1 GET /api/relay/channels/:channel/schedule-week ── */
+    if ((strcmp(method, "GET") == 0) && (strcmp(rest, "/schedule-week") == 0)) {
+      weekly_schedule_t *ws = scheduler_get_weekly((uint8_t)channel);
+      if (!ws) {
+        http_service_format_error_json(response_body, response_body_size, "not_found");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
+      int w = snprintf(response_body, response_body_size,
+        "{\"ok\":true,\"channel\":%lu,\"schedule_enabled\":%u,\"days\":[",
+        (unsigned long)channel,
+        (unsigned int)(scheduler_get_state((uint8_t)channel) ?
+                       scheduler_get_state((uint8_t)channel)->schedule_enabled : 0));
+      for (uint8_t d = 0; d < 7; d++) {
+        daily_schedule_t *day = &ws->days[d];
+        w += snprintf(response_body + w, response_body_size - w,
+          "%s{\"weekday\":%u,\"intervals\":[",
+          d > 0 ? "," : "", (unsigned int)d);
+        for (uint8_t k = 0; k < day->interval_count; k++) {
+          w += snprintf(response_body + w, response_body_size - w,
+            "%s{\"start_minute\":%u,\"end_minute\":%u}",
+            k > 0 ? "," : "",
+            (unsigned int)day->intervals[k].start_minute,
+            (unsigned int)day->intervals[k].end_minute);
+        }
+        w += snprintf(response_body + w, response_body_size - w, "]}");
+      }
+      w += snprintf(response_body + w, response_body_size - w, "]}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.2 PUT /api/relay/channels/:channel/schedule-week/:weekday ── */
+    if ((strcmp(method, "PUT") == 0) && strncmp(rest, "/schedule-week/", 15) == 0) {
+      uint32_t weekday = 0;
+      const char *wp = rest + 15;
+      while (*wp >= '0' && *wp <= '9') { weekday = weekday * 10 + (uint32_t)(*wp - '0'); wp++; }
+      if (weekday > 6) {
+        http_service_format_error_json(response_body, response_body_size, "bad_weekday");
+        return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+      }
+      weekly_schedule_t *ws = scheduler_get_weekly((uint8_t)channel);
+      if (!ws) {
+        http_service_format_error_json(response_body, response_body_size, "not_found");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
+      /* Parse intervals from form body: count=N & s0=480 & e0=720 & s1=840 & e1=1080 */
+      uint32_t count = 0;
+      http_service_extract_form_value(body, "count", &count);
+      if (count > SCHEDULER_MAX_INTERVALS) count = SCHEDULER_MAX_INTERVALS;
+      daily_schedule_t new_day;
+      memset(&new_day, 0, sizeof(new_day));
+      new_day.interval_count = (uint8_t)count;
+      char key[8];
+      for (uint32_t k = 0; k < count; k++) {
+        uint32_t sv = 0, ev = 0;
+        snprintf(key, sizeof(key), "s%lu", (unsigned long)k);
+        http_service_extract_form_value(body, key, &sv);
+        snprintf(key, sizeof(key), "e%lu", (unsigned long)k);
+        http_service_extract_form_value(body, key, &ev);
+        if (sv >= 1440 || ev == 0 || ev > 1440 || sv >= ev) {
+          http_service_format_error_json(response_body, response_body_size, "bad_interval");
+          return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+        }
+        new_day.intervals[k].start_minute = (uint16_t)sv;
+        new_day.intervals[k].end_minute = (uint16_t)ev;
+      }
+      if (!scheduler_validate_intervals(&new_day)) {
+        http_service_format_error_json(response_body, response_body_size, "schedule_overlap");
+        return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
+      }
+      ws->days[(uint8_t)weekday] = new_day;
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.3 POST /api/relay/channels/:channel/schedule-week/:weekday/copy ── */
+    if ((strcmp(method, "POST") == 0) && strstr(rest, "/schedule-week/") && strstr(rest, "/copy")) {
+      uint32_t src_wd = 0;
+      const char *wp = rest + 15;
+      while (*wp >= '0' && *wp <= '9') { src_wd = src_wd * 10 + (uint32_t)(*wp - '0'); wp++; }
+      if (src_wd > 6) {
+        http_service_format_error_json(response_body, response_body_size, "bad_weekday");
+        return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+      }
+      weekly_schedule_t *ws = scheduler_get_weekly((uint8_t)channel);
+      if (!ws) {
+        http_service_format_error_json(response_body, response_body_size, "not_found");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
+      daily_schedule_t src = ws->days[(uint8_t)src_wd];
+      /* Parse target weekdays from form: targets=0,1,2,3 */
+      char targets_buf[64];
+      if (http_service_extract_form_text(body, "targets", targets_buf, sizeof(targets_buf))) {
+        const char *t = targets_buf;
+        while (*t) {
+          while (*t == ',' || *t == ' ') t++;
+          if (*t >= '0' && *t <= '9') {
+            uint32_t tw = (uint32_t)(*t - '0');
+            if (tw <= 6) ws->days[(uint8_t)tw] = src;
+            while (*t >= '0' && *t <= '9') t++;
+          } else break;
+        }
+      }
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.4 PATCH /api/relay/channels/:channel/scheduler/enabled ── */
+    if ((strcmp(method, "PATCH") == 0) && (strcmp(rest, "/scheduler/enabled") == 0)) {
+      uint32_t enabled = 0;
+      http_service_extract_form_value(body, "enabled", &enabled);
+      channel_scheduler_state_t *st = scheduler_get_state((uint8_t)channel);
+      if (st) st->schedule_enabled = (uint8_t)(enabled ? 1 : 0);
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.5 POST /api/relay/channels/:channel/scheduler/pause ── */
+    if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/scheduler/pause") == 0)) {
+      uint32_t mode = 0, dur = 0, until = 0, blocks = 0;
+      http_service_extract_form_value(body, "mode", &mode);
+      http_service_extract_form_value(body, "duration_seconds", &dur);
+      http_service_extract_form_value(body, "until", &until);
+      http_service_extract_form_value(body, "pause_blocks_auto_trigger", &blocks);
+      channel_scheduler_state_t *st = scheduler_get_state((uint8_t)channel);
+      if (!st) {
+        http_service_format_error_json(response_body, response_body_size, "not_found");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
+      uint8_t tv;
+      uint32_t now_unix = cluster_service_get_unix_time(&tv);
+      switch (mode) {
+        case 0: st->schedule_pause_until = now_unix + 60; break;  /* current_segment_end simplified */
+        case 1: st->schedule_pause_until = now_unix + dur; break;
+        case 2: st->schedule_pause_until = until; break;
+        case 3: st->schedule_pause_until = SCHEDULER_PAUSE_FOREVER; break;
+        default: st->schedule_pause_until = now_unix + 60; break;
+      }
+      st->pause_blocks_auto_trigger = (uint8_t)(blocks ? 1 : 0);
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.6 POST /api/relay/channels/:channel/scheduler/resume ── */
+    if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/scheduler/resume") == 0)) {
+      channel_scheduler_state_t *st = scheduler_get_state((uint8_t)channel);
+      if (st) {
+        st->schedule_pause_until = 0;
+        st->pause_blocks_auto_trigger = 0;
+      }
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.7 POST /api/relay/channels/:channel/control (user manual) ── */
+    if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/control") == 0)) {
+      uint32_t target = 0, pmode = 0, pdur = 0, puntil = 0, pblocks = 0;
+      http_service_extract_form_value(body, "target", &target);
+      http_service_extract_form_value(body, "pause_mode", &pmode);
+      http_service_extract_form_value(body, "pause_duration_seconds", &pdur);
+      http_service_extract_form_value(body, "pause_until", &puntil);
+      http_service_extract_form_value(body, "pause_blocks_auto_trigger", &pblocks);
+      scheduler_user_control((uint8_t)channel, (uint8_t)(target ? 1 : 0),
+                             (scheduler_pause_mode_t)pmode, pdur, puntil,
+                             (uint8_t)(pblocks ? 1 : 0));
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.8 POST /api/relay/channels/:channel/auto-hold ── */
+    if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/auto-hold") == 0)) {
+      auto_hold_cmd_t cmd;
+      uint32_t target = 0, dur = 0, session = 0, cts = 0;
+      memset(&cmd, 0, sizeof(cmd));
+      cmd.channel = (uint8_t)channel;
+      http_service_extract_form_value(body, "target", &target);   cmd.target = (uint8_t)(target ? 1 : 0);
+      http_service_extract_form_value(body, "duration_seconds", &dur); cmd.duration_seconds = dur;
+      http_service_extract_form_value(body, "session", &session); cmd.session = session;
+      http_service_extract_form_value(body, "command_ts", &cts);  cmd.command_ts = cts;
+      http_service_extract_form_text(body, "reason", cmd.reason, SCHEDULER_REASON_MAX_LEN + 1);
+      scheduler_handle_auto_hold(&cmd, HAL_GetTick(),
+                                  cluster_service_get_unix_time(&target));
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.9 GET /api/relay/channels/:channel/scheduler/status ── */
+    if ((strcmp(method, "GET") == 0) && (strcmp(rest, "/scheduler/status") == 0)) {
+      channel_scheduler_state_t *st = scheduler_get_state((uint8_t)channel);
+      if (!st) {
+        http_service_format_error_json(response_body, response_body_size, "not_found");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
+      uint8_t tv; uint32_t now_unix = cluster_service_get_unix_time(&tv);
+      uint32_t remain = 0;
+      if (st->auto_hold.session != 0) {
+        uint32_t now_ms = HAL_GetTick();
+        remain = (st->auto_hold.until_ms > now_ms) ?
+                 (st->auto_hold.until_ms - now_ms) / 1000U : 0;
+      }
+      (void)snprintf(response_body, response_body_size,
+        "{\"ok\":true,\"channel\":%lu,"
+        "\"schedule_enabled\":%u,"
+        "\"pause_active\":%u,"
+        "\"schedule_pause_until\":%lu,"
+        "\"pause_blocks_auto_trigger\":%u,"
+        "\"auto_hold_active\":%u,"
+        "\"auto_hold_target\":%u,"
+        "\"auto_hold_start_state\":%u,"
+        "\"auto_hold_remaining_seconds\":%lu,"
+        "\"auto_hold_session\":%lu,"
+        "\"auto_hold_last_command_ts\":%lu,"
+        "\"auto_hold_reason\":\"%s\","
+        "\"time_valid\":%u}",
+        (unsigned long)channel,
+        (unsigned int)st->schedule_enabled,
+        (unsigned int)(st->schedule_pause_until != 0 && now_unix < st->schedule_pause_until ? 1 : 0),
+        (unsigned long)st->schedule_pause_until,
+        (unsigned int)st->pause_blocks_auto_trigger,
+        (unsigned int)(st->auto_hold.session != 0 ? 1 : 0),
+        (unsigned int)st->auto_hold.target_state,
+        (unsigned int)st->auto_hold.start_state,
+        (unsigned long)remain,
+        (unsigned long)st->auto_hold.session,
+        (unsigned long)st->last_auto_hold_command_ts,
+        st->auto_hold.reason,
+        (unsigned int)tv);
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* fallthrough: unknown scheduler sub-path */
   }
 
   http_service_format_error_json(response_body, response_body_size, "not_found");

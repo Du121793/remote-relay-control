@@ -527,6 +527,11 @@
               <FilePath>../App/Service/relay_protection.c</FilePath>
             </File>
             <File>
+              <FileName>scheduler.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Service/scheduler.c</FilePath>
+            </File>
+            <File>
               <FileName>cluster_service.c</FileName>
               <FileType>1</FileType>
               <FilePath>../App/Service/cluster_service.c</FilePath>
