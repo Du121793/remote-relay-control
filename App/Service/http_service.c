@@ -2945,8 +2945,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       http_service_extract_form_value(body, "session", &session); cmd.session = session;
       http_service_extract_form_value(body, "command_ts", &cts);  cmd.command_ts = cts;
       http_service_extract_form_text(body, "reason", cmd.reason, SCHEDULER_REASON_MAX_LEN + 1);
-      scheduler_handle_auto_hold(&cmd, HAL_GetTick(),
-                                  cluster_service_get_unix_time(&target));
+      { uint8_t tv2; scheduler_handle_auto_hold(&cmd, HAL_GetTick(), cluster_service_get_unix_time(&tv2)); }
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
       return http_service_send_payload(connection, "200 OK", "application/json", response_body);
     }
