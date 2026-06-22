@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AutoControl Backend Dashboard</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif}
+.top{background:#1e293b;padding:12px 20px;font-size:20px;font-weight:700;border-bottom:1px solid #334155}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:14px;padding:16px;max-width:1400px;margin:0 auto}
+.card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px}
+.card h3{margin:0 0 10px;font-size:16px;color:#38bdf8}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px}
+.row label{font-size:12px;color:#94a3b8;min-width:80px}
+.row input,.row select{background:#0f172a;border:1px solid #475569;color:#e2e8f0;padding:4px 8px;border-radius:4px;font-size:13px;flex:1}
+.row input[type=checkbox]{flex:0;width:auto;margin:0 8px 0 0}
+.status{font-size:12px;color:#94a3b8;line-height:1.5}
+.status b{color:#e2e8f0}
+.btn{background:#2563eb;color:#fff;border:0;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:13px}
+.btn:hover{background:#3b82f6}.btn.sm{padding:3px 8px;font-size:11px}
+.danger{background:#b91c1c}.danger:hover{background:#dc2626}
+.sec{background:#475569}
+.msg{padding:10px;border-radius:6px;margin-bottom:10px;font-size:13px}
+.msg-ok{background:#064e3b;color:#6ee7b7}.msg-err{background:#7f1d1d;color:#fca5a5}
+.device-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #1e293b}
+pre{font-size:11px;background:#0f172a;padding:8px;border-radius:4px;max-height:200px;overflow:auto}
+.sched-row{display:flex;gap:4px;align-items:center;margin:2px 0;font-size:12px}
+.sched-row input[type=time]{width:100px;background:#0f172a;border:1px solid #475569;color:#e2e8f0;padding:2px 4px;border-radius:3px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="top">AutoControl Backend Dashboard</div>
+<div id="msg"></div>
+<div class="grid" id="main"></div>
+
+<script>
+var M='192.168.0.209',TK='',state={nodes:[],status:null,cfg:{},protCfg:{},relays:[],prot:{}};
+
+async function api(path,opts){if(!opts)opts={};var h=opts.headers||{};if(TK)h['X-Auth-Token']=TK;var r=await fetch('http://'+M+path,{method:opts.method||'GET',headers:h,body:opts.body});var t=await r.text();try{return JSON.parse(t)}catch(e){return{ok:false,error:t}}}
+
+function msg(t,err){var d=document.getElementById('msg');d.innerHTML='<div class="msg '+(err?'msg-err':'msg-ok')+'">'+t+'</div>';setTimeout(function(){d.innerHTML=''},3000)}
+
+async function login(){var d=await api('/api/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'password=admin'});if(d.ok){TK=d.token;msg('Login OK');await refresh()}else msg('Login failed: '+d.error,1)}
+
+async function refresh(){
+  var r=await Promise.all([api('/api/status'),api('/api/config/cluster'),api('/api/config/protection'),api('/api/config/relays'),api('/api/protection'),api('/api/cluster/nodes')]);
+  state.status=r[0];state.cfg=r[1];state.protCfg=r[2];state.relays=r[3].relays||[];state.prot=r[4];state.nodes=(r[5].nodes||[]).filter(function(n){return n.same_cluster});
+  render()
+}
+
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')}
+
+function render(){
+  var h='';
+  // Cluster status
+  h+='<div class=card><h3>Cluster Status</h3><div class=status>';
+  if(state.status){
+    h+='<b>Uptime:</b> '+(state.status.uptime_ms/1000).toFixed(0)+'s<br>';
+    h+='<b>IP:</b> '+esc(state.status.ip)+' <b>Role:</b> '+(state.status.cluster&&state.status.cluster.role==2?'Master':'Member')+'<br>';
+    h+='<b>Relay Mask:</b> 0x'+state.status.relay_mask.toString(16)+'<br>';
+    h+='<b>Heap Free:</b> '+(state.status.rtos?state.status.rtos.heap_free:'?')+' bytes<br>';
+    h+='<b>Time Valid:</b> '+(state.prot&&state.prot.time_valid?'Yes':'No');
+  }
+  h+='</div></div>';
+
+  // Nodes
+  h+='<div class=card><h3>Cluster Nodes ('+state.nodes.length+')</h3>';
+  state.nodes.forEach(function(n){
+    h+='<div class=device-row><div><b>'+esc(n.name||'Node '+n.node_id)+'</b><br><span style=font-size:11px;color:#94a3b8>'+esc(n.ip_text||'')+' | Role: '+(n.role==2?'Master':'Member')+' | Online: '+(n.online?'Yes':'No')+'</span></div></div>';
+  });
+  if(!state.nodes.length)h+='<div class=status>No nodes detected</div>';
+  h+='</div>';
+
+  // Global Protection Config
+  h+='<div class=card><h3>Global Protection</h3>';
+  if(state.protCfg){
+    var keys={cooldown_seconds:'Cooldown (s)',retry_delay_seconds:'Retry Delay (s)',max_retry_count:'Max Retries',boot_delay_seconds:'Boot Delay (s)',learning_samples:'Learning Samples',aging_update_hours:'Aging Update (h)',aging_cap_percent:'Aging Cap (%)',stall_multiplier_x10:'Stall Multi (x0.1)'};
+    for(var k in keys){h+='<div class=row><label>'+keys[k]+'</label><input id=g_'+k+' value='+(state.protCfg[k]||0)+'><button class="btn sm" onclick="saveGCfg(\''+k+'\')">Save</button></div>'}
+  }
+  h+='</div>';
+
+  // Relay Config
+  h+='<div class=card><h3>Relay Config</h3>';
+  state.relays.forEach(function(r){
+    h+='<div style="margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid #334155">';
+    h+='<b>CH'+r.channel+'</b> '+esc(r.name||'')+' ';
+    h+='<input type=checkbox id=rc_en_'+r.channel+' '+(r.enabled?'checked':'')+' onchange="saveRelayCfg('+r.channel+')">Enabled ';
+    h+='<input type=checkbox id=rc_pr_'+r.channel+' '+(r.protection_enabled?'checked':'')+' onchange="saveRelayCfg('+r.channel+')">Protect ';
+    h+='<br><input id=rc_th_'+r.channel+' value='+(Number(r.overcurrent_milliamps||4500)/1000).toFixed(2)+' style=width:70px> A ';
+    h+='<input id=rc_dl_'+r.channel+' value='+(r.trip_delay_ms||0)+' style=width:60px> ms ';
+    h+='<button class="btn sm" onclick="saveRelayCfg('+r.channel+')">Save</button>';
+    // Protection state
+    if(state.prot&&state.prot.channels){
+      var ps=state.prot.channels.find(function(p){return p.ch==r.channel});
+      if(ps)h+='<span style=font-size:11px;color:#94a3b8> Phase:'+ps.phase+' Reason:'+ps.fault_reason+' mA:'+ps.current_ma+'</span>';
+    }
+    // Scheduler
+    h+=' <button class="btn sm sec" onclick="loadSched('+r.channel+')">Scheduler</button>';
+    h+='<div id="sch_'+r.channel+'"></div>';
+    h+='</div>';
+  });
+  h+='</div>';
+
+  document.getElementById('main').innerHTML=h;
+}
+
+async function saveGCfg(k){var v=document.getElementById('g_'+k).value;await api('/api/config/protection',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:k+'='+v});msg('Saved '+k);refresh()}
+
+async function saveRelayCfg(ch){
+  var body=['channel='+ch,'enabled='+(document.getElementById('rc_en_'+ch).checked?1:0),'protection_enabled='+(document.getElementById('rc_pr_'+ch).checked?1:0),'overcurrent_milliamps='+Math.round(parseFloat(document.getElementById('rc_th_'+ch).value||4.5)*1000),'trip_delay_ms='+(document.getElementById('rc_dl_'+ch).value||0)].join('&');
+  await api('/api/config/relay',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});msg('CH'+ch+' saved');refresh()
+}
+
+async function loadSched(ch){
+  var d=await api('/api/relay/channels/'+ch+'/schedule-week');
+  var s=await api('/api/relay/channels/'+ch+'/scheduler/status');
+  var box=document.getElementById('sch_'+ch);
+  if(!d.ok){box.innerHTML='<span class=status>No schedule</span>';return}
+  var h='<div style=margin-top:6px><b>Schedule:</b> ';
+  h+='<input type=checkbox id=sch_en_'+ch+' '+(s.schedule_enabled?'checked':'')+' onchange="saveSchedEn('+ch+')"> Enable';
+  h+='<button class="btn sm" onclick="saveSchedDay('+ch+')">Save Day</button></div>';
+  var days=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  for(var d=0;d<7;d++){
+    h+='<div class=sched-row><b style=width:30px>'+days[d]+'</b>';
+    var day=d.days[d];
+    var ivs=day?day.intervals:[];
+    for(var i=0;i<(ivs.length||0);i++){
+      var iv=ivs[i];
+      h+='<input type=time id=sch_s_'+ch+'_'+d+'_'+i+' value='+pad(iv.start_minute/60|0)+':'+pad(iv.start_minute%60)+'>-<input type=time id=sch_e_'+ch+'_'+d+'_'+i+' value='+pad(iv.end_minute/60|0)+':'+pad(iv.end_minute%60)+'>';
+    }
+    h+='<button class="btn sm sec" onclick="addIv('+ch+','+d+')">+</button></div>';
+  }
+  box.innerHTML=h;
+}
+function pad(n){return String(n).padStart(2,'0')}
+
+async function saveSchedEn(ch){await api('/api/relay/channels/'+ch+'/scheduler/enabled',{method:'PATCH',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enabled='+(document.getElementById('sch_en_'+ch).checked?1:0)});msg('Scheduler '+(document.getElementById('sch_en_'+ch).checked?'ON':'OFF'))}
+
+async function saveSchedDay(ch){
+  var d=prompt('Weekday (0=Mon..6=Sun):','0');if(d===null)return;d=parseInt(d);
+  var ivs=[],i=0;
+  while(document.getElementById('sch_s_'+ch+'_'+d+'_'+i)){
+    var sv=document.getElementById('sch_s_'+ch+'_'+d+'_'+i).value;
+    var ev=document.getElementById('sch_e_'+ch+'_'+d+'_'+i).value;
+    if(sv&&ev){var sm=parseInt(sv.split(':')[0])*60+parseInt(sv.split(':')[1]);var em=parseInt(ev.split(':')[0])*60+parseInt(ev.split(':')[1]);ivs.push({s:sm,e:em})}
+    i++;
+  }
+  var body='count='+ivs.length;
+  for(var j=0;j<ivs.length;j++)body+='&s'+j+'='+ivs[j].s+'&e'+j+'='+ivs[j].e;
+  var r=await api('/api/relay/channels/'+ch+'/schedule-week/'+d,{method:'PUT',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
+  msg(r.ok?'Day '+d+' saved':'Save failed: '+r.error,!r.ok);loadSched(ch)
+}
+
+function addIv(ch,d){var i=0;while(document.getElementById('sch_s_'+ch+'_'+d+'_'+i))i++;var row=document.createElement('div');row.className='sched-row';row.innerHTML='<input type=time id=sch_s_'+ch+'_'+d+'_'+i+' value=08:00>-<input type=time id=sch_e_'+ch+'_'+d+'_'+i+' value=12:00>';var box=document.getElementById('sch_'+ch);var btns=box.querySelectorAll('button');var last=btns[btns.length-1];last.parentElement.insertBefore(row,last)}
+
+login();
+</script>
+</body>
+</html>
