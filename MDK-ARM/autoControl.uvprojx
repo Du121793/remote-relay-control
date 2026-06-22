@@ -308,7 +308,7 @@
               <OCR_RVCT10>
                 <Type>0</Type>
                 <StartAddress>0x20020000</StartAddress>
-                <Size>0x50000</Size>
+                <Size>0x58000</Size>
               </OCR_RVCT10>
             </OnChipMemories>
             <RvctStartVector></RvctStartVector>
