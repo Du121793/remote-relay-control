@@ -271,7 +271,7 @@ static void https_client_parse_and_apply(const char *body, size_t body_len)
 
   if (updated.provisioning_revision != config->provisioning_revision ||
       updated.ca_revocation_tag != config->ca_revocation_tag ||
-      updated.cloud_cluster_binding_secret[0] != config->cloud_cluster_binding_secret[0])
+      strcmp(updated.cloud_cluster_binding_secret, config->cloud_cluster_binding_secret) != 0)
   {
     (void)device_config_update_and_save(&updated);
     mqtt_link_service_mark_status_dirty();
