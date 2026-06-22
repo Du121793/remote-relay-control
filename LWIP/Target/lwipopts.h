@@ -78,16 +78,18 @@
 #define LWIP_ETHERNET 1
 /*----- Value in opt.h for LWIP_DNS_SECURE: (LWIP_DNS_SECURE_RAND_XID | LWIP_DNS_SECURE_NO_MULTIPLE_OUTSTANDING | LWIP_DNS_SECURE_RAND_SRC_PORT) -*/
 #define LWIP_DNS_SECURE 7
-/*----- Raise send buffer so medium-sized JSON API payloads fit in one queued response -----*/
-#define TCP_SND_BUF (4 * TCP_MSS)
+/*----- Ethernet MTU 1500 -> MSS 1460 (was 536, too small for HTTP streaming) -----*/
+#define TCP_MSS 1460
+/*----- Raise send buffer for HTTP streaming (8 x 1460 = 11680 bytes) -----*/
+#define TCP_SND_BUF (8 * TCP_MSS)
 /*----- Value in opt.h for TCP_SND_QUEUELEN: (4*TCP_SND_BUF + (TCP_MSS - 1))/TCP_MSS -----*/
-#define TCP_SND_QUEUELEN 17
+#define TCP_SND_QUEUELEN 34
 /*----- Value in opt.h for TCP_SNDLOWAT: LWIP_MIN(LWIP_MAX(((TCP_SND_BUF)/2), (2 * TCP_MSS) + 1), (TCP_SND_BUF) - 1) -*/
-#define TCP_SNDLOWAT 1073
+#define TCP_SNDLOWAT (4 * TCP_MSS)
 /*----- Value in opt.h for TCP_SNDQUEUELOWAT: LWIP_MAX(TCP_SND_QUEUELEN)/2, 5) -*/
 #define TCP_SNDQUEUELOWAT 8
 /*----- Value in opt.h for TCP_WND_UPDATE_THRESHOLD: LWIP_MIN(TCP_WND/4, TCP_MSS*4) -----*/
-#define TCP_WND_UPDATE_THRESHOLD 536
+#define TCP_WND_UPDATE_THRESHOLD (4 * TCP_MSS)
 /*----- Value in opt.h for LWIP_NETIF_LINK_CALLBACK: 0 -----*/
 #define LWIP_NETIF_LINK_CALLBACK 1
 /*----- Value in opt.h for LWIP_IGMP: 0 -----*/
