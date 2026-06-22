@@ -1124,5 +1124,3 @@ void relay_protection_set_user_config(const relay_protection_user_config_t *cfg)
   if (cfg != NULL) g_ucfg = *cfg;
 }
 
-/* ── Scheduler v4 — included from scheduler.c ── */
-#include "scheduler.c"
