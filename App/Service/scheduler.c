@@ -4,7 +4,10 @@
 #include "relay_protection.h"
 #include "cluster_service.h"
 #include "board_relay.h"
+#include "stm32f7xx_hal_rtc.h"
 #include <string.h>
+
+extern RTC_HandleTypeDef hrtc;
 
 /* ── Per-channel state arrays ── */
 static channel_scheduler_state_t g_scheduler_state[SCHEDULER_CHANNEL_COUNT];
@@ -24,22 +27,48 @@ void scheduler_init(void)
     for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
         g_weekly_schedule[i].channel = i + 1;
     }
-    /* Flash load: v1 is RAM-only. Auto Hold cleared per §25.
-       Future: load schedule/pause from device_config flash sector. */
+    /* Restore persisted state (pause, enabled). Auto Hold not persisted. */
+    scheduler_load_from_flash();
 }
 
-/* ── Flash stubs (v2) ── */
+/* ═══════════════════════════════════════════════════════════════
+   RTC Backup persistence (128 bytes available, enough for pause/enable)
+   Weekly schedule (~4KB) deferred to v2 flash storage.
+   ═══════════════════════════════════════════════════════════════ */
+
+#define SCHEDULER_RTC_MAGIC  0x53434845U  /* "SCHE" */
+/* RTC backup registers: DR0=relay_protection boot time.
+   DR1=magic_low16 | (enabled_bits << 16)
+   DR2-DR17=pause_until[0..15] (bit0=pause_blocks_auto_trigger) */
+
 void scheduler_load_from_flash(void)
 {
-    /* TODO: load schedule_enabled, weekly_schedule, pause_until,
-       pause_blocks_auto_trigger from device_config flash sector.
-       Auto Hold is NOT persisted (short-term lease, monotonic time). */
+    uint32_t magic = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1);
+    if ((magic & 0xFFFFU) != (SCHEDULER_RTC_MAGIC & 0xFFFFU)) return;
+
+    uint16_t enabled = (uint16_t)(magic >> 16);
+    for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
+        g_scheduler_state[i].schedule_enabled = (uint8_t)((enabled >> i) & 1U);
+        uint32_t pause = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2 + i);
+        g_scheduler_state[i].schedule_pause_until = pause & 0xFFFFFFFEU;
+        g_scheduler_state[i].pause_blocks_auto_trigger = (uint8_t)(pause & 1U);
+    }
 }
 
 void scheduler_save_to_flash(void)
 {
-    /* TODO: save schedule_enabled, weekly_schedule, pause_until,
-       pause_blocks_auto_trigger to device_config flash sector. */
+    uint32_t magic = (SCHEDULER_RTC_MAGIC & 0xFFFFU);
+    uint32_t enabled = 0;
+    for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
+        if (g_scheduler_state[i].schedule_enabled) enabled |= (1UL << i);
+    }
+    magic |= (enabled << 16);
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, magic);
+    for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
+        uint32_t pause = g_scheduler_state[i].schedule_pause_until & 0xFFFFFFFEU;
+        pause |= (uint32_t)g_scheduler_state[i].pause_blocks_auto_trigger & 1U;
+        HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2 + i, pause);
+    }
 }
 
 /* ── state access ── */
@@ -334,4 +363,6 @@ void scheduler_tick(uint32_t monotonic_ms, uint32_t unix_time, uint8_t time_vali
             request_relay(ch, desired);
         }
     }
+    /* Persist state changes to RTC backup (fast, unlimited endurance) */
+    scheduler_save_to_flash();
 }
