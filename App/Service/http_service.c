@@ -2750,12 +2750,8 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
 
   /* ═══════════════════ Scheduler API (§22) ═══════════════════ */
 
-  /* Helper: extract channel from /api/relay/channels/N/... */
-  #define SCHEDULER_PATH_PREFIX "/api/relay/channels/"
-  #define SCHEDULER_PATH_PREFIX_LEN 22
-
-  if (strncmp(path, SCHEDULER_PATH_PREFIX, SCHEDULER_PATH_PREFIX_LEN) == 0) {
-    const char *rest = path + SCHEDULER_PATH_PREFIX_LEN;
+  if (strncmp(path, "/api/relay/channels/", 20) == 0) {
+    const char *rest = path + 20;
     uint32_t channel = 0;
     while (*rest >= '0' && *rest <= '9') {
       channel = channel * 10 + (uint32_t)(*rest - '0');
