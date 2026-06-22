@@ -3231,6 +3231,7 @@ static err_t http_service_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
   tcp_err(newpcb, http_service_error);
   tcp_sent(newpcb, http_service_sent);
   tcp_poll(newpcb, http_service_poll_close, 1);
+  tcp_nagle_disable(newpcb);
   (void)snprintf(message, sizeof(message), "[http] accept active=%lu\r\n",
                  (unsigned long)http_service_active_connection_count());
   http_service_uart_write(message);
