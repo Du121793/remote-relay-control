@@ -139,6 +139,8 @@ void ct_measurement_calculate_with_reference(
      (result->bias_millivolts <= CT_MEASUREMENT_BIAS_MAX_MV) &&
      (result->saturation_count == 0U)) ? 1U : 0U;
 
+  /* Only report current when CT measurement is fully valid.
+     ct_valid requires: correct sample count, bias in range, no ADC saturation. */
   if ((result->ct_valid != 0U) &&
       (result->ac_rms_millivolts >= CT_MEASUREMENT_ZERO_THRESHOLD_MV))
   {

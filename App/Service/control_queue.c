@@ -2,6 +2,8 @@
 #include "adc_service.h"
 #include "backend_link_service.h"
 #include "mqtt_link_service.h"
+#include "board_relay.h"
+#include "relay_protection.h"
 #include "cluster_service.h"
 #include "discovery_service.h"
 
@@ -84,6 +86,7 @@ static control_queue_backend_sync_t g_control_queue_backend_sync_request;
 static control_queue_backend_sync_workspace_t g_control_queue_backend_sync_workspace;
 static device_config_t g_control_queue_relay_config_snapshot;
 static volatile uint8_t g_control_queue_backend_sync_pending = 0U;
+static volatile uint8_t g_control_queue_force_stop[16];
 static StaticTask_t g_control_queue_task_buffer;
 static StackType_t g_control_queue_task_stack[1024];
 static StaticSemaphore_t g_control_queue_sync_mutex_buffer;
@@ -1083,7 +1086,23 @@ static void control_queue_worker_task(void const *argument)
 
   for (;;)
   {
-    if (xQueueReceive(g_control_queue_handle, &g_control_queue_worker_request, portMAX_DELAY) == pdPASS)
+    uint8_t ch;
+
+    /* Phase A: Check force-stop flags before processing queued commands.
+       Force-stop: turn relay OFF immediately, set 3s cooldown.
+       Pending ON commands for this channel will be rejected by the
+       cooldown check below — no need to flush the queue. */
+    for (ch = 0U; ch < 16U; ++ch)
+    {
+      if (g_control_queue_force_stop[ch] != 0U)
+      {
+        g_control_queue_force_stop[ch] = 0U;
+        (void)board_relay_set((uint8_t)(ch + 1U), GPIO_PIN_RESET);
+      }
+    }
+
+    if (xQueueReceive(g_control_queue_handle, &g_control_queue_worker_request,
+                      pdMS_TO_TICKS(100U)) == pdPASS)
     {
       control_queue_request_t *request = &g_control_queue_worker_request;
 
@@ -1176,7 +1195,49 @@ static void control_queue_worker_task(void const *argument)
         relay_domain_result_t *target_result =
           (request->result != NULL) ? request->result : &g_control_queue_async_result;
 
+        /* Phase A+B: Cooldown + boot safety + fault lockout checks.
+           Reject ON commands for channels still cooling, during boot
+           safety delay, or with hardware fault lockout. */
+        if (request->command.type == CONTROL_PROTO_CMD_SET_RELAY &&
+            request->command.value != 0U)
+        {
+          uint8_t ch = request->command.channel;
+          uint32_t fault_mask = relay_protection_fault_lock_mask();
+
+          if (relay_protection_boot_safety_active(HAL_GetTick()))
+          {
+            target_result->error = CONTROL_PROTO_ERR_BAD_COMMAND;
+            target_result->relay_mask = board_relay_snapshot();
+            goto skip_execute;
+          }
+          if (ch >= 1U && ch <= 16U && ((fault_mask >> (ch - 1U)) & 1U))
+          {
+            target_result->error = CONTROL_PROTO_ERR_BAD_COMMAND;
+            target_result->relay_mask = board_relay_snapshot();
+            goto skip_execute;
+          }
+          if (ch >= 1U && ch <= 16U &&
+              relay_protection_is_cooldown(ch, HAL_GetTick()))
+          {
+            target_result->error = CONTROL_PROTO_ERR_BAD_COMMAND;
+            target_result->relay_mask = board_relay_snapshot();
+            goto skip_execute;
+          }
+        }
+
         relay_domain_execute(&request->command, target_result);
+        skip_execute:
+
+        /* Phase B-H: Notify protection module of relay state changes */
+        if (target_result->error == CONTROL_PROTO_ERR_NONE &&
+            request->command.type == CONTROL_PROTO_CMD_SET_RELAY &&
+            request->command.channel >= 1U && request->command.channel <= 16U)
+        {
+          relay_protection_notify_relay_change(request->command.channel,
+                                               request->command.value,
+                                               HAL_GetTick());
+        }
+
         if ((target_result->error == CONTROL_PROTO_ERR_NONE) &&
             ((request->command.type == CONTROL_PROTO_CMD_SET_RELAY) ||
              (request->command.type == CONTROL_PROTO_CMD_SET_RELAY_MASK) ||
@@ -1186,7 +1247,8 @@ static void control_queue_worker_task(void const *argument)
           backend_link_service_mark_status_dirty();
           mqtt_link_service_mark_status_dirty();
         }
-        g_control_queue_stats.executed++;
+        if (target_result->error == CONTROL_PROTO_ERR_NONE)
+          g_control_queue_stats.executed++;
       }
 
       if (request->waiting_task != NULL)
@@ -1292,6 +1354,12 @@ HAL_StatusTypeDef control_queue_submit(const control_proto_command_t *command, r
   *result = g_control_queue_sync_result;
   (void)xSemaphoreGive(g_control_queue_sync_mutex);
   return (result->error == CONTROL_PROTO_ERR_NONE) ? HAL_OK : HAL_ERROR;
+}
+
+void control_queue_force_stop(uint8_t channel)
+{
+  if (channel == 0U || channel > 16U) return;
+  g_control_queue_force_stop[channel - 1U] = 1U;
 }
 
 HAL_StatusTypeDef control_queue_submit_async(const control_proto_command_t *command)

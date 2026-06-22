@@ -12,6 +12,7 @@
 #include "control_service.h"
 #include "cluster_service.h"
 #include "discovery_service.h"
+#include "relay_protection.h"
 #include "relay_domain.h"
 #include "../Config/device_config.h"
 
@@ -1184,9 +1185,10 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
         adc_service_channel_state_t cs;
         (void)adc_service_get_channel_state(ch, &cs);
         w = snprintf(buffer + pos, buffer_size - pos,
-                     "%s{\"ch\":%u,\"ct\":%u,\"mA\":%lu}",
+                     "%s{\"ch\":%u,\"ct\":%u,\"mA\":%lu,\"bias\":%u,\"rms\":%u}",
                      (ch == 0U) ? "" : ",", (unsigned int)ch,
-                     (unsigned int)cs.ct_valid, (unsigned long)cs.current_milliamps);
+                     (unsigned int)cs.ct_valid, (unsigned long)cs.current_milliamps,
+                     (unsigned int)cs.millivolts, (unsigned int)cs.ac_rms_millivolts);
         if (w > 0 && (size_t)w < (buffer_size - pos)) pos += (size_t)w;
         else break;
       }
@@ -1879,6 +1881,192 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       "application/json",
       (const unsigned char *)response_body,
       strlen(response_body));
+  }
+
+
+  /* ── Relay protection API ─────────────────────────────────── */
+  if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/protection") == 0))
+  {
+    size_t pos;
+    int w; uint8_t ch;
+    relay_protection_global_summary_t gs;
+    relay_protection_get_global_summary(&gs);
+
+    pos = (size_t)snprintf(response_body, response_body_size,
+      "{\"ok\":true,\"boot_safety_active\":%u,\"boot_delay_until_ms\":%lu,"
+      "\"restart_count\":%lu,\"fault_locked_any\":%u,\"fault_lock_mask\":%lu,"
+      "\"channels\":[",
+      (unsigned int)gs.boot_safety_active,
+      (unsigned long)gs.boot_delay_until_ms,
+      (unsigned long)gs.restart_count,
+      (unsigned int)gs.fault_locked_any,
+      (unsigned long)relay_protection_fault_lock_mask());
+    for (ch = 0U; ch < 16U; ++ch)
+    {
+      relay_protection_summary_t ps;
+      (void)relay_protection_get_summary((uint8_t)(ch + 1U), &ps);
+      w = snprintf(response_body + pos, response_body_size - pos,
+        "%s{\"ch\":%u,\"phase\":%u,\"fault_level\":%u,\"fault_reason\":%u,\"learning_complete\":%u,"
+        "\"protection_enabled\":%u,\"tripped\":%u,\"fault_locked\":%u,"
+        "\"current_ma\":%lu,\"reference_ma\":%lu,\"baseline_ma\":%lu,"
+        "\"aging_offset_ma\":%lu,\"normal_low_ma\":%lu,\"normal_high_ma\":%lu,"
+        "\"startup_peak_ma\":%lu,\"startup_duration_ms\":%lu,"
+        "\"trip_count\":%lu,\"cooldown_until_ms\":%lu,"
+        "\"learning_samples\":%u,\"ct_degraded\":%u,\"adc_saturated\":%u,"
+        "\"device_strategy\":%u,\"off_since_ms\":%lu,\"stuck_pending\":%u}",
+        (ch == 0U) ? "" : ",",
+        (unsigned int)(ch + 1U),
+        (unsigned int)ps.phase,
+        (unsigned int)ps.fault_level,
+        (unsigned int)ps.fault_reason,
+        (unsigned int)ps.learning_complete,
+        (unsigned int)ps.protection_enabled,
+        (unsigned int)ps.tripped,
+        (unsigned int)ps.fault_locked,
+        (unsigned long)ps.current_milliamps,
+        (unsigned long)ps.current_reference_ma,
+        (unsigned long)ps.initial_health_baseline_ma,
+        (unsigned long)ps.aging_offset_ma,
+        (unsigned long)ps.normal_low_ma,
+        (unsigned long)ps.normal_high_ma,
+        (unsigned long)ps.startup_peak_ma,
+        (unsigned long)ps.startup_duration_ms,
+        (unsigned long)ps.trip_count,
+        (unsigned long)ps.cooldown_until_ms,
+        (unsigned int)ps.learning_samples_collected,
+        (unsigned int)ps.ct_degraded,
+        (unsigned int)ps.adc_saturated,
+        (unsigned int)ps.device_strategy,
+        (unsigned long)ps.off_since_ms,
+        (unsigned int)ps.stuck_check_pending);
+      if (w > 0 && (size_t)w < (response_body_size - pos)) pos += (size_t)w; else break;
+    }
+    (void)snprintf(response_body + pos, response_body_size - pos, "]}");
+    return http_service_send_payload_streaming(connection, "200 OK", "application/json",
+      (const unsigned char *)response_body, strlen(response_body));
+  }
+
+  if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/protection/force-stop") == 0))
+  {
+    uint32_t channel;
+    if (!control_authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if (!http_service_extract_form_value(body, "channel", &channel) ||
+        channel == 0U || channel > 16U)
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_channel");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+    relay_protection_force_stop((uint8_t)channel);
+    (void)snprintf(response_body, response_body_size,
+      "{\"ok\":true,\"force_stop\":%lu}", (unsigned long)channel);
+    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+  }
+
+  if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/protection/clear-learning") == 0))
+  {
+    uint32_t channel;
+    if (!control_authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if (!http_service_extract_form_value(body, "channel", &channel) ||
+        channel == 0U || channel > 16U)
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_channel");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+    relay_protection_clear_learning((uint8_t)channel);
+    (void)snprintf(response_body, response_body_size,
+      "{\"ok\":true,\"learning_cleared\":%lu}", (unsigned long)channel);
+    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+  }
+
+  if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/protection/unlock") == 0))
+  {
+    uint32_t channel;
+    if (!control_authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if (!http_service_extract_form_value(body, "channel", &channel) ||
+        channel == 0U || channel > 16U)
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_channel");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+    relay_protection_unlock((uint8_t)channel);
+    (void)snprintf(response_body, response_body_size,
+      "{\"ok\":true,\"unlocked\":%lu}", (unsigned long)channel);
+    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+  }
+
+  if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/config/protection") == 0))
+  {
+    relay_protection_user_config_t cfg;
+    uint32_t val;
+    if (!control_authenticated) {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    relay_protection_get_user_config(&cfg);
+    if (http_service_extract_form_value(body, "cooldown_seconds", &val)) cfg.cooldown_seconds = val;
+    if (http_service_extract_form_value(body, "retry_delay_seconds", &val)) cfg.retry_delay_seconds = val;
+    if (http_service_extract_form_value(body, "max_retry_count", &val)) cfg.max_retry_count = val;
+    if (http_service_extract_form_value(body, "boot_delay_seconds", &val)) cfg.boot_delay_seconds = val;
+    if (http_service_extract_form_value(body, "learning_samples", &val)) cfg.learning_samples = val;
+    if (http_service_extract_form_value(body, "aging_update_hours", &val)) cfg.aging_update_hours = val;
+    if (http_service_extract_form_value(body, "aging_cap_percent", &val)) cfg.aging_cap_percent = val;
+    if (http_service_extract_form_value(body, "stall_multiplier_x10", &val)) cfg.stall_timeout_multiplier_x10 = val;
+    relay_protection_set_user_config(&cfg);
+    (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+  }
+
+  if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/config/protection") == 0))
+  {
+    relay_protection_user_config_t cfg;
+    relay_protection_get_user_config(&cfg);
+    (void)snprintf(response_body, response_body_size,
+      "{\"ok\":true,\"cooldown_seconds\":%lu,\"retry_delay_seconds\":%lu,"
+      "\"max_retry_count\":%lu,\"boot_delay_seconds\":%lu,"
+      "\"learning_samples\":%lu,\"aging_update_hours\":%lu,"
+      "\"aging_cap_percent\":%lu,\"stall_multiplier_x10\":%lu}",
+      (unsigned long)cfg.cooldown_seconds, (unsigned long)cfg.retry_delay_seconds,
+      (unsigned long)cfg.max_retry_count, (unsigned long)cfg.boot_delay_seconds,
+      (unsigned long)cfg.learning_samples, (unsigned long)cfg.aging_update_hours,
+      (unsigned long)cfg.aging_cap_percent, (unsigned long)cfg.stall_timeout_multiplier_x10);
+    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+  }
+
+  if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/protection/strategy") == 0))
+  {
+    uint32_t channel, strategy;
+    if (!control_authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if (!http_service_extract_form_value(body, "channel", &channel) ||
+        channel == 0U || channel > 16U)
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_channel");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+    if (!http_service_extract_form_value(body, "strategy", &strategy) || strategy > 1U)
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_strategy");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+    relay_protection_set_strategy((uint8_t)channel, (uint8_t)strategy);
+    (void)snprintf(response_body, response_body_size,
+      "{\"ok\":true,\"channel\":%lu,\"strategy\":%lu}", (unsigned long)channel, (unsigned long)strategy);
+    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/login") == 0))

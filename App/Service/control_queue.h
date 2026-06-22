@@ -68,6 +68,7 @@ HAL_StatusTypeDef control_queue_submit_relay_config_async(
   const char *request_id);
 void control_queue_poll(void);
 void control_queue_get_stats(control_queue_stats_t *stats);
+void control_queue_force_stop(uint8_t channel);
 
 #ifdef __cplusplus
 }

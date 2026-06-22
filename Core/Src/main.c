@@ -35,6 +35,7 @@
 #include "mqtt_link_service.h"
 #include "discovery_service.h"
 #include "adc_service.h"
+#include "relay_protection.h"
 #include "time_sync_service.h"
 #include "https_client_service.h"
 #include "lwip/stats.h"
@@ -395,8 +396,12 @@ int main(void)
   MX_RNG_Init();
   MX_MBEDTLS_Init();
   /* USER CODE BEGIN 2 */
+  relay_protection_init();  /* force all relays OFF before config applies startup mask */
   device_config_init();
-  (void)board_relay_apply_mask(device_config_build_startup_relay_mask(device_config_get()));
+  /* Startup relay mask is now managed by relay_protection:
+     boot_default_on / remember_state become pending requests
+     that are only applied after boot delay expires. */
+  (void)board_relay_apply_mask(0U);  /* all OFF — protection module owns boot state */
   cluster_service_init();
   MX_RTC_Init();
   log_startup_banner();
@@ -582,6 +587,8 @@ static void MX_ADC1_Init(void)
 static void MX_ADC3_Init(void)
 {
   ADC_ChannelConfTypeDef sConfig = {0};
+  __HAL_RCC_ADC3_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
   hadc3.Instance = ADC3;
   hadc3.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc3.Init.Resolution = ADC_RESOLUTION_12B;
@@ -650,6 +657,9 @@ static void MX_DMA_Init(void)
 
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+
+  HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 6, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
 }
 
 /**
@@ -819,6 +829,7 @@ void StartDefaultTask(void const * argument)
   MX_LWIP_Init();
   uart3_write("[boot] lwip initialized\r\n");
   adc_service_init(&hadc1, &hadc3, &htim2);
+  /* relay_protection_init() now called earlier, before device_config_init() */
   next_dhcp_report_ms = HAL_GetTick() + g_dhcp_report_interval_ms;
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
@@ -852,6 +863,7 @@ void StartDefaultTask(void const * argument)
 
     ethernetif_poll_tx_reclaim();
     adc_service_poll();
+    relay_protection_poll();
 
     if ((last_stack_log_ms == 0U) || ((int32_t)(now - last_stack_log_ms) >= 5000))
     {
