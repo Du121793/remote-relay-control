@@ -1,6 +1,8 @@
 #include "adc_service.h"
 #include "ct_measurement.h"
 #include "control_queue.h"
+#include "board_relay.h"
+#include "relay_protection.h"
 #include "../Config/device_config.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -8,10 +10,10 @@
 
 #define ADC_SERVICE_SAMPLE_RATE_HZ      2000U
 #define ADC_SERVICE_WINDOW_SAMPLES      400U
-#define ADC_SERVICE_DMA_BUFFER_SAMPLES  1800U  /* 200 × 9, double-buffered */
-#define ADC_SERVICE_HALF_SAMPLES        900U
-#define ADC_SERVICE_ADC3_DMA_SAMPLES    1600U  /* 200 × 8 */
-#define ADC_SERVICE_ADC3_HALF_SAMPLES   800U
+#define ADC_SERVICE_DMA_BUFFER_SAMPLES  1800U  /* 200trig×9ch, double-buffered */
+#define ADC_SERVICE_HALF_SAMPLES         900U
+#define ADC_SERVICE_ADC3_DMA_SAMPLES    1600U  /* 200trig×8ch */
+#define ADC_SERVICE_ADC3_HALF_SAMPLES    800U
 #define ADC_SERVICE_ADC1_CONV           9U     /* 8 CT + VREFINT */
 #define ADC_SERVICE_ADC3_CONV           8U     /* 8 CT */
 #define ADC_SERVICE_VREF_RANK           8U     /* 0-based within 9-sample seq */
@@ -30,7 +32,6 @@ static TIM_HandleTypeDef *g_timer;
 static adc_service_state_t g_state;
 static adc_service_channel_state_t g_ch[ADC_SERVICE_CHANNEL_COUNT];
 static ct_measurement_window_t g_win[ADC_SERVICE_CHANNEL_COUNT];
-static ct_overcurrent_state_t g_prot[DEVICE_CONFIG_RELAY_COUNT];
 static uint64_t g_vref_sum;
 static uint32_t g_vref_count;
 static volatile uint8_t g_a1_pend, g_a3_pend;
@@ -83,20 +84,20 @@ static void publish_ch(uint8_t ch, uint32_t vdda, uint32_t now)
   taskEXIT_CRITICAL();
   ct_measurement_window_reset(&g_win[ch]);
 
-  /* Overcurrent: relay N is hard-bound to ADC N-1 */
+  /* Phase A-H: Relay protection assessment.
+     Hard-bound: relay N → ADC channel N-1.
+     The protection module handles overcurrent, startup, running,
+     under-current, stuck detection, learning, aging, CT quality,
+     device strategy, and fault classification. */
   {
-    const device_config_t *cfg = device_config_get();
-    const device_config_current_t *c = &cfg->current[ch];
-    uint8_t en = (r.ct_valid && c->protection_enabled) ? 1U : 0U;
-    if(ct_overcurrent_update(&g_prot[ch], en, r.current_milliamps,
-        c->overcurrent_milliamps, c->trip_delay_ms,
-        c->reset_hysteresis_milliamps, now))
-    {
-      control_proto_command_t cmd; memset(&cmd,0,sizeof(cmd));
-      cmd.type=CONTROL_PROTO_CMD_SET_RELAY; cmd.channel=(uint8_t)(ch+1U);
-      cmd.value=0U; cmd.error=CONTROL_PROTO_ERR_NONE;
-      (void)control_queue_submit_async(&cmd);
-    }
+    uint32_t relay_mask = board_relay_snapshot();
+    uint8_t relay_on = ((relay_mask >> ch) & 1U);
+    relay_protection_assess((uint8_t)(ch + 1U), r.current_milliamps,
+                            r.ct_valid,
+                            (r.saturation_count > 0U) ? 1U : 0U,
+                            r.bias_millivolts,
+                            r.ac_rms_millivolts,
+                            relay_on, now);
   }
 }
 
@@ -140,7 +141,7 @@ void adc_service_init(ADC_HandleTypeDef *adc1, ADC_HandleTypeDef *adc3,
 {
   HAL_StatusTypeDef s;
   memset(&g_state,0,sizeof(g_state)); memset(g_ch,0,sizeof(g_ch));
-  memset(g_win,0,sizeof(g_win)); memset(g_prot,0,sizeof(g_prot));
+  memset(g_win,0,sizeof(g_win));
   g_vref_sum=g_vref_count=0U; g_adc1=adc1; g_adc3=adc3; g_timer=tim;
   g_a1_pend=g_a3_pend=g_a1_he=g_a3_he=0U;
   g_a1_ovr=g_a3_ovr=g_a1_hec=g_a3_hec=0U;
@@ -194,10 +195,13 @@ uint8_t adc_service_get_channel_state(uint8_t ch, adc_service_channel_state_t *s
 
 uint8_t adc_service_get_protection_state(uint8_t rch, adc_service_protection_state_t *s)
 { if(!s||!rch||rch>DEVICE_CONFIG_RELAY_COUNT) return 0U;
-  const ct_overcurrent_state_t *src=&g_prot[rch-1U];
-  taskENTER_CRITICAL(); s->above_threshold=src->above_threshold; s->tripped=src->tripped;
-  s->threshold_since_ms=src->threshold_since_ms; s->trip_count=src->trip_count;
-  s->last_trip_ms=src->last_trip_ms; taskEXIT_CRITICAL(); return 1U; }
+  relay_protection_summary_t ps;
+  if(!relay_protection_get_summary(rch,&ps)) return 0U;
+  taskENTER_CRITICAL();
+  s->above_threshold=(ps.fault_level>=RELAY_PROTECTION_FAULT_WARNING)?1U:0U;
+  s->tripped=ps.tripped; s->threshold_since_ms=0U;
+  s->trip_count=ps.trip_count; s->last_trip_ms=0U;
+  taskEXIT_CRITICAL(); return 1U; }
 
 /* ── HAL Callbacks ──────────────────────────────────────────────── */
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *h)
