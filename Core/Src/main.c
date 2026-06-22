@@ -867,12 +867,8 @@ void StartDefaultTask(void const * argument)
     adc_service_poll();
     relay_protection_poll();
 
-    /* Scheduler + Auto Hold tick */
-    {
-      uint8_t time_valid;
-      uint32_t unix_time = cluster_service_get_unix_time(&time_valid);
-      scheduler_tick(HAL_GetTick(), unix_time, time_valid);
-    }
+    /* Scheduler tick (disabled for streaming debug) */
+    /* TODO: re-enable after fixing HTTP streaming truncation */
 
     if ((last_stack_log_ms == 0U) || ((int32_t)(now - last_stack_log_ms) >= 5000))
     {
