@@ -243,6 +243,7 @@ function ensureClusterIdentityMaterial(record) {
   record.caFingerprint = bundle.caFingerprint;
   record.bindingSecret = bundle.bindingSecret;
   record.issuedAt = record.issuedAt || bundle.issuedAt;
+  saveCloudRegistry();
   return record;
 }
 
