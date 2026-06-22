@@ -5,6 +5,7 @@
 #include "cluster_service.h"
 #include "board_relay.h"
 #include "stm32f7xx_hal_rtc.h"
+#include "stm32f7xx_hal_flash.h"
 #include <string.h>
 
 extern RTC_HandleTypeDef hrtc;
@@ -32,9 +33,34 @@ void scheduler_init(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   RTC Backup persistence (128 bytes available, enough for pause/enable)
-   Weekly schedule (~4KB) deferred to v2 flash storage.
+   Persistence: RTC backup (pause/enable) + Flash sector 10 (schedule)
    ═══════════════════════════════════════════════════════════════ */
+
+#define SCHEDULER_FLASH_ADDR   0x081C0000UL
+#define SCHEDULER_FLASH_SECTOR FLASH_SECTOR_10
+#define SCHEDULER_FLASH_MAGIC2 0x53434832U  /* "SCH2" */
+#define SCHEDULER_FLASH_VERSION 1U
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t crc;
+    uint8_t  schedule_enabled[SCHEDULER_CHANNEL_COUNT];
+    weekly_schedule_t weekly[SCHEDULER_CHANNEL_COUNT];
+} scheduler_flash_data_t;
+
+static uint32_t sched_crc32(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFU;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint32_t)data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1U) crc = (crc >> 1U) ^ 0xEDB88320U;
+            else crc >>= 1U;
+        }
+    }
+    return crc ^ 0xFFFFFFFFU;
+}
 
 #define SCHEDULER_RTC_MAGIC  0x53434845U  /* "SCHE" */
 /* RTC backup registers: DR0=relay_protection boot time.
@@ -43,20 +69,39 @@ void scheduler_init(void)
 
 void scheduler_load_from_flash(void)
 {
+    /* RTC backup: pause/enable (fast, every tick) */
     uint32_t magic = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1);
-    if ((magic & 0xFFFFU) != (SCHEDULER_RTC_MAGIC & 0xFFFFU)) return;
+    if ((magic & 0xFFFFU) == (SCHEDULER_RTC_MAGIC & 0xFFFFU)) {
+        uint16_t enabled = (uint16_t)(magic >> 16);
+        for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
+            g_scheduler_state[i].schedule_enabled = (uint8_t)((enabled >> i) & 1U);
+            uint32_t pause = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2 + i);
+            g_scheduler_state[i].schedule_pause_until = pause & 0xFFFFFFFEU;
+            g_scheduler_state[i].pause_blocks_auto_trigger = (uint8_t)(pause & 1U);
+        }
+    }
 
-    uint16_t enabled = (uint16_t)(magic >> 16);
-    for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
-        g_scheduler_state[i].schedule_enabled = (uint8_t)((enabled >> i) & 1U);
-        uint32_t pause = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2 + i);
-        g_scheduler_state[i].schedule_pause_until = pause & 0xFFFFFFFEU;
-        g_scheduler_state[i].pause_blocks_auto_trigger = (uint8_t)(pause & 1U);
+    /* Flash sector 10: weekly schedule (persistent across power cycles) */
+    const scheduler_flash_data_t *stored =
+        (const scheduler_flash_data_t *)SCHEDULER_FLASH_ADDR;
+    if (stored->magic == SCHEDULER_FLASH_MAGIC2 &&
+        stored->version == SCHEDULER_FLASH_VERSION) {
+        uint32_t computed = sched_crc32(
+            (const uint8_t *)&stored->schedule_enabled,
+            sizeof(scheduler_flash_data_t) - offsetof(scheduler_flash_data_t, schedule_enabled));
+        if (computed == stored->crc) {
+            for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
+                if (!g_scheduler_state[i].schedule_enabled)
+                    g_scheduler_state[i].schedule_enabled = stored->schedule_enabled[i];
+                g_weekly_schedule[i] = stored->weekly[i];
+            }
+        }
     }
 }
 
 void scheduler_save_to_flash(void)
 {
+    /* RTC backup: pause/enable (fast, every tick) */
     uint32_t magic = (SCHEDULER_RTC_MAGIC & 0xFFFFU);
     uint32_t enabled = 0;
     for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
@@ -69,6 +114,41 @@ void scheduler_save_to_flash(void)
         pause |= (uint32_t)g_scheduler_state[i].pause_blocks_auto_trigger & 1U;
         HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2 + i, pause);
     }
+}
+
+/* Called from scheduler_tick after schedule changes (throttled) */
+static uint32_t g_last_flash_save_ms = 0;
+
+void scheduler_save_weekly_to_flash(void)
+{
+    /* Throttle: max once per 60 seconds to avoid flash wear */
+    uint32_t now = HAL_GetTick();
+    if (g_last_flash_save_ms != 0 &&
+        (now - g_last_flash_save_ms) < 60000U) return;
+    g_last_flash_save_ms = now;
+
+    scheduler_flash_data_t data;
+    memset(&data, 0, sizeof(data));
+    data.magic = SCHEDULER_FLASH_MAGIC2;
+    data.version = SCHEDULER_FLASH_VERSION;
+
+    for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
+        data.schedule_enabled[i] = g_scheduler_state[i].schedule_enabled;
+        data.weekly[i] = g_weekly_schedule[i];
+    }
+    data.crc = sched_crc32(
+        (const uint8_t *)&data.schedule_enabled,
+        sizeof(data) - offsetof(scheduler_flash_data_t, schedule_enabled));
+
+    HAL_FLASH_Unlock();
+    FLASH_Erase_Sector(SCHEDULER_FLASH_SECTOR, VOLTAGE_RANGE_3);
+    uint32_t addr = SCHEDULER_FLASH_ADDR;
+    for (size_t i = 0; i < sizeof(data); i += 4) {
+        uint32_t word;
+        memcpy(&word, ((uint8_t *)&data) + i, 4);
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + i, word);
+    }
+    HAL_FLASH_Lock();
 }
 
 /* ── state access ── */
@@ -363,6 +443,7 @@ void scheduler_tick(uint32_t monotonic_ms, uint32_t unix_time, uint8_t time_vali
             request_relay(ch, desired);
         }
     }
-    /* Persist state changes to RTC backup (fast, unlimited endurance) */
+    /* Persist: RTC backup every tick, Flash weekly schedule every 60s */
     scheduler_save_to_flash();
+    scheduler_save_weekly_to_flash();
 }

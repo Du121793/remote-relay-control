@@ -96,6 +96,7 @@ bool scheduler_validate_intervals(const daily_schedule_t *day);
 /* Persistence */
 void scheduler_load_from_flash(void);
 void scheduler_save_to_flash(void);
+void scheduler_save_weekly_to_flash(void);
 
 #ifdef __cplusplus
 }
