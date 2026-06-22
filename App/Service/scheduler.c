@@ -255,10 +255,10 @@ void scheduler_user_control(uint8_t channel, uint8_t target,
         case SCHEDULER_PAUSE_CURRENT_SEGMENT:
             /* pause until end of current schedule segment + 1 minute */
             /* simplified: pause for 1 minute */
-            st->schedule_pause_until = cluster_service_get_unix_time(&time_valid) + 60;
+            st->schedule_pause_until = cluster_service_get_unix_time(&tv) + 60;
             break;
         case SCHEDULER_PAUSE_DURATION:
-            st->schedule_pause_until = cluster_service_get_unix_time(&time_valid) + pause_duration_seconds;
+            st->schedule_pause_until = cluster_service_get_unix_time(&tv) + pause_duration_seconds;
             break;
         case SCHEDULER_PAUSE_UNTIL:
             st->schedule_pause_until = pause_until_unix;
