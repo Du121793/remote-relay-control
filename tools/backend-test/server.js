@@ -720,11 +720,17 @@ function effectiveMasterNodeIdForGroup(backendKey, clusterName) {
   return 0;
 }
 
-async function remoteNodeRequest(nodeId, pathText, form) {
+async function remoteNodeRequest(nodeId, pathText, method, form) {
   const node = resolveKnownNode(nodeId);
   let token;
   let response;
   let data;
+  /* Backward compat: old calls pass (nodeId, path, form) with 3 args */
+  if (typeof method !== 'string' || (method !== 'GET' && method !== 'POST' && method !== 'PUT' && method !== 'PATCH' && method !== 'DELETE')) {
+    form = method;
+    method = 'POST';
+  }
+  if (!form) form = "";
 
   if (!node || !node.ip) {
     throw new Error("node_offline");
@@ -732,7 +738,7 @@ async function remoteNodeRequest(nodeId, pathText, form) {
 
   token = await remoteNodeLogin(node);
   response = await fetch(`http://${node.ip}${pathText}`, {
-    method: "POST",
+    method: method,
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       "X-Auth-Token": String(token),
@@ -748,7 +754,7 @@ async function remoteNodeRequest(nodeId, pathText, form) {
     remoteSessionCache.delete(String(Number(node.nodeId || 0)));
     token = await remoteNodeLogin(node);
     response = await fetch(`http://${node.ip}${pathText}`, {
-      method: "POST",
+      method: method,
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
         "X-Auth-Token": String(token),
@@ -1848,6 +1854,14 @@ function renderHtml() {
       <div id="relayConfigPanels" class="muted">沒有可用裝置</div>
     </section>
     <section class="card">
+      <h2>排程器與 Auto Hold</h2>
+      <div class="row"><input id="schNodeId" placeholder="節點 nodeId"><input id="schChannel" placeholder="channel (1-16)"><button onclick="loadScheduler()">載入排程</button></div>
+      <div id="schStatus" class="muted" style="margin-top:6px"></div>
+      <div id="schDay" class="muted" style="margin-top:6px"></div>
+      <div class="row" style="margin-top:8px"><button onclick="schEnable()">啟用排程</button><button onclick="schDisable()">停用排程</button><button onclick="schPause()">暫停1hr</button><button onclick="schResume()">恢復</button></div>
+      <div class="row" style="margin-top:8px"><input id="ahDuration" placeholder="duration_seconds" value="600"><input id="ahSession" placeholder="session" value="1"><input id="ahReason" placeholder="reason" value="auto-hold"><select id="ahTarget"><option value="1">ON</option><option value="0">OFF</option></select><button onclick="sendAutoHold()">送 Auto Hold</button><button onclick="sendAutoHoldClear()">清除 Auto Hold</button></div>
+    </section>
+    <section class="card">
       <h2>手動命令</h2>
       <div class="row">
         <input id="commandNodeId" placeholder="來源節點 nodeId">
@@ -1856,6 +1870,7 @@ function renderHtml() {
           <option value="relay">單路控制</option>
           <option value="mask">遮罩控制</option>
           <option value="all">全部開關</option>
+          <option value="auto-hold">Auto Hold</option>
         </select>
         <input id="commandChannel" placeholder="channel">
         <input id="commandValue" placeholder="value / mask">
@@ -2578,8 +2593,15 @@ function renderHtml() {
       const commandType = document.getElementById('commandType').value;
       const channel = document.getElementById('commandChannel').value.trim();
       const value = document.getElementById('commandValue').value.trim();
-      const body = {};
 
+      if (commandType === 'auto-hold') {
+        var ts=Math.floor(Date.now()/1000);
+        var r=await remoteNodeRequest(nodeId,'/api/relay/channels/'+channel+'/auto-hold','POST','target=1&duration_seconds='+(value||600)+'&session=1&command_ts='+ts+'&reason=manual');
+        document.getElementById('commandResult').textContent=JSON.stringify(r);
+        refreshBurst();return;
+      }
+
+      const body = {};
       if (targetNodeId) body.targetNodeId = Number(targetNodeId);
       if (commandType === 'relay') {
         body.channel = Number(channel);
@@ -2681,6 +2703,14 @@ function renderHtml() {
       }
       refresh();
     }
+    // ── Scheduler functions ──
+    async function loadScheduler(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;var s=await remoteNodeGetJson(nid,'/api/relay/channels/'+ch+'/scheduler/status');var w=await remoteNodeGetJson(nid,'/api/relay/channels/'+ch+'/schedule-week');var st=document.getElementById('schStatus');var sd=document.getElementById('schDay');if(!s.ok){st.textContent='Failed: '+s.error;return}st.innerHTML='<b>Enabled:</b> '+(s.schedule_enabled?'Yes':'No')+' <b>Pause:</b> '+(s.pause_active?'Active (until '+s.schedule_pause_until+')':'None')+' <b>AutoHold:</b> '+(s.auto_hold_active?('target='+(s.auto_hold_target?'ON':'OFF')+' remain='+s.auto_hold_remaining_seconds+'s session='+s.auto_hold_session):'None');if(w.ok&&w.days){var days=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];var h='';for(var d=0;d<7;d++){var day=w.days[d];h+='<b>'+days[d]+':</b> ';if(!day.intervals||!day.intervals.length)h+='OFF';else for(var i=0;i<day.intervals.length;i++){var iv=day.intervals[i];h+=Math.floor(iv.start_minute/60)+':'+String(iv.start_minute%60).padStart(2,'0')+'-'+Math.floor(iv.end_minute/60)+':'+String(iv.end_minute%60).padStart(2,'0')+' '}h+='<br>'}sd.innerHTML=h}}
+    async function schEnable(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await remoteNodeRequest(nid,'/api/relay/channels/'+ch+'/scheduler/enabled','PATCH','enabled=1');loadScheduler()}
+    async function schDisable(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await remoteNodeRequest(nid,'/api/relay/channels/'+ch+'/scheduler/enabled','PATCH','enabled=0');loadScheduler()}
+    async function schPause(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await remoteNodeRequest(nid,'/api/relay/channels/'+ch+'/scheduler/pause','POST','mode=1&duration_seconds=3600&pause_blocks_auto_trigger=0');loadScheduler()}
+    async function schResume(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await remoteNodeRequest(nid,'/api/relay/channels/'+ch+'/scheduler/resume','POST');loadScheduler()}
+    async function sendAutoHold(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();var dur=document.getElementById('ahDuration').value;var ses=document.getElementById('ahSession').value;var tgt=document.getElementById('ahTarget').value;var rsn=document.getElementById('ahReason').value;if(!nid||!ch)return;var ts=Math.floor(Date.now()/1000);var body='target='+tgt+'&duration_seconds='+dur+'&session='+ses+'&command_ts='+ts+'&reason='+encodeURIComponent(rsn);var r=await remoteNodeRequest(nid,'/api/relay/channels/'+ch+'/auto-hold','POST',body);document.getElementById('commandResult').textContent=JSON.stringify(r);loadScheduler()}
+    async function sendAutoHoldClear(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();var ses=document.getElementById('ahSession').value;var tgt=document.getElementById('ahTarget').value;if(!nid||!ch)return;var ts=Math.floor(Date.now()/1000);var body='target='+tgt+'&duration_seconds=0&session='+ses+'&command_ts='+ts+'&reason=clear';var r=await remoteNodeRequest(nid,'/api/relay/channels/'+ch+'/auto-hold','POST',body);document.getElementById('commandResult').textContent=JSON.stringify(r);loadScheduler()}
     renderDeviceNamePanels([]);
     renderRelayConfigPanels([], {});
     connectStream();
