@@ -1389,176 +1389,19 @@ async function saveGlobalProtectionConfig() {
 }
 
 /* ── Scheduler UI ── */
-async function fetchSchedulerStatus(ch) {
-  var d = await apiFetch('/api/relay/channels/' + ch + '/scheduler/status');
-  if (d.ok) state.schedulerStatus = d;
-  return d.ok;
-}
-async function fetchScheduleWeek(ch) {
-  var d = await apiFetch('/api/relay/channels/' + ch + '/schedule-week');
-  if (d.ok) state.scheduleWeek = d;
-  return d.ok;
-}
-
-function renderScheduler() {
-  var ch = Number(document.getElementById('schCh').value);
-  if (!ch || ch < 1 || ch > 16) {
-    document.getElementById('schStatus').textContent = '';
-    document.getElementById('schIntervals').innerHTML = '';
-    return;
-  }
-  fetchSchedulerStatus(ch).then(function() { renderSchedulerStatus(); });
-  fetchScheduleWeek(ch).then(function() { renderSchedulerDay(); });
-}
-
-function renderSchedulerStatus() {
-  var s = state.schedulerStatus;
-  if (!s) return;
-  document.getElementById('schEnabled').checked = !!s.schedule_enabled;
-  var st = [];
-  st.push('排程: ' + (s.schedule_enabled ? '啟用' : '關閉'));
-  if (s.pause_active) st.push(' | 暫停中 (until ' + s.schedule_pause_until + ')');
-  if (s.auto_hold_active) st.push(' | Auto Hold: ' + (s.auto_hold_target ? 'ON' : 'OFF') + ' remain ' + s.auto_hold_remaining_seconds + 's');
-  if (s.pause_active) {
-    document.getElementById('schPauseBtn').style.display = 'none';
-    document.getElementById('schResumeBtn').style.display = '';
-  } else {
-    document.getElementById('schPauseBtn').style.display = '';
-    document.getElementById('schResumeBtn').style.display = 'none';
-  }
-  document.getElementById('schStatus').textContent = st.join('');
-}
-
-function renderSchedulerDay() {
-  var w = state.scheduleWeek;
-  if (!w) return;
-  var dayIdx = Number(document.getElementById('schDay').value);
-  var day = w.days[dayIdx];
-  var html = '';
-  for (var i = 0; i < (day.intervals ? day.intervals.length : 0); i++) {
-    var iv = day.intervals[i];
-    var sh = Math.floor(iv.start_minute / 60);
-    var sm = iv.start_minute % 60;
-    var eh = Math.floor(iv.end_minute / 60);
-    var em = iv.end_minute % 60;
-    html += '<div class="row" style="margin-bottom:4px">' +
-      '<input type="time" id="schS' + i + '" value="' +
-      String(sh).padStart(2,'0') + ':' + String(sm).padStart(2,'0') +
-      '" onchange="markDirty()"> ~ ' +
-      '<input type="time" id="schE' + i + '" value="' +
-      String(eh).padStart(2,'0') + ':' + String(em).padStart(2,'0') +
-      '" onchange="markDirty()">' +
-      '<button class="btn danger" onclick="removeInterval(' + i + ')" style="padding:2px 6px;font-size:11px">X</button>' +
-      '</div>';
-  }
-  document.getElementById('schIntervals').innerHTML = html || '<span class="sub">無排程區間（此日全天 OFF）</span>';
-}
-
-function saveScheduleDay() {
-  var ch = Number(document.getElementById('schCh').value);
-  var dayIdx = Number(document.getElementById('schDay').value);
-  var intervals = [];
-  var count = 0;
-  while (document.getElementById('schS' + count)) {
-    var sv = document.getElementById('schS' + count).value;
-    var ev = document.getElementById('schE' + count).value;
-    if (sv && ev) {
-      var sm = parseInt(sv.split(':')[0]) * 60 + parseInt(sv.split(':')[1]);
-      var em = parseInt(ev.split(':')[0]) * 60 + parseInt(ev.split(':')[1]);
-      intervals.push({ start_minute: sm, end_minute: em });
-    }
-    count++;
-  }
-  var body = 'count=' + intervals.length;
-  for (var i = 0; i < intervals.length; i++) {
-    body += '&s' + i + '=' + intervals[i].start_minute + '&e' + i + '=' + intervals[i].end_minute;
-  }
-  apiFetch('/api/relay/channels/' + ch + '/schedule-week/' + dayIdx, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body
-  }).then(function(d) {
-    if (!d.ok) { showMessage('儲存失敗: ' + d.error, 'error'); return; }
-    showMessage('排程已儲存。');
-    fetchScheduleWeek(ch).then(function() { renderSchedulerDay(); });
-  });
-}
-
-function addInterval() {
-  var count = 0;
-  while (document.getElementById('schS' + count)) count++;
-  var div = document.createElement('div');
-  div.className = 'row';
-  div.style.marginBottom = '4px';
-  div.innerHTML = '<input type="time" id="schS' + count + '" value="08:00"> ~ ' +
-    '<input type="time" id="schE' + count + '" value="12:00">' +
-    '<button class="btn danger" onclick="removeInterval(' + count + ')" style="padding:2px 6px;font-size:11px">X</button>';
-  document.getElementById('schIntervals').appendChild(div);
-}
-
-function removeInterval(idx) {
-  var elS = document.getElementById('schS' + idx);
-  var elE = document.getElementById('schE' + idx);
-  if (elS) elS.parentElement.remove();
-}
-
-function saveSchedulerEnabled() {
-  var ch = Number(document.getElementById('schCh').value);
-  if (!ch) return;
-  apiFetch('/api/relay/channels/' + ch + '/scheduler/enabled', {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'enabled=' + (document.getElementById('schEnabled').checked ? 1 : 0)
-  });
-}
-
-function pauseScheduler() {
-  var ch = Number(document.getElementById('schCh').value);
-  if (!ch) return;
-  apiFetch('/api/relay/channels/' + ch + '/scheduler/pause', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'mode=1&duration_seconds=3600&pause_blocks_auto_trigger=0'
-  }).then(function(d) {
-    if (d.ok) { showMessage('已暫停 1 小時。'); fetchSchedulerStatus(ch).then(function() { renderSchedulerStatus(); }); }
-  });
-}
-
-function resumeScheduler() {
-  var ch = Number(document.getElementById('schCh').value);
-  if (!ch) return;
-  apiFetch('/api/relay/channels/' + ch + '/scheduler/resume', {
-    method: 'POST'
-  }).then(function(d) {
-    if (d.ok) { showMessage('已恢復。'); fetchSchedulerStatus(ch).then(function() { renderSchedulerStatus(); }); }
-  });
-}
-
-function copySchedule() {
-  var ch = Number(document.getElementById('schCh').value);
-  var src = Number(document.getElementById('schDay').value);
-  var targets = prompt('複製到哪些星期？(0=Mon,1=Tue,2=Wed,3=Thu,4=Fri,5=Sat,6=Sun)\n例如: 1,2,3', '');
-  if (!targets) return;
-  apiFetch('/api/relay/channels/' + ch + '/schedule-week/' + src + '/copy', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'targets=' + encodeURIComponent(targets)
-  }).then(function(d) {
-    if (d.ok) { showMessage('已複製到 ' + targets); fetchScheduleWeek(ch).then(function() { renderSchedulerDay(); }); }
-    else showMessage('複製失敗: ' + d.error, 'error');
-  });
-}
-
-function initSchChannels() {
-  var sel = document.getElementById('schCh');
-  if (sel.options.length > 1) return;
-  for (var i = 1; i <= 16; i++) {
-    var opt = document.createElement('option');
-    opt.value = String(i);
-    opt.textContent = 'Channel ' + i;
-    sel.appendChild(opt);
-  }
-}
+async function fetchSchedulerStatus(ch){var d=await apiFetch('/api/relay/channels/'+ch+'/scheduler/status');if(d.ok)state.schedulerStatus=d;return d.ok}
+async function fetchScheduleWeek(ch){var d=await apiFetch('/api/relay/channels/'+ch+'/schedule-week');if(d.ok)state.scheduleWeek=d;return d.ok}
+function renderScheduler(){var ch=Number(document.getElementById('schCh').value);if(!ch||ch<1||ch>16){document.getElementById('schStatus').textContent='';document.getElementById('schIntervals').innerHTML='';return}fetchSchedulerStatus(ch).then(function(){renderSchedulerStatus()});fetchScheduleWeek(ch).then(function(){renderSchedulerDay()})}
+function renderSchedulerStatus(){var s=state.schedulerStatus;if(!s)return;document.getElementById('schEnabled').checked=!!s.schedule_enabled;var st=[];st.push('Schedule: '+(s.schedule_enabled?'ON':'OFF'));if(s.pause_active)st.push(' | Paused until '+s.schedule_pause_until);if(s.auto_hold_active)st.push(' | AutoHold: '+(s.auto_hold_target?'ON':'OFF')+' '+s.auto_hold_remaining_seconds+'s');document.getElementById('schPauseBtn').style.display=s.pause_active?'none':'';document.getElementById('schResumeBtn').style.display=s.pause_active?'':'none';document.getElementById('schStatus').textContent=st.join('')}
+function renderSchedulerDay(){var w=state.scheduleWeek;if(!w)return;var d=Number(document.getElementById('schDay').value);var day=w.days[d];var h='';for(var i=0;i<(day.intervals?day.intervals.length:0);i++){var iv=day.intervals[i];var sh=Math.floor(iv.start_minute/60),sm=iv.start_minute%60,eh=Math.floor(iv.end_minute/60),em=iv.end_minute%60;h+='<div class=row style=margin-bottom:4px><input type=time id=schS'+i+' value='+String(sh).padStart(2,'0')+':'+String(sm).padStart(2,'0')+'> ~ <input type=time id=schE'+i+' value='+String(eh).padStart(2,'0')+':'+String(em).padStart(2,'0')+'><button class="btn danger" onclick=removeInterval('+i+') style=padding:2px_6px;font-size:11px>X</button></div>'}document.getElementById('schIntervals').innerHTML=h||'<span class=sub>No intervals (OFF all day)</span>'}
+function saveScheduleDay(){var ch=Number(document.getElementById('schCh').value),dy=Number(document.getElementById('schDay').value),ivs=[],c=0;while(document.getElementById('schS'+c)){var sv=document.getElementById('schS'+c).value,ev=document.getElementById('schE'+c).value;if(sv&&ev){var sm=parseInt(sv.split(':')[0])*60+parseInt(sv.split(':')[1]),em=parseInt(ev.split(':')[0])*60+parseInt(ev.split(':')[1]);ivs.push({start_minute:sm,end_minute:em})}c++}var b='count='+ivs.length;for(var i=0;i<ivs.length;i++)b+='&s'+i+'='+ivs[i].start_minute+'&e'+i+'='+ivs[i].end_minute;apiFetch('/api/relay/channels/'+ch+'/schedule-week/'+dy,{method:'PUT',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b}).then(function(d){if(!d.ok){showMessage('Save failed: '+d.error,'error');return}showMessage('Schedule saved.');fetchScheduleWeek(ch).then(function(){renderSchedulerDay()})})}
+function addInterval(){var c=0;while(document.getElementById('schS'+c))c++;var dv=document.createElement('div');dv.className='row';dv.style.marginBottom='4px';dv.innerHTML='<input type=time id=schS'+c+' value=08:00> ~ <input type=time id=schE'+c+' value=12:00><button class="btn danger" onclick=removeInterval('+c+') style=padding:2px_6px;font-size:11px>X</button>';document.getElementById('schIntervals').appendChild(dv)}
+function removeInterval(i){var e=document.getElementById('schS'+i);if(e)e.parentElement.remove()}
+function saveSchedulerEnabled(){var ch=Number(document.getElementById('schCh').value);if(!ch)return;apiFetch('/api/relay/channels/'+ch+'/scheduler/enabled',{method:'PATCH',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enabled='+(document.getElementById('schEnabled').checked?1:0)})}
+function pauseScheduler(){var ch=Number(document.getElementById('schCh').value);if(!ch)return;apiFetch('/api/relay/channels/'+ch+'/scheduler/pause',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode=1&duration_seconds=3600&pause_blocks_auto_trigger=0'}).then(function(d){if(d.ok){showMessage('Paused 1hr.');fetchSchedulerStatus(ch).then(function(){renderSchedulerStatus()})}})}
+function resumeScheduler(){var ch=Number(document.getElementById('schCh').value);if(!ch)return;apiFetch('/api/relay/channels/'+ch+'/scheduler/resume',{method:'POST'}).then(function(d){if(d.ok){showMessage('Resumed.');fetchSchedulerStatus(ch).then(function(){renderSchedulerStatus()})}})}
+function copySchedule(){var ch=Number(document.getElementById('schCh').value),src=Number(document.getElementById('schDay').value),t=prompt('Copy to weekdays? (0=Mon..6=Sun) e.g. 1,2,3','');if(!t)return;apiFetch('/api/relay/channels/'+ch+'/schedule-week/'+src+'/copy',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'targets='+encodeURIComponent(t)}).then(function(d){if(d.ok){showMessage('Copied to '+t);fetchScheduleWeek(ch).then(function(){renderSchedulerDay()})}else showMessage('Copy failed: '+d.error,'error')})}
+function initSchChannels(){var s=document.getElementById('schCh');if(s.options.length>1)return;for(var i=1;i<=16;i++){var o=document.createElement('option');o.value=String(i);o.textContent='CH'+i;s.appendChild(o)}}
 
 /* ================================================================
    [13] BOOTSTRAP
