@@ -359,34 +359,6 @@ pre {
         </table>
       </div>
       <div id="remoteRelayConfigPanels"></div>
-
-      <!-- Scheduler Panel -->
-      <div class="panel">
-        <div class="title">排程器設定 <span class="tip" data-tip="設定每週定時 ON/OFF 排程，與 Auto Hold 狀態">?</span></div>
-        <div class="row" style="margin-bottom:10px">
-          <div class="grow"><label>Channel</label><select id="schCh" onchange="renderScheduler()"><option value="0">--</option></select></div>
-          <div><label>啟用排程</label><input id="schEnabled" type="checkbox" onchange="saveSchedulerEnabled()"></div>
-        </div>
-        <div id="schStatus" class="sub" style="margin-bottom:10px"></div>
-        <div class="row" style="margin-bottom:8px">
-          <button class="btn sec" id="schPauseBtn" onclick="pauseScheduler()">暫停排程</button>
-          <button class="btn sec" id="schResumeBtn" onclick="resumeScheduler()" style="display:none">恢復排程</button>
-          <span class="sub" id="schPauseInfo"></span>
-        </div>
-        <div class="row" style="margin-bottom:8px">
-          <b>Weekday:</b>
-          <select id="schDay" onchange="renderSchedulerDay()">
-            <option value="0">Mon</option><option value="1">Tue</option><option value="2">Wed</option>
-            <option value="3">Thu</option><option value="4">Fri</option><option value="5">Sat</option><option value="6">Sun</option>
-          </select>
-          <button class="btn sec" onclick="copySchedule()">複製到...</button>
-        </div>
-        <div id="schIntervals"></div>
-        <div class="row" style="margin-top:8px">
-          <button class="btn pri" onclick="addInterval()">+ 新增區間</button>
-          <button class="btn pri" onclick="saveScheduleDay()">儲存此日排程</button>
-        </div>
-      </div>
     </div>
 
     <!-- Tab: Status -->
@@ -448,8 +420,6 @@ var state = {
   activeTab: 'home',
   protectionState: null,
   protectionConfig: null,
-  schedulerStatus: null,
-  scheduleWeek: null,
   pendingLocal: {},
   pendingRemote: {},
   pollTimer: null,
@@ -1060,7 +1030,6 @@ function renderAll() {
   fillSettings();
   fillDetectedClusters();
   fillGlobalProtectionConfig();
-  initSchChannels();
   renderHome();
   renderCluster();
   renderRelayConfig();
@@ -1387,21 +1356,6 @@ async function saveGlobalProtectionConfig() {
   showMessage('全域保護參數已更新。');
   await refreshAll(true, 'manual');
 }
-
-/* ── Scheduler UI ── */
-async function fetchSchedulerStatus(ch){var d=await apiFetch('/api/relay/channels/'+ch+'/scheduler/status');if(d.ok)state.schedulerStatus=d;return d.ok}
-async function fetchScheduleWeek(ch){var d=await apiFetch('/api/relay/channels/'+ch+'/schedule-week');if(d.ok)state.scheduleWeek=d;return d.ok}
-function renderScheduler(){var ch=Number(document.getElementById('schCh').value);if(!ch||ch<1||ch>16){document.getElementById('schStatus').textContent='';document.getElementById('schIntervals').innerHTML='';return}fetchSchedulerStatus(ch).then(function(){renderSchedulerStatus()});fetchScheduleWeek(ch).then(function(){renderSchedulerDay()})}
-function renderSchedulerStatus(){var s=state.schedulerStatus;if(!s)return;document.getElementById('schEnabled').checked=!!s.schedule_enabled;var st=[];st.push('Schedule: '+(s.schedule_enabled?'ON':'OFF'));if(s.pause_active)st.push(' | Paused until '+s.schedule_pause_until);if(s.auto_hold_active)st.push(' | AutoHold: '+(s.auto_hold_target?'ON':'OFF')+' '+s.auto_hold_remaining_seconds+'s');document.getElementById('schPauseBtn').style.display=s.pause_active?'none':'';document.getElementById('schResumeBtn').style.display=s.pause_active?'':'none';document.getElementById('schStatus').textContent=st.join('')}
-function renderSchedulerDay(){var w=state.scheduleWeek;if(!w)return;var d=Number(document.getElementById('schDay').value);var day=w.days[d];var h='';for(var i=0;i<(day.intervals?day.intervals.length:0);i++){var iv=day.intervals[i];var sh=Math.floor(iv.start_minute/60),sm=iv.start_minute%60,eh=Math.floor(iv.end_minute/60),em=iv.end_minute%60;h+='<div class=row style=margin-bottom:4px><input type=time id=schS'+i+' value='+String(sh).padStart(2,'0')+':'+String(sm).padStart(2,'0')+'> ~ <input type=time id=schE'+i+' value='+String(eh).padStart(2,'0')+':'+String(em).padStart(2,'0')+'><button class="btn danger" onclick=removeInterval('+i+') style=padding:2px_6px;font-size:11px>X</button></div>'}document.getElementById('schIntervals').innerHTML=h||'<span class=sub>No intervals (OFF all day)</span>'}
-function saveScheduleDay(){var ch=Number(document.getElementById('schCh').value),dy=Number(document.getElementById('schDay').value),ivs=[],c=0;while(document.getElementById('schS'+c)){var sv=document.getElementById('schS'+c).value,ev=document.getElementById('schE'+c).value;if(sv&&ev){var sm=parseInt(sv.split(':')[0])*60+parseInt(sv.split(':')[1]),em=parseInt(ev.split(':')[0])*60+parseInt(ev.split(':')[1]);ivs.push({start_minute:sm,end_minute:em})}c++}var b='count='+ivs.length;for(var i=0;i<ivs.length;i++)b+='&s'+i+'='+ivs[i].start_minute+'&e'+i+'='+ivs[i].end_minute;apiFetch('/api/relay/channels/'+ch+'/schedule-week/'+dy,{method:'PUT',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b}).then(function(d){if(!d.ok){showMessage('Save failed: '+d.error,'error');return}showMessage('Schedule saved.');fetchScheduleWeek(ch).then(function(){renderSchedulerDay()})})}
-function addInterval(){var c=0;while(document.getElementById('schS'+c))c++;var dv=document.createElement('div');dv.className='row';dv.style.marginBottom='4px';dv.innerHTML='<input type=time id=schS'+c+' value=08:00> ~ <input type=time id=schE'+c+' value=12:00><button class="btn danger" onclick=removeInterval('+c+') style=padding:2px_6px;font-size:11px>X</button>';document.getElementById('schIntervals').appendChild(dv)}
-function removeInterval(i){var e=document.getElementById('schS'+i);if(e)e.parentElement.remove()}
-function saveSchedulerEnabled(){var ch=Number(document.getElementById('schCh').value);if(!ch)return;apiFetch('/api/relay/channels/'+ch+'/scheduler/enabled',{method:'PATCH',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enabled='+(document.getElementById('schEnabled').checked?1:0)})}
-function pauseScheduler(){var ch=Number(document.getElementById('schCh').value);if(!ch)return;apiFetch('/api/relay/channels/'+ch+'/scheduler/pause',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode=1&duration_seconds=3600&pause_blocks_auto_trigger=0'}).then(function(d){if(d.ok){showMessage('Paused 1hr.');fetchSchedulerStatus(ch).then(function(){renderSchedulerStatus()})}})}
-function resumeScheduler(){var ch=Number(document.getElementById('schCh').value);if(!ch)return;apiFetch('/api/relay/channels/'+ch+'/scheduler/resume',{method:'POST'}).then(function(d){if(d.ok){showMessage('Resumed.');fetchSchedulerStatus(ch).then(function(){renderSchedulerStatus()})}})}
-function copySchedule(){var ch=Number(document.getElementById('schCh').value),src=Number(document.getElementById('schDay').value),t=prompt('Copy to weekdays? (0=Mon..6=Sun) e.g. 1,2,3','');if(!t)return;apiFetch('/api/relay/channels/'+ch+'/schedule-week/'+src+'/copy',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'targets='+encodeURIComponent(t)}).then(function(d){if(d.ok){showMessage('Copied to '+t);fetchScheduleWeek(ch).then(function(){renderSchedulerDay()})}else showMessage('Copy failed: '+d.error,'error')})}
-function initSchChannels(){var s=document.getElementById('schCh');if(s.options.length>1)return;for(var i=1;i<=16;i++){var o=document.createElement('option');o.value=String(i);o.textContent='CH'+i;s.appendChild(o)}}
 
 /* ================================================================
    [13] BOOTSTRAP
