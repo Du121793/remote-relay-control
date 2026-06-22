@@ -47,7 +47,7 @@ size_t control_queue_decrypt_body(const char *enc_body, size_t enc_len,
 #define HTTP_AUTH_SESSION_CAPACITY  8U
 #define HTTP_AUTH_SCOPE_CONTROL     0U
 #define HTTP_AUTH_SCOPE_SERVICE     1U
-#define HTTP_CONNECTION_IDLE_TIMEOUT_MS 10000UL
+#define HTTP_CONNECTION_IDLE_TIMEOUT_MS 30000UL
 #define HTTP_AUTH_PASSWORD          "admin"
 #define HTTP_BACKEND_SYNC_FALLBACK_MS (5UL * 60UL * 1000UL)
 
