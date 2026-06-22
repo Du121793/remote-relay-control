@@ -827,7 +827,7 @@ static err_t http_service_send_payload_streaming(http_service_connection_t *conn
   header_len = snprintf(header, sizeof(header),
                         "HTTP/1.1 %s\r\n"
                         "Content-Type: %s\r\n"
-                        "Content-Length: %u\r\n"
+                        "Content-Length: %lu\r\n"
                         "Connection: close\r\n"
                         "Cache-Control: no-store\r\n"
                         "Access-Control-Allow-Origin: *\r\n"
@@ -836,7 +836,7 @@ static err_t http_service_send_payload_streaming(http_service_connection_t *conn
                         "\r\n",
                         status_line,
                         content_type,
-                        (unsigned int)body_len);
+                        (unsigned long)body_len);
   if ((header_len <= 0) || ((size_t)header_len >= sizeof(header)))
   {
     return ERR_BUF;
@@ -882,7 +882,7 @@ static err_t http_service_send_payload(http_service_connection_t *connection,
   header_len = snprintf(header, sizeof(header),
                         "HTTP/1.1 %s\r\n"
                         "Content-Type: %s\r\n"
-                        "Content-Length: %u\r\n"
+                        "Content-Length: %lu\r\n"
                         "Connection: close\r\n"
                         "Cache-Control: no-store\r\n"
                         "Access-Control-Allow-Origin: *\r\n"
@@ -891,7 +891,7 @@ static err_t http_service_send_payload(http_service_connection_t *connection,
                         "\r\n",
                         status_line,
                         content_type,
-                        (unsigned int)body_len);
+                        (unsigned long)body_len);
   if ((header_len <= 0) || ((size_t)header_len >= sizeof(header)))
   {
     return ERR_BUF;
