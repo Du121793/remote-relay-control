@@ -1,5 +1,6 @@
 #include "mqtt_link_service.h"
 
+#include "https_client_service.h"
 #include "adc_service.h"
 #include "cluster_service.h"
 #include "control_queue.h"
@@ -1359,6 +1360,8 @@ static void mqtt_link_connection_callback(mqtt_client_t *client,
     g_mqtt_link_context.stats.connect_failures++;
     g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_CONNECT + (uint32_t)status;
     mqtt_link_log_value("[mqtt] disconnected status=", (uint32_t)status);
+    /* TLS/PSK failure may mean bindingSecret changed — re-provision now */
+    https_client_service_trigger();
     return;
   }
 

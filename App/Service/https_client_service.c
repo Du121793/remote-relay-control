@@ -532,3 +532,10 @@ uint8_t https_client_service_is_busy(void)
 {
   return (g_https_client_context.state != HTTPS_STATE_IDLE) ? 1U : 0U;
 }
+
+void https_client_service_trigger(void)
+{
+  /* Reset retry timer to trigger immediate provisioning on next poll */
+  https_client_close();
+  g_https_client_context.next_attempt_ms = 0U;
+}
