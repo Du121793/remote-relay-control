@@ -3990,9 +3990,9 @@ app.post("/api/sensor/alert", (req, res) => {
 
   let mqttResult = null;
   if (shouldSendMqtt) {
-    const payload = {
     const nodeInfo = resolveKnownNode(targetNodeId);
     const clusterName = nodeInfo?.cluster || clusterId;
+    const payload = {
       channel,
       target,
       duration_seconds: durationSec,
