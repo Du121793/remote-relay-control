@@ -3900,7 +3900,7 @@ app.post("/api/sensor/alert", (req, res) => {
   const clusterId      = String(req.body.cluster_id || "default");
   const deviceId       = String(req.body.device_id || "");
   const nowMs          = Date.now();
-  const nowUnix        = Math.floor(nowMs / 1000);
+  let   nowUnix        = Math.floor(nowMs / 1000);
 
   if (!channel || channel < 1 || channel > 16) {
     return res.status(400).json({ ok: false, error: "invalid_channel" });
@@ -3949,6 +3949,12 @@ app.post("/api/sensor/alert", (req, res) => {
   const key = makeSensorKey(clusterId, deviceId, channel);
   let sensor = activeSensors.get(key);
   const isNewSession = !sensor || sensor.session === 0;
+
+  // Ensure command_ts is always increasing (MCU rejects older ts)
+  if (sensor && sensor.lastCommandTs && nowUnix <= sensor.lastCommandTs) {
+    nowUnix = sensor.lastCommandTs + 1;
+  }
+  if (sensor) sensor.lastCommandTs = nowUnix;
 
   if (isNewSession) {
     // First alert — create new session
