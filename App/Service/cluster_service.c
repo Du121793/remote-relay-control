@@ -1,5 +1,4 @@
 #include "cluster_service.h"
-#include "backend_link_service.h"
 #include "mqtt_link_service.h"
 #include "../Platform/board_relay.h"
 
@@ -335,7 +334,6 @@ static uint8_t cluster_service_rtc_poll_ready(void)
 
 static void cluster_service_mark_backend_dirty(void)
 {
-  backend_link_service_mark_status_dirty();
   mqtt_link_service_mark_status_dirty();
 }
 

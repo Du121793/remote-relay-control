@@ -1,6 +1,5 @@
 #include "time_sync_service.h"
 
-#include "backend_link_service.h"
 #include "cluster_service.h"
 
 #include "FreeRTOS.h"
@@ -106,7 +105,7 @@ static void time_sync_close_udp(void)
 
 static void time_sync_schedule(uint32_t delay_ms)
 {
-  backend_link_service_cancel_time_request();
+  /* MQTT time sync is now the primary path; backend TCP retired */
   g_time_sync_context.state = TIME_SYNC_STATE_IDLE;
   g_time_sync_context.deadline_ms = 0U;
   g_time_sync_context.next_attempt_ms = HAL_GetTick() + delay_ms;
@@ -129,7 +128,8 @@ static void time_sync_start_backend_fallback(uint32_t error)
   g_time_sync_context.stats.waiting_backend = 1U;
   g_time_sync_context.state = TIME_SYNC_STATE_BACKEND_WAIT;
   g_time_sync_context.deadline_ms = now + TIME_SYNC_BACKEND_TIMEOUT_MS;
-  (void)backend_link_service_request_time();
+  /* MQTT time sync is now the primary path */
+  /* backend_link_service_request_time() has been retired */
 }
 
 static void time_sync_send_request(const ip_addr_t *address)
@@ -327,7 +327,7 @@ static void time_sync_tcpip_step(void *argument)
 
   if (time_sync_is_master_online() == 0U)
   {
-    backend_link_service_cancel_time_request();
+    /* MQTT time sync is now the primary path; backend TCP retired */
     time_sync_close_udp();
     g_time_sync_context.state = TIME_SYNC_STATE_IDLE;
     g_time_sync_context.master_since_ms = 0U;

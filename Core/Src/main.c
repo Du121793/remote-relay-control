@@ -31,7 +31,6 @@
 #include "../../App/Config/device_config.h"
 #include "http_service.h"
 #include "control_service.h"
-#include "backend_link_service.h"
 #include "mqtt_link_service.h"
 #include "discovery_service.h"
 #include "adc_service.h"
@@ -874,18 +873,28 @@ void StartDefaultTask(void const * argument)
       scheduler_tick(HAL_GetTick(), unix_time, time_valid);
     }
 
-    if ((last_stack_log_ms == 0U) || ((int32_t)(now - last_stack_log_ms) >= 5000))
+    if ((last_stack_log_ms == 0U) || ((int32_t)(now - last_stack_log_ms) >= 30000))
     {
-      char stack_msg[64];
-      (void)snprintf(stack_msg, sizeof(stack_msg), "[rtos] default hw=%lu\r\n",
-                     (unsigned long)uxTaskGetStackHighWaterMark(NULL));
+      char stack_msg[160];
+      extern TaskHandle_t g_device_config_task_handle;
+      extern osThreadId g_control_queue_task_handle;
+      extern osThreadId g_discovery_task_handle;
+      TaskHandle_t tcpip = xTaskGetHandle("tcpip_thread");
+      (void)snprintf(stack_msg, sizeof(stack_msg),
+                     "[rtos] stacks: def=%lu cfg=%lu ctl=%lu disc=%lu tcpip=%lu heap_min=%lu\r\n",
+                     (unsigned long)uxTaskGetStackHighWaterMark(NULL),
+                     (unsigned long)uxTaskGetStackHighWaterMark(g_device_config_task_handle),
+                     (unsigned long)uxTaskGetStackHighWaterMark((TaskHandle_t)g_control_queue_task_handle),
+                     (unsigned long)uxTaskGetStackHighWaterMark((TaskHandle_t)g_discovery_task_handle),
+                     (unsigned long)uxTaskGetStackHighWaterMark(tcpip),
+                     (unsigned long)xPortGetMinimumEverFreeHeapSize());
       uart3_write(stack_msg);
       last_stack_log_ms = now;
     }
 
     control_service_poll();
     discovery_service_poll();
-    backend_link_service_poll();
+    /* backend TCP (:42001) has been retired — commands now flow via MQTT */
     mqtt_link_service_poll();
     https_client_service_poll();
     time_sync_service_poll();

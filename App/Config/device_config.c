@@ -39,7 +39,7 @@ static StaticQueue_t g_device_config_queue_buffer;
 static uint8_t g_device_config_queue_storage[
   DEVICE_CONFIG_QUEUE_LENGTH * sizeof(device_config_request_t)];
 static StaticTask_t g_device_config_task_buffer;
-static StackType_t g_device_config_task_stack[2048];
+static StackType_t g_device_config_task_stack[4096]; /* 16 KB — provisioning path needs >8 KB */
 static StaticSemaphore_t g_device_config_save_mutex_buffer;
 static SemaphoreHandle_t g_device_config_save_mutex = NULL;
 static uint8_t g_device_config_sync_result = 0U;
@@ -507,6 +507,12 @@ uint32_t device_config_compute_auth_tag(
     {
       uint32_t tag;
       memcpy(&tag, hmac_out, sizeof(tag));
+      /* Debug: log the first auth_tag computation after boot */
+      { static int _once = 0; extern UART_HandleTypeDef huart3;
+        if (!_once) { char _m[96]; (void)snprintf(_m,sizeof(_m),
+          "[auth] hash[0]=%02x input=%s tag=0x%08lx\r\n",
+          (unsigned)password_hash[0], input_buf, (unsigned long)tag);
+          HAL_UART_Transmit(&huart3,(uint8_t*)_m,(uint16_t)strlen(_m),100); _once=1; } }
       return tag;
     }
     return 0U;
@@ -617,6 +623,14 @@ const device_config_t *device_config_get(void)
   return &g_device_config;
 }
 
+void device_config_copy(device_config_t *dst)
+{
+  if (dst == NULL) return;
+  taskENTER_CRITICAL();
+  *dst = g_device_config;
+  taskEXIT_CRITICAL();
+}
+
 void device_config_set(const device_config_t *config)
 {
   if (config == NULL)
@@ -632,14 +646,32 @@ void device_config_set(const device_config_t *config)
 
 uint8_t device_config_update_and_save(const device_config_t *config)
 {
-  device_config_request_t request;
-  device_config_t normalized;
+  static device_config_request_t request;
+  static device_config_t normalized;
   uint8_t unchanged;
   uint8_t saved;
+  uint8_t mutex_held = 0U;
 
   if (config == NULL)
   {
     return 0U;
+  }
+
+  device_config_worker_init();
+
+  /* Acquire mutex BEFORE writing static workspace to prevent races
+     between HTTP/HTTPS/ControlQueue concurrent updates. */
+  if ((g_device_config_queue != NULL) &&
+      (g_device_config_task_handle != NULL) &&
+      (g_device_config_save_mutex != NULL) &&
+      (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING))
+  {
+    if (xSemaphoreTake(g_device_config_save_mutex,
+                       pdMS_TO_TICKS(DEVICE_CONFIG_WAIT_MS)) != pdTRUE)
+    {
+      return 0U;
+    }
+    mutex_held = 1U;
   }
 
   normalized = *config;
@@ -653,23 +685,18 @@ uint8_t device_config_update_and_save(const device_config_t *config)
 
   if (unchanged != 0U)
   {
+    if (mutex_held != 0U) (void)xSemaphoreGive(g_device_config_save_mutex);
     return 1U;
   }
-
-  device_config_worker_init();
 
   if ((g_device_config_queue == NULL) ||
       (g_device_config_task_handle == NULL) ||
       (g_device_config_save_mutex == NULL) ||
       (xTaskGetSchedulerState() != taskSCHEDULER_RUNNING))
   {
-    return device_config_save_direct(&request.config);
-  }
-
-  if (xSemaphoreTake(g_device_config_save_mutex,
-                     pdMS_TO_TICKS(DEVICE_CONFIG_WAIT_MS)) != pdTRUE)
-  {
-    return 0U;
+    saved = device_config_save_direct(&request.config);
+    if (mutex_held != 0U) (void)xSemaphoreGive(g_device_config_save_mutex);
+    return saved;
   }
 
   g_device_config_sync_result = 0U;
@@ -955,7 +982,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
 {
   const uint32_t *src32;
   uint32_t offset;
-  device_config_t temp;
+  static device_config_t temp;
 
   if ((config == NULL) || (device_config_is_valid(config) == 0U))
   {
@@ -1005,7 +1032,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
 
 static void device_config_worker_task(void *argument)
 {
-  device_config_request_t request;
+  static device_config_request_t request;
 
   (void)argument;
 
@@ -1055,7 +1082,7 @@ static void device_config_worker_init(void)
     g_device_config_task_handle =
       xTaskCreateStatic(device_config_worker_task,
                         "CfgSave",
-                        2048U,
+                        4096U /* must match g_device_config_task_stack */,
                         NULL,
                         tskIDLE_PRIORITY + 1U,
                         g_device_config_task_stack,

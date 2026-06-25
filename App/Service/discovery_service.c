@@ -197,87 +197,80 @@ static void discovery_service_ensure_multicast_membership(void)
   }
 }
 
+/* Two independent static buffers — no union aliasing.
+   Parse into announce, then copy fields to node safely. */
+static discovery_proto_announce_t g_announce_buf;
+static cluster_node_t g_node_buf;
+
 static void discovery_service_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port)
 {
   u16_t copy_len;
-  discovery_proto_announce_t announce;
-  cluster_node_t node;
+  discovery_proto_announce_t *announce = &g_announce_buf;
+  cluster_node_t *node = &g_node_buf;
 
   LWIP_UNUSED_ARG(arg);
   LWIP_UNUSED_ARG(pcb);
-
-  if (p == NULL)
-  {
-    return;
-  }
+  if (p == NULL) return;
 
   g_discovery_stats.rx_packets++;
   g_discovery_stats.last_src_port = port;
   g_discovery_stats.last_src_ip = ip4_addr_get_u32(ip_2_ip4(addr));
   copy_len = (p->tot_len < (sizeof(g_discovery_rx_payload) - 1U)) ?
-             p->tot_len :
-             (u16_t)(sizeof(g_discovery_rx_payload) - 1U);
+             p->tot_len : (u16_t)(sizeof(g_discovery_rx_payload) - 1U);
   pbuf_copy_partial(p, g_discovery_rx_payload, copy_len, 0U);
   g_discovery_rx_payload[copy_len] = '\0';
 
-  if (discovery_proto_is_discover(g_discovery_rx_payload, copy_len) != 0U)
-  {
+  if (discovery_proto_is_discover(g_discovery_rx_payload, copy_len) != 0U) {
     g_discovery_stats.discover_packets++;
     discovery_service_udp_send_announce(addr, port);
-  }
-  else if (discovery_proto_parse_announce(g_discovery_rx_payload,
-                                          copy_len,
-                                          &announce) != 0U)
-  {
-    if (strcmp(announce.service, DISCOVERY_SERVICE_TYPE) == 0)
-    {
-      memset(&node, 0, sizeof(node));
-      node.valid = 1U;
-      node.online = 1U;
-      node.auto_join = announce.auto_join;
-      node.role = announce.role;
-      node.device_state = CLUSTER_DEVICE_STATE_RUNNING;
-      node.node_id = announce.node_id;
-      node.ip_addr = ip4_addr_get_u32(ip_2_ip4(addr));
-      node.last_seen_ms = HAL_GetTick();
-      node.load_score = announce.load_score;
-      node.term = announce.term;
-      node.relay_mask = announce.relay_mask;
-      node.enabled_mask = announce.enabled_mask;
-      node.auth_tag = announce.auth_tag;
-      node.unix_time = announce.unix_time;
-      node.time_valid = announce.time_valid;
-      node.time_source = announce.time_source;
-      node.time_quality = announce.time_quality;
-      node.time_seq = announce.time_seq;
-      node.gateway_epoch = announce.gateway_epoch;
-      node.gateway_node_id = announce.gateway_node_id;
-      node.adc_valid = announce.adc_valid;
-      node.adc_ct_valid = announce.adc_ct_valid;
-      node.adc_signal_present = announce.adc_signal_present;
-      node.adc_raw = announce.adc_raw;
-      node.adc_millivolts = announce.adc_millivolts;
-      node.adc_min = announce.adc_min;
-      node.adc_max = announce.adc_max;
-      node.adc_average = announce.adc_average;
-      node.adc_raw_rms = announce.adc_raw_rms;
-      node.adc_rms_millivolts = announce.adc_rms_millivolts;
-      node.adc_current_milliamps = announce.adc_current_milliamps;
-      node.adc_sample_rate_hz = announce.adc_sample_rate_hz;
-      node.adc_window_samples = announce.adc_window_samples;
-      node.adc_sample_count = announce.adc_sample_count;
-      node.adc_dma_overruns = announce.adc_dma_overruns;
-      node.adc_saturation_count = announce.adc_saturation_count;
-      memcpy(node.node_name, announce.device, sizeof(node.node_name));
-      memcpy(node.cluster_name, announce.cluster, sizeof(node.cluster_name));
-      memcpy(node.cloud_cluster_id, announce.cloud_cluster_id, sizeof(node.cloud_cluster_id));
-      memcpy(node.cloud_device_id, announce.cloud_device_id, sizeof(node.cloud_device_id));
-      memcpy(node.cloud_key_id, announce.cloud_key_id, sizeof(node.cloud_key_id));
-      memcpy(node.mac, announce.mac, sizeof(node.mac));
-      cluster_service_note_remote_node(&node);
+  } else if (discovery_proto_parse_announce(g_discovery_rx_payload, copy_len, announce) != 0U) {
+    if (strcmp(announce->service, DISCOVERY_SERVICE_TYPE) == 0) {
+      /* announce and node are separate buffers — no aliasing, no memset races */
+      memset(node, 0, sizeof(*node));
+      node->valid = 1U; node->online = 1U;
+      node->auto_join = announce->auto_join;
+      node->role = announce->role;
+      node->device_state = CLUSTER_DEVICE_STATE_RUNNING;
+      node->node_id = announce->node_id;
+      node->ip_addr = ip4_addr_get_u32(ip_2_ip4(addr));
+      node->last_seen_ms = HAL_GetTick();
+      node->load_score = announce->load_score;
+      node->term = announce->term;
+      node->relay_mask = announce->relay_mask;
+      node->enabled_mask = announce->enabled_mask;
+      node->auth_tag = announce->auth_tag;
+      node->unix_time = announce->unix_time;
+      node->time_valid = announce->time_valid;
+      node->time_source = announce->time_source;
+      node->time_quality = announce->time_quality;
+      node->time_seq = announce->time_seq;
+      node->gateway_epoch = announce->gateway_epoch;
+      node->gateway_node_id = announce->gateway_node_id;
+      node->adc_valid = announce->adc_valid;
+      node->adc_ct_valid = announce->adc_ct_valid;
+      node->adc_signal_present = announce->adc_signal_present;
+      node->adc_raw = announce->adc_raw;
+      node->adc_millivolts = announce->adc_millivolts;
+      node->adc_min = announce->adc_min;
+      node->adc_max = announce->adc_max;
+      node->adc_average = announce->adc_average;
+      node->adc_raw_rms = announce->adc_raw_rms;
+      node->adc_rms_millivolts = announce->adc_rms_millivolts;
+      node->adc_current_milliamps = announce->adc_current_milliamps;
+      node->adc_sample_rate_hz = announce->adc_sample_rate_hz;
+      node->adc_window_samples = announce->adc_window_samples;
+      node->adc_sample_count = announce->adc_sample_count;
+      node->adc_dma_overruns = announce->adc_dma_overruns;
+      node->adc_saturation_count = announce->adc_saturation_count;
+      memcpy(node->node_name, announce->device, sizeof(node->node_name));
+      memcpy(node->cluster_name, announce->cluster, sizeof(node->cluster_name));
+      memcpy(node->cloud_cluster_id, announce->cloud_cluster_id, sizeof(node->cloud_cluster_id));
+      memcpy(node->cloud_device_id, announce->cloud_device_id, sizeof(node->cloud_device_id));
+      memcpy(node->cloud_key_id, announce->cloud_key_id, sizeof(node->cloud_key_id));
+      memcpy(node->mac, announce->mac, sizeof(node->mac));
+      cluster_service_note_remote_node(node);
     }
   }
-
   pbuf_free(p);
 }
 

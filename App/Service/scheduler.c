@@ -33,13 +33,14 @@ void scheduler_init(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Persistence: RTC backup (pause/enable) + Flash sector 10 (schedule)
+   Persistence: RTC backup (pause/enable) + Flash (schedule)
+   Sector chosen to avoid overlap with device_config at 0x081E0000.
    ═══════════════════════════════════════════════════════════════ */
 
-#define SCHEDULER_FLASH_ADDR   0x081C0000UL
-#define SCHEDULER_FLASH_SECTOR FLASH_SECTOR_10
-#define SCHEDULER_FLASH_MAGIC2 0x53434832U  /* "SCH2" */
-#define SCHEDULER_FLASH_VERSION 1U
+#define SCHEDULER_FLASH_ADDR_DUAL 0x081C0000UL  /* dual-bank: sector 22 */
+#define SCHEDULER_FLASH_ADDR_SINGLE 0x08180000UL /* single-bank: sector 10 */
+#define SCHEDULER_FLASH_MAGIC2 0x53434833U  /* "SCH3" — bumped for sector fix */
+#define SCHEDULER_FLASH_VERSION 2U
 
 typedef struct {
     uint32_t magic;
@@ -66,6 +67,10 @@ static uint32_t sched_crc32(const uint8_t *data, size_t len)
 /* RTC backup registers: DR0=relay_protection boot time.
    DR1=magic_low16 | (enabled_bits << 16)
    DR2-DR17=pause_until[0..15] (bit0=pause_blocks_auto_trigger) */
+/* Forward declarations */
+static uint32_t scheduler_flash_addr(void);
+static uint32_t scheduler_flash_sector(void);
+
 
 void scheduler_load_from_flash(void)
 {
@@ -81,9 +86,9 @@ void scheduler_load_from_flash(void)
         }
     }
 
-    /* Flash sector 10: weekly schedule (persistent across power cycles) */
+    /* Flash: weekly schedule (persistent across power cycles) */
     const scheduler_flash_data_t *stored =
-        (const scheduler_flash_data_t *)SCHEDULER_FLASH_ADDR;
+        (const scheduler_flash_data_t *)scheduler_flash_addr();
     if (stored->magic == SCHEDULER_FLASH_MAGIC2 &&
         stored->version == SCHEDULER_FLASH_VERSION) {
         uint32_t computed = sched_crc32(
@@ -116,16 +121,42 @@ void scheduler_save_to_flash(void)
     }
 }
 
-/* Called from scheduler_tick after schedule changes (throttled) */
+/* Flash save: dirty-driven with error checking and correct sector selection. */
 static uint32_t g_last_flash_save_ms = 0;
+static uint32_t g_last_flash_crc = 0;
+static uint8_t  g_scheduler_flash_dirty = 0U;
+
+void scheduler_mark_flash_dirty(void) { g_scheduler_flash_dirty = 1U; }
+
+static uint32_t scheduler_flash_addr(void)
+{
+#if defined(FLASH_OPTCR_nDBANK)
+  if ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U)
+    return SCHEDULER_FLASH_ADDR_SINGLE;  /* single-bank: sector 10 */
+  return SCHEDULER_FLASH_ADDR_DUAL;      /* dual-bank:   sector 22 */
+#else
+  return SCHEDULER_FLASH_ADDR_SINGLE;
+#endif
+}
+
+static uint32_t scheduler_flash_sector(void)
+{
+#if defined(FLASH_OPTCR_nDBANK)
+  if ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U)
+    return FLASH_SECTOR_10;
+  return FLASH_SECTOR_22;
+#else
+  return FLASH_SECTOR_10;
+#endif
+}
 
 void scheduler_save_weekly_to_flash(void)
 {
-    /* Throttle: max once per 60 seconds to avoid flash wear */
     uint32_t now = HAL_GetTick();
+    if (g_scheduler_flash_dirty == 0U) return;
+    /* Deferred coalescing: wait 2 s since LAST MARK to batch changes */
     if (g_last_flash_save_ms != 0 &&
-        (now - g_last_flash_save_ms) < 60000U) return;
-    g_last_flash_save_ms = now;
+        (now - g_last_flash_save_ms) < 2000U) return;
 
     scheduler_flash_data_t data;
     memset(&data, 0, sizeof(data));
@@ -140,15 +171,48 @@ void scheduler_save_weekly_to_flash(void)
         (const uint8_t *)&data.schedule_enabled,
         sizeof(data) - offsetof(scheduler_flash_data_t, schedule_enabled));
 
-    HAL_FLASH_Unlock();
-    FLASH_Erase_Sector(SCHEDULER_FLASH_SECTOR, VOLTAGE_RANGE_3);
-    uint32_t addr = SCHEDULER_FLASH_ADDR;
-    for (size_t i = 0; i < sizeof(data); i += 4) {
-        uint32_t word;
-        memcpy(&word, ((uint8_t *)&data) + i, 4);
-        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + i, word);
+    /* Skip write if content unchanged from last successful save */
+    if (data.crc == g_last_flash_crc && g_last_flash_crc != 0U) {
+        g_scheduler_flash_dirty = 0U;
+        g_last_flash_save_ms = now;
+        return;
     }
-    HAL_FLASH_Lock();
+
+    {
+      uint32_t addr = scheduler_flash_addr();
+      uint32_t sector = scheduler_flash_sector();
+      uint8_t write_ok = 1U;
+
+      HAL_FLASH_Unlock();
+      __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP);
+      FLASH_Erase_Sector(sector, VOLTAGE_RANGE_3);
+      if (__HAL_FLASH_GET_FLAG(FLASH_FLAG_EOP) != RESET)
+      {
+        for (size_t i = 0; i < sizeof(data); i += 4)
+        {
+            uint32_t word;
+            memcpy(&word, ((uint8_t *)&data) + i, 4);
+            if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + i, word) != HAL_OK)
+            {
+                write_ok = 0U;
+                break;
+            }
+        }
+      }
+      else
+      {
+        write_ok = 0U;
+      }
+      HAL_FLASH_Lock();
+
+      /* Only clear dirty + update CRC on success */
+      if (write_ok != 0U) {
+        g_last_flash_crc = data.crc;
+        g_scheduler_flash_dirty = 0U;
+        g_last_flash_save_ms = now;
+      }
+      /* On failure, dirty stays set → retry next tick */
+    }
 }
 
 /* ── state access ── */

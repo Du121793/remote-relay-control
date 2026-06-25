@@ -4,7 +4,6 @@
 
 #include "board_relay.h"
 #include "adc_service.h"
-#include "backend_link_service.h"
 #include "mqtt_link_service.h"
 #include "time_sync_service.h"
 #include "control_proto.h"
@@ -39,9 +38,9 @@ size_t control_queue_decrypt_body(const char *enc_body, size_t enc_len,
                                    char *plain_out, size_t plain_out_size);
 
 #define HTTP_TCP_PORT               80U
-#define HTTP_CONN_POOL_SIZE         4U
-#define HTTP_REQUEST_BUFFER_SIZE    2048U
-#define HTTP_BODY_BUFFER_SIZE       16384U
+#define HTTP_CONN_POOL_SIZE         2U    /* 2 connections sufficient with streaming */
+#define HTTP_REQUEST_BUFFER_SIZE    1536U  /* reduced from 2048 — max form body < 1KB */
+#define HTTP_BODY_BUFFER_SIZE       12288U /* reduced from 16384 — JSON API fits in 12KB */
 #define HTTP_AUTH_TOKEN_SIZE        16U
 #define HTTP_AUTH_SESSION_TTL_MS    (15UL * 60UL * 1000UL)
 #define HTTP_AUTH_SESSION_CAPACITY  8U
@@ -764,7 +763,14 @@ static err_t http_service_send_payload_chunk(http_service_connection_t *connecti
     return ERR_OK;
   }
 
-  send_len = (u16_t)(connection->send_total - connection->send_progress);
+  {
+    size_t remaining = connection->send_total - connection->send_progress;
+    if (remaining > 0xFFFFUL)
+    {
+      remaining = 0xFFFFUL;
+    }
+    send_len = (u16_t)remaining;
+  }
   if (send_len > space)
   {
     send_len = space;
@@ -805,7 +811,7 @@ static err_t http_service_send_payload_chunk(http_service_connection_t *connecti
   {
       connection->close_pending = 1U;
   }
-  
+
   return ERR_OK;
 }
 
@@ -906,7 +912,10 @@ static err_t http_service_send_payload(http_service_connection_t *connection,
 
   /* Use progressive streaming for payloads larger than ~1 KB to avoid
      tcp_write ERR_MEM when the body exceeds tcp_sndbuf.  The sent callback
-     drives http_service_send_payload_chunk() to push remaining data. */
+     drives http_service_send_payload_chunk() to push remaining data.
+     For status / config JSON this is safe because the body pointer
+     (connection->response_buffer) lives inside the connection struct and
+     is not freed until the connection is released. */
   if (body_len > 1024U)
   {
     connection->send_data = (const unsigned char *)body;
@@ -945,14 +954,13 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
   char ip_text[16];
   char mask_text[16];
   char gw_text[16];
-  control_service_stats_t control_stats;
-  control_queue_stats_t control_queue_stats;
-  discovery_service_stats_t discovery_stats;
-  backend_link_stats_t backend_stats;
+  static control_service_stats_t control_stats;
+  static control_queue_stats_t control_queue_stats;
+  static discovery_service_stats_t discovery_stats;
   mqtt_link_stats_t *mqtt_stats = &g_http_mqtt_stats_snapshot;
-  cluster_service_state_t cluster_state;
-  adc_service_state_t adc_state;
-  time_sync_service_stats_t time_sync_stats;
+  static cluster_service_state_t cluster_state;
+  static adc_service_state_t adc_state;
+  static time_sync_service_stats_t time_sync_stats;
   size_t heap_free = xPortGetFreeHeapSize();
   size_t heap_min = xPortGetMinimumEverFreeHeapSize();
   uint32_t http_active = 0U;
@@ -964,7 +972,6 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
   control_service_get_stats(&control_stats);
   control_queue_get_stats(&control_queue_stats);
   discovery_service_get_stats(&discovery_stats);
-  backend_link_service_get_stats(&backend_stats);
   mqtt_link_service_get_stats(mqtt_stats);
   cluster_service_get_state(&cluster_state);
   adc_service_get_state(&adc_state);
@@ -1005,7 +1012,6 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  "\"discovery\":{\"rx\":%lu,\"tx_attempts\":%lu,\"announce\":%lu,\"tx_failures\":%lu,\"discover\":%lu,\"last_tx_err\":%ld,\"last_payload_len\":%lu},"
                  "\"auth\":{\"required\":1,\"active_session\":%u,\"sessions_issued\":%lu,\"login_failures\":%lu},"
                  "\"http\":{\"connections\":%lu,\"requests\":%lu,\"errors\":%lu,\"active\":%lu,\"close_pending\":%lu,\"listener_up\":%lu},"
-                 "\"backend\":{\"connected\":%u,\"should_run\":%u,\"port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"sent_hello\":%lu,\"sent_heartbeat\":%lu,\"sent_status\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"last_error\":%lu},"
                  "\"cloud\":{\"configured\":%u,\"enabled\":%u,\"should_run\":%u,\"connected\":%u,\"transport\":%u,\"broker_port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"published_hello\":%lu,\"published_heartbeat\":%lu,\"published_status\":%lu,\"published_fault_reports\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"published_acks\":%lu,\"ack_queue_dropped\":%lu,\"ack_queue_depth\":%lu,\"last_error\":%lu,\"status_dirty_count\":%lu,\"ca_fingerprint_configured\":%u,\"binding_secret_configured\":%u},"
                  "\"lwip\":{\"mem_avail\":%lu,\"mem_used\":%lu,\"mem_err\":%lu,\"tcp_pcb_used\":%lu,\"tcp_pcb_max\":%lu,\"tcp_seg_used\":%lu,\"tcp_seg_max\":%lu,\"pbuf_used\":%lu,\"pbuf_max\":%lu,\"sys_timeout_used\":%lu,\"sys_timeout_max\":%lu,\"sys_timeout_err\":%lu,\"eth_tx\":%lu,\"eth_tx_err\":%lu,\"eth_tx_free\":%lu,\"eth_tx_reclaim\":%lu,\"eth_tx_reclaim_schedule_err\":%lu,\"eth_last_tx_hal_status\":%lu,\"eth_last_tx_hal_error\":%lu,\"eth_last_tx_dma_error\":%lu,\"eth_rx\":%lu,\"eth_rx_null\":%lu,\"eth_rx_alloc_fail\":%lu,\"eth_rx_alloc_recover\":%lu,\"eth_rx_alloc_stalled\":%lu,\"eth_last_rx_ms\":%lu,\"eth_dma_status\":%lu,\"eth_rx_build_pending\":%lu}"
                  "}",
@@ -1111,17 +1117,6 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)http_active,
                  (unsigned long)http_close_pending,
                  (unsigned long)((g_http_listener_pcb != NULL) ? 1U : 0U),
-                 (unsigned int)backend_stats.connected,
-                 (unsigned int)backend_stats.should_run,
-                 (unsigned int)backend_stats.port,
-                 (unsigned long)backend_stats.connect_attempts,
-                 (unsigned long)backend_stats.connect_failures,
-                 (unsigned long)backend_stats.sent_hello,
-                 (unsigned long)backend_stats.sent_heartbeat,
-                 (unsigned long)backend_stats.sent_status,
-                 (unsigned long)backend_stats.received_commands,
-                 (unsigned long)backend_stats.command_errors,
-                 (unsigned long)backend_stats.last_error,
                  (unsigned int)mqtt_stats->configured,
                  (unsigned int)mqtt_stats->enabled,
                  (unsigned int)mqtt_stats->should_run,
@@ -1143,6 +1138,7 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)mqtt_stats->status_dirty_count,
                  (unsigned int)(mqtt_stats->cluster_ca_fingerprint[0] != '\0'),
                  (unsigned int)(mqtt_stats->cluster_binding_secret[0] != '\0'),
+#if LWIP_STATS
                  (unsigned long)lwip_stats.mem.avail,
                  (unsigned long)lwip_stats.mem.used,
                  (unsigned long)lwip_stats.mem.err,
@@ -1152,9 +1148,16 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)MEMP_STATS_GET(max, MEMP_TCP_SEG),
                  (unsigned long)MEMP_STATS_GET(used, MEMP_PBUF),
                  (unsigned long)MEMP_STATS_GET(max, MEMP_PBUF),
+#else
+                 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL,
+#endif
+#if MEMP_STATS
                  (unsigned long)MEMP_STATS_GET(used, MEMP_SYS_TIMEOUT),
                  (unsigned long)MEMP_STATS_GET(max, MEMP_SYS_TIMEOUT),
                  (unsigned long)MEMP_STATS_GET(err, MEMP_SYS_TIMEOUT),
+#else
+                 0UL, 0UL, 0UL,
+#endif
                  (unsigned long)g_eth_tx_packets,
                  (unsigned long)g_eth_tx_errors,
                  (unsigned long)g_eth_tx_free_packets,
@@ -1206,12 +1209,7 @@ __attribute__((noinline)) static err_t http_service_handle_status_request(http_s
   }
 
   http_service_format_status_json(connection->response_buffer, sizeof(connection->response_buffer));
-  http_service_uart_write("[http] status ready\r\n");
-  return http_service_send_payload_streaming(connection,
-                                             "200 OK",
-                                             "application/json",
-                                             (const unsigned char *)connection->response_buffer,
-                                             strlen(connection->response_buffer));
+  return http_service_send_payload(connection, "200 OK", "application/json", connection->response_buffer);
 }
 
 static void http_service_format_relay_json(char *buffer, size_t buffer_size, uint32_t relay_mask)
@@ -2832,6 +2830,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
         return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
       }
       ws->days[(uint8_t)weekday] = new_day;
+      scheduler_mark_flash_dirty();
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
       return http_service_send_payload(connection, "200 OK", "application/json", response_body);
     }
@@ -2860,6 +2859,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
           if (*t >= '0' && *t <= '9') {
             uint32_t tw = (uint32_t)(*t - '0');
             if (tw <= 6) ws->days[(uint8_t)tw] = src;
+          scheduler_mark_flash_dirty();
             while (*t >= '0' && *t <= '9') t++;
           } else break;
         }
@@ -2873,6 +2873,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       uint32_t enabled = 0;
       http_service_extract_form_value(body, "enabled", &enabled);
       channel_scheduler_state_t *st = scheduler_get_state((uint8_t)channel);
+      scheduler_mark_flash_dirty();
       if (st) st->schedule_enabled = (uint8_t)(enabled ? 1 : 0);
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
       return http_service_send_payload(connection, "200 OK", "application/json", response_body);
@@ -3070,9 +3071,19 @@ static err_t http_service_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
     http_service_uart_write(message);
   }
   
-  /* Reset chunk tracking for the new request */
+  /* Reset chunk tracking for the new request, UNLESS a streaming
+     response is already in progress (e.g. GET / is still pushing the
+     large HTML page).  Clobbering send_data would silently kill the
+     streaming and leave the browser waiting forever. */
   if (connection != NULL)
   {
+     if (connection->send_data != NULL && connection->send_progress < connection->send_total)
+     {
+       /* Another streaming response is still in flight — silently
+          drop the pipelined request.  The pbuf was already freed
+          above; just return so the ongoing transfer can continue. */
+       return ERR_OK;
+     }
      connection->send_data = NULL;
      connection->send_total = 0;
      connection->send_progress = 0;

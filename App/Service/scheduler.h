@@ -9,11 +9,11 @@ extern "C" {
 #endif
 
 #define SCHEDULER_CHANNEL_COUNT     16U
-#define SCHEDULER_MAX_INTERVALS      8U
+#define SCHEDULER_MAX_INTERVALS      6U
 #define SCHEDULER_PAUSE_FOREVER      0xFFFFFFFFU
 #define SCHEDULER_AUTO_HOLD_MIN_SEC  1U
 #define SCHEDULER_AUTO_HOLD_MAX_SEC  1800U
-#define SCHEDULER_REASON_MAX_LEN     63
+#define SCHEDULER_REASON_MAX_LEN     47
 
 /* ── Time interval for one ON period ── */
 typedef struct {
@@ -97,6 +97,7 @@ bool scheduler_validate_intervals(const daily_schedule_t *day);
 void scheduler_load_from_flash(void);
 void scheduler_save_to_flash(void);
 void scheduler_save_weekly_to_flash(void);
+void scheduler_mark_flash_dirty(void);
 
 #ifdef __cplusplus
 }

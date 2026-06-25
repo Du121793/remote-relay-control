@@ -70,8 +70,8 @@
 #define PBUF_POOL_SIZE 32
 /*----- Value in opt.h for MEM_ALIGNMENT: 1 -----*/
 #define MEM_ALIGNMENT 4
-/*----- Reserve the top 48 KiB of SRAM for the lwIP heap -----*/
-#define LWIP_RAM_HEAP_POINTER 0x20070000
+/*----- lwIP heap placed by linker in SRAM1 (no hardcoded address) -----*/
+/* LWIP_RAM_HEAP_POINTER removed — linker-managed BSS array avoids DMA overlap */
 /*----- Value in opt.h for MEMP_NUM_SYS_TIMEOUT: (LWIP_TCP + IP_REASSEMBLY + LWIP_ARP + (2*LWIP_DHCP) + LWIP_AUTOIP + LWIP_IGMP + LWIP_DNS + (PPP_SUPPORT*6*MEMP_NUM_PPP_PCB) + (LWIP_IPV6 ? (1 + LWIP_IPV6_REASS + LWIP_IPV6_MLD) : 0)) -*/
 #define MEMP_NUM_SYS_TIMEOUT 16
 /*----- Value in opt.h for LWIP_ETHERNET: LWIP_ARP || PPPOE_SUPPORT -*/
@@ -94,9 +94,11 @@
 #define LWIP_NETIF_LINK_CALLBACK 1
 /*----- Value in opt.h for LWIP_IGMP: 0 -----*/
 #define LWIP_IGMP 1
-/* TLS receive and MQTT callbacks are nested on tcpip_thread. CMSIS-RTOS v1
-   passes this value to FreeRTOS as StackType_t units, so 2560 reserves 10 KiB. */
-#define TCPIP_THREAD_STACKSIZE 2560
+/* TLS/MQTT/HTTPS callbacks nest deeply on tcpip_thread — observed >16 KB
+   with https_client_recv → device_config_update_and_save.
+   6144 words = 24 KiB provides safe headroom; CMSIS-RTOS v1 passes this
+   value to FreeRTOS as StackType_t units (4 bytes each on Cortex-M7). */
+#define TCPIP_THREAD_STACKSIZE 6144
 /*----- Value in opt.h for TCPIP_THREAD_PRIO: 1 -----*/
 #define TCPIP_THREAD_PRIO osPriorityNormal
 /*----- Value in opt.h for TCPIP_MBOX_SIZE: 0 -----*/
@@ -120,7 +122,7 @@
 /*----- Use the CubeMX-generated external mbedTLS middleware. -----*/
 #define LWIP_USE_EXTERNAL_MBEDTLS 1
 /*----- Value in opt.h for LWIP_STATS: 1 -----*/
-#define LWIP_STATS 1
+#define LWIP_STATS 1  /* debug: expose lwIP internal counters in /api/status */
 #define MEM_STATS 1
 #define MEMP_STATS 1
 /*----- Value in opt.h for CHECKSUM_GEN_IP: 1 -----*/
