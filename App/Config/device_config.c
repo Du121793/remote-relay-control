@@ -23,8 +23,54 @@ static uint8_t g_device_config_initialized = 0U;
 static uint8_t g_device_config_runtime_dirty = 0U;
 static uint32_t g_device_config_runtime_due_ms = 0U;
 
-#define DEVICE_CONFIG_FLASH_ADDRESS   0x081E0000UL
-#define DEVICE_CONFIG_QUEUE_LENGTH    2U
+/* A/B slot addresses. Each slot in its own sector for power-loss safety. */
+#define DEVICE_CONFIG_SLOT_A_SINGLE  0x08180000UL  /* sector 10 */
+#define DEVICE_CONFIG_SLOT_B_SINGLE  0x081C0000UL  /* sector 11 */
+#define DEVICE_CONFIG_SLOT_A_DUAL    0x081C0000UL  /* sector 22 */
+#define DEVICE_CONFIG_SLOT_B_DUAL    0x081E0000UL  /* sector 23 */
+#define DEVICE_CONFIG_SLOT_HEADER_MAGIC 0x43464732UL  /* "CFG2" */
+#define DEVICE_CONFIG_SLOT_COMMIT_VALID  0x43474744UL  /* "CGD" */
+
+typedef struct {
+  uint32_t magic;
+  uint32_t sequence;
+  uint32_t crc;
+  uint32_t commit;
+} device_config_slot_header_t;
+
+static uint32_t g_device_config_sequence = 0U;
+static uint32_t g_device_config_active_slot = 0U; /* 0 or 1 */
+static uint32_t device_config_slot_addr(uint8_t slot) {
+  uint8_t single = 0U;
+#if defined(FLASH_OPTCR_nDBANK)
+  single = ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U) ? 1U : 0U;
+#else
+  single = 1U;
+#endif
+  if (slot == 0U) return single ? DEVICE_CONFIG_SLOT_A_SINGLE : DEVICE_CONFIG_SLOT_A_DUAL;
+  return single ? DEVICE_CONFIG_SLOT_B_SINGLE : DEVICE_CONFIG_SLOT_B_DUAL;
+}
+static uint32_t device_config_slot_sector(uint8_t slot) {
+  uint8_t single = 0U;
+#if defined(FLASH_OPTCR_nDBANK)
+  single = ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U) ? 1U : 0U;
+#else
+  single = 1U;
+#endif
+  if (single) return (slot == 0U) ? FLASH_SECTOR_10 : FLASH_SECTOR_11;
+  return (slot == 0U) ? FLASH_SECTOR_22 : FLASH_SECTOR_23;
+}
+static uint32_t device_config_slot_bank(uint8_t slot) {
+  (void)slot;
+#if defined(FLASH_OPTCR_nDBANK)
+  if ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U) return FLASH_BANK_1;
+  return FLASH_BANK_2;
+#else
+  return FLASH_BANK_1;
+#endif
+}
+
+#define DEVICE_CONFIG_QUEUE_LENGTH    1U
 #define DEVICE_CONFIG_WAIT_MS         2000U
 #define DEVICE_CONFIG_RUNTIME_SAVE_DELAY_MS  1500U
 
@@ -42,6 +88,8 @@ static StaticTask_t g_device_config_task_buffer;
 static StackType_t g_device_config_task_stack[4096]; /* 16 KB — provisioning path needs >8 KB */
 static StaticSemaphore_t g_device_config_save_mutex_buffer;
 static SemaphoreHandle_t g_device_config_save_mutex = NULL;
+static StaticSemaphore_t g_flash_storage_mutex_buffer;
+static SemaphoreHandle_t g_flash_storage_mutex = NULL;
 static uint8_t g_device_config_sync_result = 0U;
 
 typedef struct
@@ -166,50 +214,21 @@ static uint8_t device_config_v4_is_valid(const device_config_v4_t *config);
 static uint8_t device_config_v5_is_valid(const device_config_v5_t *config);
 static void device_config_build_current_defaults(device_config_t *config);
 
-static uint32_t device_config_flash_sector(void)
-{
-#if defined(FLASH_OPTCR_nDBANK)
-  if ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U)
-  {
-    return FLASH_SECTOR_11;
-  }
-  return FLASH_SECTOR_23;
-#else
-  return FLASH_SECTOR_11;
-#endif
-}
-
-static uint32_t device_config_flash_bank(void)
-{
-#if defined(FLASH_OPTCR_nDBANK)
-  if ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U)
-  {
-    return FLASH_BANK_1;
-  }
-  return FLASH_BANK_2;
-#else
-  return FLASH_BANK_1;
-#endif
-}
-
-static uint8_t device_config_flash_erase(void)
+static uint32_t device_config_flash_erase_slot(uint8_t slot)
 {
   FLASH_EraseInitTypeDef erase_init;
   uint32_t sector_error = 0U;
-
   memset(&erase_init, 0, sizeof(erase_init));
   erase_init.TypeErase = FLASH_TYPEERASE_SECTORS;
   erase_init.VoltageRange = FLASH_VOLTAGE_RANGE_3;
-  erase_init.Banks = device_config_flash_bank();
-  erase_init.Sector = device_config_flash_sector();
+  erase_init.Banks = device_config_slot_bank(slot);
+  erase_init.Sector = device_config_slot_sector(slot);
   erase_init.NbSectors = 1U;
-
   if (HAL_FLASHEx_Erase(&erase_init, &sector_error) != HAL_OK)
   {
     g_device_config_last_flash_error = HAL_FLASH_GetError();
     return 0U;
   }
-
   g_device_config_last_flash_error = 0U;
   return 1U;
 }
@@ -751,12 +770,31 @@ uint8_t device_config_is_valid(const device_config_t *config)
 
 uint8_t device_config_load(device_config_t *config)
 {
-  const device_config_t *stored = (const device_config_t *)DEVICE_CONFIG_FLASH_ADDRESS;
-  const device_config_v5_t *stored_v5 = (const device_config_v5_t *)DEVICE_CONFIG_FLASH_ADDRESS;
-  const device_config_v4_t *stored_v4 = (const device_config_v4_t *)DEVICE_CONFIG_FLASH_ADDRESS;
-  const device_config_v3_t *stored_v3 = (const device_config_v3_t *)DEVICE_CONFIG_FLASH_ADDRESS;
-  const device_config_v2_t *stored_v2 = (const device_config_v2_t *)DEVICE_CONFIG_FLASH_ADDRESS;
-  const device_config_v1_t *stored_v1 = (const device_config_v1_t *)DEVICE_CONFIG_FLASH_ADDRESS;
+  /* Find newest valid A/B slot */
+  uint32_t slot_addr = 0U;
+  {
+    const device_config_slot_header_t *ha = (const device_config_slot_header_t *)device_config_slot_addr(0U);
+    const device_config_slot_header_t *hb = (const device_config_slot_header_t *)device_config_slot_addr(1U);
+    uint8_t va = (ha->magic == DEVICE_CONFIG_SLOT_HEADER_MAGIC && ha->commit == DEVICE_CONFIG_SLOT_COMMIT_VALID) ? 1U : 0U;
+    uint8_t vb = (hb->magic == DEVICE_CONFIG_SLOT_HEADER_MAGIC && hb->commit == DEVICE_CONFIG_SLOT_COMMIT_VALID) ? 1U : 0U;
+    if (va && vb) {
+      g_device_config_active_slot = (ha->sequence >= hb->sequence) ? 0U : 1U;
+      g_device_config_sequence = (ha->sequence >= hb->sequence) ? ha->sequence : hb->sequence;
+    } else if (va) {
+      g_device_config_active_slot = 0U; g_device_config_sequence = ha->sequence;
+    } else if (vb) {
+      g_device_config_active_slot = 1U; g_device_config_sequence = hb->sequence;
+    } else {
+      return 0U;
+    }
+    slot_addr = device_config_slot_addr(g_device_config_active_slot) + sizeof(device_config_slot_header_t);
+  }
+  const device_config_t *stored = (const device_config_t *)slot_addr;
+  const device_config_v5_t *stored_v5 = (const device_config_v5_t *)slot_addr;
+  const device_config_v4_t *stored_v4 = (const device_config_v4_t *)slot_addr;
+  const device_config_v3_t *stored_v3 = (const device_config_v3_t *)slot_addr;
+  const device_config_v2_t *stored_v2 = (const device_config_v2_t *)slot_addr;
+  const device_config_v1_t *stored_v1 = (const device_config_v1_t *)slot_addr;
   uint32_t index;
 
   if (config == NULL)
@@ -983,11 +1021,20 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   const uint32_t *src32;
   uint32_t offset;
   static device_config_t temp;
+  uint8_t save_slot;
+  uint32_t save_addr;
+  device_config_slot_header_t hdr;
 
   if ((config == NULL) || (device_config_is_valid(config) == 0U))
   {
     return 0U;
   }
+
+  /* Write to the ALTERNATE slot for power-loss safety.
+     If power fails during erase/write, the other slot still has valid data. */
+  save_slot = (g_device_config_active_slot == 0U) ? 1U : 0U;
+  save_addr = device_config_slot_addr(save_slot);
+  g_device_config_sequence++;
 
   temp = *config;
   temp.config_crc32 = device_config_compute_crc32(&temp);
@@ -999,33 +1046,67 @@ static uint8_t device_config_save_direct(const device_config_t *config)
      a sector is being erased or programmed will cause an imprecise bus
      fault (CFSR=0x00000400).  The HAL flash helpers do not guarantee
      full interrupt masking for the complete operation window. */
+  flash_storage_lock();
   __disable_irq();
 
   HAL_FLASH_Unlock();
   __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
                          FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_ERSERR);
 
-  if (device_config_flash_erase() == 0U)
+  if (device_config_flash_erase_slot(save_slot) == 0U)
   {
     HAL_FLASH_Lock();
+    flash_storage_unlock();
     __enable_irq();
     return 0U;
+  }
+
+  /* Write slot header (uncommitted) + data, then commit. */
+  hdr.magic    = DEVICE_CONFIG_SLOT_HEADER_MAGIC;
+  hdr.sequence = g_device_config_sequence;
+  hdr.crc      = temp.config_crc32;
+  hdr.commit   = 0xFFFFFFFFU; /* not committed yet */
+  {
+    const uint32_t *hdr32 = (const uint32_t *)&hdr;
+    uint32_t hdr_offset;
+    for (hdr_offset = 0U; hdr_offset < sizeof(hdr); hdr_offset += sizeof(uint32_t))
+    {
+      if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,
+                            save_addr + hdr_offset,
+                            hdr32[hdr_offset / sizeof(uint32_t)]) != HAL_OK)
+      {
+        g_device_config_last_flash_error = HAL_FLASH_GetError();
+        HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
+        return 0U;
+      }
+    }
   }
 
   for (offset = 0U; offset < sizeof(temp); offset += sizeof(uint32_t))
   {
     if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,
-                          DEVICE_CONFIG_FLASH_ADDRESS + offset,
+                          save_addr + sizeof(device_config_slot_header_t) + offset,
                           src32[offset / sizeof(uint32_t)]) != HAL_OK)
     {
       g_device_config_last_flash_error = HAL_FLASH_GetError();
-      HAL_FLASH_Lock();
-      __enable_irq();
+      HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
       return 0U;
     }
   }
 
+  /* Commit: write SLOT_COMMIT_VALID to make this slot the active one */
+  {
+    uint32_t commit_word = DEVICE_CONFIG_SLOT_COMMIT_VALID;
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,
+                          save_addr + offsetof(device_config_slot_header_t, commit),
+                          commit_word) == HAL_OK)
+    {
+      g_device_config_active_slot = save_slot;
+    }
+  }
+
   HAL_FLASH_Lock();
+  flash_storage_unlock();
   __enable_irq();
   return 1U;
 }
@@ -1074,6 +1155,11 @@ static void device_config_worker_init(void)
   {
     g_device_config_save_mutex =
       xSemaphoreCreateMutexStatic(&g_device_config_save_mutex_buffer);
+  }
+  if (g_flash_storage_mutex == NULL)
+  {
+    g_flash_storage_mutex =
+      xSemaphoreCreateMutexStatic(&g_flash_storage_mutex_buffer);
   }
   if ((g_device_config_queue != NULL) &&
       (g_device_config_save_mutex != NULL) &&
@@ -1234,3 +1320,21 @@ void device_config_poll(void)
 }
 
 UBaseType_t device_config_stack_high_water(void) { if (g_device_config_task_handle == NULL) return 0; return uxTaskGetStackHighWaterMark(g_device_config_task_handle); }
+
+void flash_storage_lock(void)
+{
+  if (g_flash_storage_mutex != NULL &&
+      xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
+  {
+    (void)xSemaphoreTake(g_flash_storage_mutex, portMAX_DELAY);
+  }
+}
+
+void flash_storage_unlock(void)
+{
+  if (g_flash_storage_mutex != NULL &&
+      xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
+  {
+    (void)xSemaphoreGive(g_flash_storage_mutex);
+  }
+}

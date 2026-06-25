@@ -122,9 +122,9 @@
 /*----- Use the CubeMX-generated external mbedTLS middleware. -----*/
 #define LWIP_USE_EXTERNAL_MBEDTLS 1
 /*----- Value in opt.h for LWIP_STATS: 1 -----*/
-#define LWIP_STATS 1  /* debug: expose lwIP internal counters in /api/status */
-#define MEM_STATS 1
-#define MEMP_STATS 1
+#define LWIP_STATS 0  /* debug: expose lwIP internal counters in /api/status */
+#define MEM_STATS 0
+#define MEMP_STATS 0
 /*----- Value in opt.h for CHECKSUM_GEN_IP: 1 -----*/
 #define CHECKSUM_GEN_IP 1
 /*----- Value in opt.h for CHECKSUM_GEN_UDP: 1 -----*/

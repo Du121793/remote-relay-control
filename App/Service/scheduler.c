@@ -38,8 +38,8 @@ void scheduler_init(void)
    Sector chosen to avoid overlap with device_config at 0x081E0000.
    ═══════════════════════════════════════════════════════════════ */
 
-#define SCHEDULER_FLASH_ADDR_DUAL 0x081C0000UL  /* dual-bank: sector 22 */
-#define SCHEDULER_FLASH_ADDR_SINGLE 0x08180000UL /* single-bank: sector 10 */
+#define SCHEDULER_FLASH_ADDR_DUAL 0x081A0000UL  /* dual-bank: sector 22 */
+#define SCHEDULER_FLASH_ADDR_SINGLE 0x080E0000UL /* single-bank: sector 7 */
 #define SCHEDULER_FLASH_MAGIC2 0x53434833U  /* "SCH3" — bumped for sector fix */
 #define SCHEDULER_FLASH_VERSION 2U
 
@@ -144,8 +144,8 @@ static uint32_t scheduler_flash_addr(void)
 {
 #if defined(FLASH_OPTCR_nDBANK)
   if ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U)
-    return SCHEDULER_FLASH_ADDR_SINGLE;  /* single-bank: sector 10 */
-  return SCHEDULER_FLASH_ADDR_DUAL;      /* dual-bank:   sector 22 */
+    return SCHEDULER_FLASH_ADDR_SINGLE;  /* single-bank: sector 7 */
+  return SCHEDULER_FLASH_ADDR_DUAL;      /* dual-bank:   sector 21 */
 #else
   return SCHEDULER_FLASH_ADDR_SINGLE;
 #endif
@@ -155,10 +155,10 @@ static uint32_t scheduler_flash_sector(void)
 {
 #if defined(FLASH_OPTCR_nDBANK)
   if ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U)
-    return FLASH_SECTOR_10;
-  return FLASH_SECTOR_22;
+    return FLASH_SECTOR_7;
+  return FLASH_SECTOR_21;
 #else
-  return FLASH_SECTOR_10;
+  return FLASH_SECTOR_7;
 #endif
 }
 
