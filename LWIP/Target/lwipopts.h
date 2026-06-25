@@ -57,7 +57,7 @@
 #define LWIP_ALTCP_TLS 1
 #define LWIP_ALTCP_TLS_MBEDTLS 1
 #define ALTCP_MBEDTLS_RNG_FN mbedtls_entropy_func
-#define MQTT_OUTPUT_RINGBUF_SIZE 1024
+#define MQTT_OUTPUT_RINGBUF_SIZE 4096  /* 12 topic subscribes + hello + status fit */
 /* Long command topics plus the accepted 383-byte JSON payload must fit. */
 #define MQTT_VAR_HEADER_BUFFER_LEN 640
 /*----- Value in opt.h for MEMP_NUM_IGMP_GROUP: 8 -----*/
