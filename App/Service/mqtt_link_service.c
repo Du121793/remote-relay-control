@@ -1494,104 +1494,34 @@ static void mqtt_link_incoming_data(void *argument,
 
 static void mqtt_link_subscribe_commands(void)
 {
-  err_t error;
+  err_t error = ERR_OK;
+  err_t last_err = ERR_OK;
 
-  error = mqtt_subscribe(g_mqtt_link_context.client,
-                         g_mqtt_link_context.stats.topic_command_relay,
-                         1U,
-                         mqtt_link_subscription_callback,
-                         NULL);
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_mask,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_config_relay,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_time,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_auto_hold,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_control,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_scheduler_set,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_scheduler_enabled,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_scheduler_pause,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_protection_force_stop,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_protection_unlock,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_protection_clear_learning,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
+  /* Subscribe all topics independently — one failure does not stop the rest. */
+  #define MQTT_SUB(topic_field) do { \
+    err_t e = mqtt_subscribe(g_mqtt_link_context.client, \
+      g_mqtt_link_context.stats.topic_field, 1U, \
+      mqtt_link_subscription_callback, NULL); \
+    if (e != ERR_OK) { error = e; last_err = e; } \
+  } while(0)
+
+  MQTT_SUB(topic_command_relay);
+  MQTT_SUB(topic_command_mask);
+  MQTT_SUB(topic_command_config_relay);
+  MQTT_SUB(topic_command_time);
+  MQTT_SUB(topic_command_auto_hold);
+  MQTT_SUB(topic_command_control);
+  MQTT_SUB(topic_command_scheduler_set);
+  MQTT_SUB(topic_command_scheduler_enabled);
+  MQTT_SUB(topic_command_scheduler_pause);
+  MQTT_SUB(topic_command_protection_force_stop);
+  MQTT_SUB(topic_command_protection_unlock);
+  MQTT_SUB(topic_command_protection_clear_learning);
+  #undef MQTT_SUB
+
   if (error != ERR_OK)
   {
-    g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_SUBSCRIBE + (uint32_t)(-error);
+    g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_SUBSCRIBE + (uint32_t)(-last_err);
   }
 }
 
@@ -1615,8 +1545,6 @@ static void mqtt_link_connection_callback(mqtt_client_t *client,
 
   g_mqtt_link_context.stats.connected = 1U;
   g_mqtt_link_context.stats.last_error = 0U;
-  g_mqtt_link_context.status_dirty = 1U;
-  g_mqtt_link_context.initial_publish_stage = 1U;
   g_mqtt_link_context.last_heartbeat_ms = 0U;
   g_mqtt_link_context.last_status_ms = 0U;
 
@@ -1624,7 +1552,11 @@ static void mqtt_link_connection_callback(mqtt_client_t *client,
                           mqtt_link_incoming_publish,
                           mqtt_link_incoming_data,
                           NULL);
+  /* Subscribe BEFORE setting dirty/stage — ensures ring buffer has room
+     for all 12 SUBSCRIBE packets before hello/status compete for space. */
   mqtt_link_subscribe_commands();
+  g_mqtt_link_context.status_dirty = 1U;
+  g_mqtt_link_context.initial_publish_stage = 1U;
   mqtt_link_log("[mqtt] connected\r\n");
 }
 
