@@ -816,11 +816,17 @@ uint8_t device_config_load(device_config_t *config)
   /* Try fallback: if primary slot data is invalid, check the other slot */
   {
     uint8_t fallback_slot = (g_device_config_active_slot == 0U) ? 1U : 0U;
-    uint32_t fb_addr = device_config_slot_addr(fallback_slot) + sizeof(device_config_slot_header_t);
-    const device_config_t *fb_stored = (const device_config_t *)fb_addr;
-    if (fb_stored->magic == DEVICE_CONFIG_MAGIC && device_config_is_valid(fb_stored) != 0U)
+    uint32_t fb_base = device_config_slot_addr(fallback_slot);
+    const device_config_slot_header_t *fb_hdr = (const device_config_slot_header_t *)fb_base;
+    const device_config_t *fb_stored = (const device_config_t *)(fb_base + sizeof(device_config_slot_header_t));
+    if (fb_hdr->magic == DEVICE_CONFIG_SLOT_HEADER_MAGIC &&
+        fb_hdr->commit == DEVICE_CONFIG_SLOT_COMMIT_VALID &&
+        device_config_is_valid(fb_stored) != 0U &&
+        fb_hdr->crc == fb_stored->config_crc32)
     {
       memcpy(config, fb_stored, sizeof(*config));
+      g_device_config_active_slot = fallback_slot;
+      g_device_config_sequence = fb_hdr->sequence;
       return 1U;
     }
   }
