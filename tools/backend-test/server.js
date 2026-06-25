@@ -3877,6 +3877,186 @@ loadCloudRegistry();
 
 /* Commands are published to the MQTT broker via its control API on port 4301 */
 
+/* ═══════════════════════════════════════════════════════════════
+   Sensor Auto Hold API — Grafana/backend sensor alerts → MCU
+   ═══════════════════════════════════════════════════════════════ */
+
+// activeSensors: key = "cluster|device|channel"
+const activeSensors = new Map();
+
+function makeSensorKey(clusterId, deviceId, channel) {
+  return `${String(clusterId || "default")}|${String(deviceId || "")}|${Number(channel)}`;
+}
+
+// POST /api/sensor/alert
+// Body: { cluster_id?, device_id?, channel, target, duration_seconds, reason }
+// Creates or renews an Auto Hold session.  Only sends MQTT if this is
+// a new session OR ≥5 minutes have passed since the last MQTT renew.
+app.post("/api/sensor/alert", (req, res) => {
+  const channel        = Number(req.body.channel);
+  const target         = Number(req.body.target ?? 1);
+  const durationSec    = Number(req.body.duration_seconds ?? 600);
+  const reason         = String(req.body.reason || "sensor alert").slice(0, 63);
+  const clusterId      = String(req.body.cluster_id || "default");
+  const deviceId       = String(req.body.device_id || "");
+  const nowMs          = Date.now();
+  const nowUnix        = Math.floor(nowMs / 1000);
+
+  if (!channel || channel < 1 || channel > 16) {
+    return res.status(400).json({ ok: false, error: "invalid_channel" });
+  }
+  if (target !== 0 && target !== 1) {
+    return res.status(400).json({ ok: false, error: "invalid_target" });
+  }
+  if (durationSec < 1 || durationSec > 1800) {
+    return res.status(400).json({ ok: false, error: "invalid_duration", max: 1800 });
+  }
+
+  // Resolve which device to target
+  if (!cloudClusters.has(clusterId)) {
+    return res.status(404).json({ ok: false, error: "cluster_not_found" });
+  }
+
+  // Find an online device in this cluster
+  let targetNodeId = 0;
+  const registryKey = `${clusterId}|${deviceId}`;
+  if (deviceId && cloudDevices.has(registryKey)) {
+    const dev = cloudDevices.get(registryKey);
+    if (dev && dev.nodeId) targetNodeId = dev.nodeId;
+  }
+  if (!targetNodeId) {
+    // Pick any online device in this cluster via knownNodes
+    for (const [nid, node] of knownNodes) {
+      if (node.online && String(node.clusterId || "default") === clusterId) {
+        targetNodeId = Number(nid);
+        break;
+      }
+    }
+  }
+  if (!targetNodeId) {
+    return res.status(503).json({ ok: false, error: "no_online_device" });
+  }
+
+  const key = makeSensorKey(clusterId, deviceId, channel);
+  let sensor = activeSensors.get(key);
+  const isNewSession = !sensor || sensor.session === 0;
+
+  if (isNewSession) {
+    // First alert — create new session
+    sensor = {
+      session:     crypto.randomBytes(4).readUInt32BE(0) >>> 0,  // positive uint32
+      channel,
+      target,
+      durationSec,
+      reason,
+      clusterId,
+      deviceId,
+      targetNodeId,
+      lastMqttRenewMs: 0,        // force immediate send
+      lastAlertMs: nowMs,
+      createdAtMs: nowMs,
+    };
+    activeSensors.set(key, sensor);
+  } else {
+    // Existing session — update tracking, maybe renew
+    sensor.lastAlertMs = nowMs;
+    sensor.reason = reason;
+    activeSensors.set(key, sensor);
+  }
+
+  // Decide whether to send MQTT now
+  const elapsedSinceRenew = (nowMs - sensor.lastMqttRenewMs);
+  const shouldSendMqtt = isNewSession || (elapsedSinceRenew >= 5 * 60 * 1000);
+
+  let mqttResult = null;
+  if (shouldSendMqtt) {
+    const payload = {
+      channel,
+      target,
+      duration_seconds: durationSec,
+      session: sensor.session,
+      command_ts: nowUnix,
+      reason,
+      node_id: targetNodeId,
+      request_id: crypto.randomBytes(8).toString("hex"),
+    };
+    const mqttOk = mqttPublishCommand(clusterId, "auto-hold", payload);
+    mqttResult = mqttOk ? "sent" : "mqtt_unavailable";
+    if (mqttOk) {
+      sensor.lastMqttRenewMs = nowMs;
+      sensor.targetNodeId = targetNodeId;
+    }
+  } else {
+    mqttResult = "deferred";  // <5min since last MQTT, skip
+  }
+
+  return res.json({
+    ok: true,
+    session: sensor.session,
+    channel,
+    mqtt: mqttResult,
+    is_new_session: isNewSession,
+    next_renew_available_ms: sensor.lastMqttRenewMs + 5 * 60 * 1000,
+  });
+});
+
+// POST /api/sensor/recover
+// Body: { cluster_id?, device_id?, channel }
+// Ends the active sensor Auto Hold for this channel.
+app.post("/api/sensor/recover", (req, res) => {
+  const channel   = Number(req.body.channel);
+  const clusterId = String(req.body.cluster_id || "default");
+  const deviceId  = String(req.body.device_id || "");
+  const key       = makeSensorKey(clusterId, deviceId, channel);
+  const sensor    = activeSensors.get(key);
+
+  if (!sensor || sensor.session === 0) {
+    return res.json({ ok: true, cleared: false, reason: "no_active_session" });
+  }
+
+  const nowUnix = Math.floor(Date.now() / 1000);
+  const payload = {
+    channel,
+    target: sensor.target,       // must match creation target
+    duration_seconds: 0,         // clear
+    session: sensor.session,
+    command_ts: nowUnix,
+    reason: "感測器恢復正常",
+    node_id: sensor.targetNodeId,
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+
+  const mqttOk = mqttPublishCommand(clusterId, "auto-hold", payload);
+  activeSensors.delete(key);
+
+  return res.json({
+    ok: true,
+    cleared: true,
+    session: sensor.session,
+    channel,
+    mqtt: mqttOk ? "sent" : "mqtt_unavailable",
+  });
+});
+
+// GET /api/sensor/status — list all active sensor sessions
+app.get("/api/sensor/status", (_req, res) => {
+  const list = [];
+  for (const [key, s] of activeSensors) {
+    list.push({
+      key,
+      channel: s.channel,
+      target: s.target,
+      session: s.session,
+      duration_sec: s.durationSec,
+      reason: s.reason,
+      last_alert_ms: s.lastAlertMs,
+      last_mqtt_renew_ms: s.lastMqttRenewMs,
+      created_ms: s.createdAtMs,
+    });
+  }
+  return res.json({ ok: true, active: list.length, sensors: list });
+});
+
 app.listen(HTTP_PORT, HTTP_HOST, () => {
   console.log(`[backend-test] http listening on ${HTTP_HOST}:${HTTP_PORT}`);
 });
