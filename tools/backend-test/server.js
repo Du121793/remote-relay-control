@@ -63,16 +63,21 @@ const BROKER_CONTROL_URL = `http://127.0.0.1:${MQTT_CONTROL_PORT}`;
 async function mqttPublishCommand(clusterName, topicSuffix, payload) {
   try {
     const topic = `cluster/${clusterName}/command/${topicSuffix}`;
+    const payloadJson = JSON.stringify(payload);
     const response = await fetch(`${BROKER_CONTROL_URL}/api/publish`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ topic, payload: JSON.stringify(payload) }),
+      body: JSON.stringify({ topic, payload: payloadJson }),
     });
     const data = await response.json();
-    return data.ok === true;
-  } catch (_) {
-    return false;
+    if (data.ok === true) return true;
+    console.error(`[mqtt-publish] control API returned: ${JSON.stringify(data)}`);
+  } catch (err) {
+    console.error(`[mqtt-publish] control API failed: ${err.message}`);
+    console.error(`[mqtt-publish] Ensure Mosquitto HTTP listener is on port ${MQTT_CONTROL_PORT}`);
+    console.error(`[mqtt-publish] Or set MQTT_CONTROL_PORT env var to the correct port`);
   }
+  return false;
 }
 
 function ensureDataDir() {
