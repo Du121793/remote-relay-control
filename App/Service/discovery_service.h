@@ -28,5 +28,6 @@ void discovery_service_get_stats(discovery_service_stats_t *stats);
 #ifdef __cplusplus
 }
 #endif
+UBaseType_t discovery_service_stack_high_water(void);
 
 #endif /* DISCOVERY_SERVICE_H */

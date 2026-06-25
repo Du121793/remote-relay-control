@@ -1,4 +1,5 @@
 #include "relay_protection.h"
+#include "../Config/rtc_backup_layout.h"
 #include "board_relay.h"
 #include "control_queue.h"
 #include "../Config/device_config.h"
@@ -159,7 +160,7 @@ void relay_protection_init(void)
     /* Read RTC backup register for previous boot tick */
     if (__HAL_RCC_RTC_IS_CLK_ENABLED())
     {
-      prev_boot = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR0);
+      prev_boot = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_RELAY_RESTART);
     }
     if (prev_boot != 0U && (now - prev_boot) < 30000U)
     {
@@ -170,7 +171,7 @@ void relay_protection_init(void)
       g_rp.restart_count = 0U;
     }
     /* Store current boot time */
-    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, now);
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_RELAY_RESTART, now);
   }
 
   /* Repeated restart → fault lock all channels */

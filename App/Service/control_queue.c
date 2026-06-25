@@ -1623,3 +1623,5 @@ void control_queue_get_stats(control_queue_stats_t *stats)
     }
   }
 }
+
+UBaseType_t control_queue_stack_high_water(void) { if (g_control_queue_task_handle == NULL) return 0; return uxTaskGetStackHighWaterMark((TaskHandle_t)g_control_queue_task_handle); }

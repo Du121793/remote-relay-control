@@ -6,6 +6,7 @@
 #include "board_relay.h"
 #include "stm32f7xx_hal_rtc.h"
 #include "stm32f7xx_hal_flash.h"
+#include "../Config/rtc_backup_layout.h"
 #include <string.h>
 
 extern RTC_HandleTypeDef hrtc;
@@ -70,17 +71,18 @@ static uint32_t sched_crc32(const uint8_t *data, size_t len)
 /* Forward declarations */
 static uint32_t scheduler_flash_addr(void);
 static uint32_t scheduler_flash_sector(void);
+static uint32_t g_last_flash_crc = 0;
 
 
 void scheduler_load_from_flash(void)
 {
     /* RTC backup: pause/enable (fast, every tick) */
-    uint32_t magic = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1);
+    uint32_t magic = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_SCHED_MAGIC_EN);
     if ((magic & 0xFFFFU) == (SCHEDULER_RTC_MAGIC & 0xFFFFU)) {
         uint16_t enabled = (uint16_t)(magic >> 16);
         for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
             g_scheduler_state[i].schedule_enabled = (uint8_t)((enabled >> i) & 1U);
-            uint32_t pause = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2 + i);
+            uint32_t pause = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_SCHED_PAUSE_BASE + i);
             g_scheduler_state[i].schedule_pause_until = pause & 0xFFFFFFFEU;
             g_scheduler_state[i].pause_blocks_auto_trigger = (uint8_t)(pause & 1U);
         }
@@ -100,30 +102,38 @@ void scheduler_load_from_flash(void)
                     g_scheduler_state[i].schedule_enabled = stored->schedule_enabled[i];
                 g_weekly_schedule[i] = stored->weekly[i];
             }
+            g_last_flash_crc = stored->crc;
         }
     }
 }
 
+/* RTC backup dirty flag — only write when state actually changed */
+static volatile uint8_t g_scheduler_rtc_dirty = 0U;
+void scheduler_mark_rtc_dirty(void) { g_scheduler_rtc_dirty = 1U; }
+
 void scheduler_save_to_flash(void)
 {
-    /* RTC backup: pause/enable (fast, every tick) */
-    uint32_t magic = (SCHEDULER_RTC_MAGIC & 0xFFFFU);
-    uint32_t enabled = 0;
+    uint32_t magic, enabled = 0;
+    if (g_scheduler_rtc_dirty == 0U) return;
+    g_scheduler_rtc_dirty = 0U;
+
+    /* Write pause data FIRST, then magic last.
+       If reset occurs mid-write, magic won't match → safe to discard. */
+    for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
+        uint32_t pause = g_scheduler_state[i].schedule_pause_until & 0xFFFFFFFEU;
+        pause |= (uint32_t)g_scheduler_state[i].pause_blocks_auto_trigger & 1U;
+        HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_SCHED_PAUSE_BASE + i, pause);
+    }
+    magic = (SCHEDULER_RTC_MAGIC & 0xFFFFU);
     for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
         if (g_scheduler_state[i].schedule_enabled) enabled |= (1UL << i);
     }
     magic |= (enabled << 16);
-    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, magic);
-    for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
-        uint32_t pause = g_scheduler_state[i].schedule_pause_until & 0xFFFFFFFEU;
-        pause |= (uint32_t)g_scheduler_state[i].pause_blocks_auto_trigger & 1U;
-        HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2 + i, pause);
-    }
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_SCHED_MAGIC_EN, magic);
 }
 
 /* Flash save: dirty-driven with error checking and correct sector selection. */
 static uint32_t g_last_flash_save_ms = 0;
-static uint32_t g_last_flash_crc = 0;
 static uint8_t  g_scheduler_flash_dirty = 0U;
 
 void scheduler_mark_flash_dirty(void) { g_scheduler_flash_dirty = 1U; }
@@ -385,6 +395,7 @@ void scheduler_handle_auto_hold(const auto_hold_cmd_t *cmd, uint32_t monotonic_m
     /* request target state */
     request_relay(cmd->channel, hold->target_state);
 }
+    scheduler_mark_rtc_dirty();
 
 /* ═══════════════════════════════════════════════════════════════
    Auto Hold finish
@@ -458,6 +469,7 @@ void scheduler_user_control(uint8_t channel, uint8_t target,
     }
     st->pause_blocks_auto_trigger = pause_blocks_auto_trigger;
 
+    scheduler_mark_rtc_dirty();
     /* 3. send relay command */
     request_relay(channel, target);
 }

@@ -100,6 +100,7 @@ void device_config_runtime_relay_mask_set(uint32_t relay_mask);
 void device_config_poll(void);
 
 #ifdef __cplusplus
+UBaseType_t device_config_stack_high_water(void);
 }
 #endif
 

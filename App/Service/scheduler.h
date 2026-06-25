@@ -98,6 +98,7 @@ void scheduler_load_from_flash(void);
 void scheduler_save_to_flash(void);
 void scheduler_save_weekly_to_flash(void);
 void scheduler_mark_flash_dirty(void);
+void scheduler_mark_rtc_dirty(void);
 
 #ifdef __cplusplus
 }

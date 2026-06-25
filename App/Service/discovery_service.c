@@ -367,7 +367,7 @@ static void discovery_service_task(void const *argument)
 
   for (;;)
   {
-    (void)tcpip_callback(discovery_service_tcpip_step, NULL);
+    (void)tcpip_try_callback(discovery_service_tcpip_step, NULL);
     osDelay(500U);
   }
 }
@@ -379,3 +379,5 @@ void discovery_service_get_stats(discovery_service_stats_t *stats)
     *stats = g_discovery_stats;
   }
 }
+
+UBaseType_t discovery_service_stack_high_water(void) { if (g_discovery_task_handle == NULL) return 0; return uxTaskGetStackHighWaterMark((TaskHandle_t)g_discovery_task_handle); }

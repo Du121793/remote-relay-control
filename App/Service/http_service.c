@@ -2830,7 +2830,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
         return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
       }
       ws->days[(uint8_t)weekday] = new_day;
-      scheduler_mark_flash_dirty();
+      scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
       return http_service_send_payload(connection, "200 OK", "application/json", response_body);
     }
@@ -2859,7 +2859,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
           if (*t >= '0' && *t <= '9') {
             uint32_t tw = (uint32_t)(*t - '0');
             if (tw <= 6) ws->days[(uint8_t)tw] = src;
-          scheduler_mark_flash_dirty();
+          scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
             while (*t >= '0' && *t <= '9') t++;
           } else break;
         }
@@ -2873,7 +2873,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       uint32_t enabled = 0;
       http_service_extract_form_value(body, "enabled", &enabled);
       channel_scheduler_state_t *st = scheduler_get_state((uint8_t)channel);
-      scheduler_mark_flash_dirty();
+      scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
       if (st) st->schedule_enabled = (uint8_t)(enabled ? 1 : 0);
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
       return http_service_send_payload(connection, "200 OK", "application/json", response_body);
@@ -3355,7 +3355,7 @@ void http_service_poll(void)
 
   g_http_poll_pending = 1U;
   g_http_poll_skip_count = 0U;
-  err = tcpip_callback(http_service_tcpip_step, NULL);
+  err = tcpip_try_callback(http_service_tcpip_step, NULL);
   if (err != ERR_OK)
   {
     g_http_poll_pending = 0U;

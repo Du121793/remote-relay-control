@@ -876,17 +876,17 @@ void StartDefaultTask(void const * argument)
     if ((last_stack_log_ms == 0U) || ((int32_t)(now - last_stack_log_ms) >= 30000))
     {
       char stack_msg[160];
-      extern TaskHandle_t g_device_config_task_handle;
-      extern osThreadId g_control_queue_task_handle;
-      extern osThreadId g_discovery_task_handle;
+      extern UBaseType_t device_config_stack_high_water(void);
+      extern UBaseType_t control_queue_stack_high_water(void);
+      extern UBaseType_t discovery_service_stack_high_water(void);
       TaskHandle_t tcpip = xTaskGetHandle("tcpip_thread");
       (void)snprintf(stack_msg, sizeof(stack_msg),
                      "[rtos] stacks: def=%lu cfg=%lu ctl=%lu disc=%lu tcpip=%lu heap_min=%lu\r\n",
                      (unsigned long)uxTaskGetStackHighWaterMark(NULL),
-                     (unsigned long)uxTaskGetStackHighWaterMark(g_device_config_task_handle),
-                     (unsigned long)uxTaskGetStackHighWaterMark((TaskHandle_t)g_control_queue_task_handle),
-                     (unsigned long)uxTaskGetStackHighWaterMark((TaskHandle_t)g_discovery_task_handle),
-                     (unsigned long)uxTaskGetStackHighWaterMark(tcpip),
+                     (unsigned long)device_config_stack_high_water(),
+                     (unsigned long)control_queue_stack_high_water(),
+                     (unsigned long)discovery_service_stack_high_water(),
+                     (unsigned long)(tcpip ? uxTaskGetStackHighWaterMark(tcpip) : 0UL),
                      (unsigned long)xPortGetMinimumEverFreeHeapSize());
       uart3_write(stack_msg);
       last_stack_log_ms = now;

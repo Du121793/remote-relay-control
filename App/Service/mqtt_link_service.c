@@ -1324,7 +1324,7 @@ static void mqtt_link_process_command(void)
       new_day.intervals[k].end_minute = (uint16_t)ev;
     }
     ws->days[(uint8_t)sch_weekday] = new_day;
-      scheduler_mark_flash_dirty();
+      scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;
   }
@@ -1337,7 +1337,7 @@ static void mqtt_link_process_command(void)
     channel_scheduler_state_t *st = scheduler_get_state((uint8_t)sch_en_ch);
     if (st) { st->schedule_enabled = (uint8_t)(sch_enabled ? 1 : 0); }
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
-      scheduler_mark_flash_dirty();
+      scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
     return;
   }
   else if (strcmp(g_mqtt_link_context.rx_topic,

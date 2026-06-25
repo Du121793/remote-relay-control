@@ -410,7 +410,7 @@ void control_service_poll(void)
   }
 
   g_control_poll_pending = 1U;
-  err = tcpip_callback(control_service_tcpip_step, NULL);
+  err = tcpip_try_callback(control_service_tcpip_step, NULL);
   if (err != ERR_OK)
   {
     g_control_poll_pending = 0U;

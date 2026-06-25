@@ -51,8 +51,6 @@ typedef struct
   uint32_t next_attempt_ms;
   char rx_buffer[HTTPS_CLIENT_RX_BUFFER_SIZE];
   size_t rx_used;
-  char value_buffer[DEVICE_CONFIG_CA_CERT_MAX_LEN];
-  device_config_t updated;
 } https_client_context_t;
 
 static https_client_context_t g_https_client_context;
@@ -174,8 +172,8 @@ static void https_client_send_request(void)
 static void https_client_parse_and_apply(const char *body, size_t body_len)
 {
   const device_config_t *config = device_config_get();
-  device_config_t *updated = &g_https_client_context.updated;
-  char *value_buffer = g_https_client_context.value_buffer;
+  static device_config_t updated;
+  static char value_buffer[DEVICE_CONFIG_CA_CERT_MAX_LEN];
   const char *ptr;
 
   if ((config == NULL) || (body == NULL) || (body_len < 8U))
@@ -202,9 +200,9 @@ static void https_client_parse_and_apply(const char *body, size_t body_len)
     size_t len;
 
     if ((end != NULL) && (end > start) &&
-        ((len = (size_t)(end - start)) < sizeof(updated->cloud_key_id)))
+        ((len = (size_t)(end - start)) < sizeof(updated.cloud_key_id)))
     {
-      memset(updated.cloud_key_id, 0, sizeof(updated->cloud_key_id));
+      memset(updated.cloud_key_id, 0, sizeof(updated.cloud_key_id));
       memcpy(updated.cloud_key_id, start, len);
     }
   }
@@ -218,10 +216,10 @@ static void https_client_parse_and_apply(const char *body, size_t body_len)
     size_t len;
 
     if ((end != NULL) && (end > start) &&
-        ((len = (size_t)(end - start)) < sizeof(updated->cloud_cluster_binding_secret)))
+        ((len = (size_t)(end - start)) < sizeof(updated.cloud_cluster_binding_secret)))
     {
       memset(updated.cloud_cluster_binding_secret, 0,
-             sizeof(updated->cloud_cluster_binding_secret));
+             sizeof(updated.cloud_cluster_binding_secret));
       memcpy(updated.cloud_cluster_binding_secret, start, len);
     }
   }
@@ -256,10 +254,10 @@ static void https_client_parse_and_apply(const char *body, size_t body_len)
         dest[dest_len++] = *start++;
       }
     }
-    if (dest_len > 0U && dest_len < sizeof(updated->cloud_cluster_ca_cert))
+    if (dest_len > 0U && dest_len < sizeof(updated.cloud_cluster_ca_cert))
     {
       memset(updated.cloud_cluster_ca_cert, 0,
-             sizeof(updated->cloud_cluster_ca_cert));
+             sizeof(updated.cloud_cluster_ca_cert));
       memcpy(updated.cloud_cluster_ca_cert, value_buffer, dest_len);
     }
   }

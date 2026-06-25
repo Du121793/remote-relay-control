@@ -73,5 +73,6 @@ void control_queue_force_stop(uint8_t channel);
 #ifdef __cplusplus
 }
 #endif
+UBaseType_t control_queue_stack_high_water(void);
 
 #endif /* CONTROL_QUEUE_H */

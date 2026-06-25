@@ -1,0 +1,97 @@
+*** Using Compiler 'V6.24', folder: 'C:\Users\a5522\AppData\Local\Keil_v5\ARM\ARMCLANG\Bin'
+Build target 'autoControl'
+compiling ct_measurement.c...
+compiling adc_service.c...
+linking...
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching http_service.o(.bss..L_MergedGlobals.191).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching queue.o(.bss.xQueueRegistry).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching dhcp.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching discovery_service.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching tcp_in.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ssl_tls.o(.data..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching aes.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching tasks.o(.bss..L_MergedGlobals.2).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_memory_NETBUF_base).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching stm32f7xx_hal_flash.o(.bss.pFlash).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ecp.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching control_service.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ip.o(.bss.ip_data).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching tcp.o(.bss..L_MergedGlobals.64).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching heap_4.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching relay_protection.o(.bss.g_rp).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ethernetif.o(.data.LAN8742_IOCtx).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching tcpip.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching mem.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching netif.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching timeouts.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ethernetif.o(.bss.memp_stats_RX_POOL).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_UDP_PCB).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_TCP_PCB).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_TCP_PCB_LISTEN).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_TCP_SEG).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_ALTCP_PCB).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_REASSDATA).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_FRAG_PBUF).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_NETBUF).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_NETCONN).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_TCPIP_MSG_API).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_TCPIP_MSG_INPKT).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_IGMP_GROUP).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_SYS_TIMEOUT).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_NETDB).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_PBUF).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_stats_PBUF_POOL).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching stm32f7xx_hal.o(.data..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching tcp.o(.data..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching igmp.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ip4_frag.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching port.o(.bss..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ecp_curves.o(.data.ecp_mod_p192k1.Rp).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ecp_curves.o(.data.ecp_mod_p224k1.Rp).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ecp_curves.o(.data.ecp_mod_p256k1.Rp).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching platform.o(.data..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching stm32f7xx_it.o(.bss.g_panic_latched).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching device_config.o(.bss.g_device_config_last_flash_error).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ethernetif.o(.bss.memp_tab_RX_POOL).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ethernetif.o(.bss.g_eth_irq_count).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching stm32f7xx_hal.o(.bss.uwTick).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching system_stm32f7xx.o(.data.SystemCoreClock).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_UDP_PCB).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_TCP_PCB).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_TCP_PCB_LISTEN).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_TCP_SEG).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_ALTCP_PCB).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_REASSDATA).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_FRAG_PBUF).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_NETBUF).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_NETCONN).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_TCPIP_MSG_API).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_TCPIP_MSG_INPKT).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_IGMP_GROUP).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_SYS_TIMEOUT).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_NETDB).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_PBUF).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching memp.o(.bss.memp_tab_PBUF_POOL).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching udp.o(.bss.udp_pcbs).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching dhcp.o(.bss.dhcp_create_msg.xid).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ip4.o(.bss.ip4_default_multicast_netif).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching sys_arch.o(.bss.lwip_sys_mutex).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching sys_arch.o(.bss.errno).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching port.o(.data.uxCriticalNesting).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ecp_curves.o(.data.ecp_mpi_set1.one).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching strtok.o(.data).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching main.o(.data..L_MergedGlobals).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching udp.o(.data.udp_port).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ip4.o(.bss.ip_id).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching device_config.o(.bss.g_device_config_initialized).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching pbuf.o(.bss.pbuf_free_ooseq_pending).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching tcp.o(.bss.tcp_timer).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching etharp.o(.bss.etharp_cached_entry).
+autoControl\autoControl.axf: Error: L6406E: No space in execution regions with .ANY selector matching ssl_ciphersuites.o(.bss.supported_init).
+autoControl\autoControl.axf: Error: L6407E: Sections of aggregate size 0x474 bytes could not fit into .ANY selector(s).
+Not enough information to list image symbols.
+Not enough information to list load addresses in the image map.
+Finished: 2 information, 0 warning and 86 error messages.
+"autoControl\autoControl.axf" - 86 Error(s), 0 Warning(s).
+Target not created.
+Build Time Elapsed:  00:00:03
