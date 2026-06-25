@@ -3917,24 +3917,33 @@ app.post("/api/sensor/alert", (req, res) => {
     return res.status(404).json({ ok: false, error: "cluster_not_found" });
   }
 
-  // Find an online device in this cluster
-  let targetNodeId = 0;
-  const registryKey = `${clusterId}|${deviceId}`;
-  if (deviceId && cloudDevices.has(registryKey)) {
-    const dev = cloudDevices.get(registryKey);
-    if (dev && dev.nodeId) targetNodeId = dev.nodeId;
+  // Try explicit node_id, then cloudDevices, then knownNodes
+  let targetNodeId = Number(req.body.node_id) || 0;
+  if (!targetNodeId && deviceId) {
+    const registryKey = `${clusterId}|${deviceId}`;
+    if (cloudDevices.has(registryKey)) {
+      const dev = cloudDevices.get(registryKey);
+      if (dev && dev.nodeId) targetNodeId = dev.nodeId;
+    }
   }
   if (!targetNodeId) {
-    // Pick any online device in this cluster via knownNodes
-    for (const [nid, node] of knownNodes) {
-      if (node.online && String(node.clusterId || "default") === clusterId) {
-        targetNodeId = Number(nid);
+    // Pick any device in this cluster with a known nodeId
+    for (const [, dev] of cloudDevices) {
+      if (String(dev.clusterId || "default") === clusterId && dev.nodeId) {
+        targetNodeId = dev.nodeId;
         break;
       }
     }
   }
+  // Fallback: try knownNodes
   if (!targetNodeId) {
-    return res.status(503).json({ ok: false, error: "no_online_device" });
+    for (const [nid, node] of knownNodes) {
+      targetNodeId = Number(nid);
+      break;
+    }
+  }
+  if (!targetNodeId) {
+    return res.status(503).json({ ok: false, error: "no_online_device", hint: "pass node_id explicitly" });
   }
 
   const key = makeSensorKey(clusterId, deviceId, channel);
