@@ -1360,6 +1360,7 @@ static void mqtt_link_process_command(void)
         default: st->schedule_pause_until = now_unix + 60; break;
       }
       st->pause_blocks_auto_trigger = (uint8_t)(sp_blocks ? 1 : 0);
+      scheduler_mark_rtc_dirty();
     }
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;

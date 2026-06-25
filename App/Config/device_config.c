@@ -805,7 +805,24 @@ uint8_t device_config_load(device_config_t *config)
   memcpy(config, stored, sizeof(*config));
   if (device_config_is_valid(config) != 0U)
   {
-    return 1U;
+    /* Also verify slot header CRC matches stored data */
+    const device_config_slot_header_t *hdr = (const device_config_slot_header_t *)
+      (slot_addr - sizeof(device_config_slot_header_t));
+    if (hdr->crc == config->config_crc32)
+      return 1U;
+    /* CRC mismatch — try fallback slot below */
+  }
+
+  /* Try fallback: if primary slot data is invalid, check the other slot */
+  {
+    uint8_t fallback_slot = (g_device_config_active_slot == 0U) ? 1U : 0U;
+    uint32_t fb_addr = device_config_slot_addr(fallback_slot) + sizeof(device_config_slot_header_t);
+    const device_config_t *fb_stored = (const device_config_t *)fb_addr;
+    if (fb_stored->magic == DEVICE_CONFIG_MAGIC && device_config_is_valid(fb_stored) != 0U)
+    {
+      memcpy(config, fb_stored, sizeof(*config));
+      return 1U;
+    }
   }
 
   if (device_config_v5_is_valid(stored_v5) != 0U)
@@ -1094,15 +1111,26 @@ static uint8_t device_config_save_direct(const device_config_t *config)
     }
   }
 
-  /* Commit: write SLOT_COMMIT_VALID to make this slot the active one */
+  /* Verify written data before committing */
+  if (memcmp((const void *)(save_addr + sizeof(device_config_slot_header_t)),
+             &temp, sizeof(temp)) != 0)
+  {
+    HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
+    return 0U;
+  }
+
+  /* Commit: write SLOT_COMMIT_VALID. If this fails, slot stays invalid. */
   {
     uint32_t commit_word = DEVICE_CONFIG_SLOT_COMMIT_VALID;
     if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,
                           save_addr + offsetof(device_config_slot_header_t, commit),
-                          commit_word) == HAL_OK)
+                          commit_word) != HAL_OK)
     {
-      g_device_config_active_slot = save_slot;
+      g_device_config_last_flash_error = HAL_FLASH_GetError();
+      HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
+      return 0U;
     }
+    g_device_config_active_slot = save_slot;
   }
 
   HAL_FLASH_Lock();

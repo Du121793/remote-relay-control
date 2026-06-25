@@ -8,6 +8,8 @@
 #include "stm32f7xx_hal_flash.h"
 #include "../Config/rtc_backup_layout.h"
 #include <string.h>
+#include "FreeRTOS.h"
+#include "task.h"
 
 extern RTC_HandleTypeDef hrtc;
 
@@ -119,8 +121,9 @@ void scheduler_save_to_flash(void)
     if (g_scheduler_rtc_dirty == 0U) return;
     g_scheduler_rtc_dirty = 0U;
 
-    /* Write pause data FIRST, then magic last.
-       If reset occurs mid-write, magic won't match → safe to discard. */
+    /* Clear magic first, then write pause, then write new magic.
+       If reset occurs mid-write, old magic is already gone → safe. */
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_SCHED_MAGIC_EN, 0U);
     for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
         uint32_t pause = g_scheduler_state[i].schedule_pause_until & 0xFFFFFFFEU;
         pause |= (uint32_t)g_scheduler_state[i].pause_blocks_auto_trigger & 1U;

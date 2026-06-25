@@ -2901,6 +2901,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
         default: st->schedule_pause_until = now_unix + 60; break;
       }
       st->pause_blocks_auto_trigger = (uint8_t)(blocks ? 1 : 0);
+      scheduler_mark_rtc_dirty();
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
       return http_service_send_payload(connection, "200 OK", "application/json", response_body);
     }
@@ -2910,6 +2911,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       channel_scheduler_state_t *st = scheduler_get_state((uint8_t)channel);
       if (st) {
         st->schedule_pause_until = 0;
+      scheduler_mark_rtc_dirty();
         st->pause_blocks_auto_trigger = 0;
       }
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
