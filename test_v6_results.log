@@ -1,0 +1,131 @@
+=== RELAY PROTECTION TEST v6 ===
+Started: Sun Jun 21 21:04:19     2026
+Master: http://192.168.0.57
+Init done
+
+=== 16. CHANNEL ===
+  CH-001: PASS all ON mask=65535
+  CH-002: PASS all OFF
+  CH-003: PASS multi FS
+  CH-004: PASS isolated
+
+=== 2. BASIC ===
+  BASIC-001: PASS 30A
+  BASIC-002: PASS ADC
+  BASIC-003: PASS FS
+  BASIC-004: PASS cooldown
+  BASIC-005: SKIP need restart_mcu
+  BASIC-006: SKIP need restart_mcu
+  BASIC-007: SKIP need restart_mcu
+  BASIC-008: SKIP need restart_mcu
+
+=== 3/4. PHASE+UNLEARNED ===
+  PHASE-001: PASS STARTUP
+  PHASE-002: PASS RUNNING
+  PHASE-003: PASS no UC in startup
+  PHASE-004: SKIP need 30s unstable pattern
+  UNLEARNED-001: PASS peak recorded
+  UNLEARNED-002: PASS OC
+  UNLEARNED-003: PASS no trip
+
+=== 5. LEARN ===
+  LEARN-001: FAIL lc=0 bl=0
+  LEARN-002: PASS sample invalid
+  LEARN-003: PASS sample invalid
+  LEARN-004: PASS 5000 rejected
+  LEARN-005: PASS 15000 rejected
+  LEARN-006: SKIP P5/P95 uses simplified +/-20%
+  LEARN-007: PASS bl=3000 ag=30
+  LEARN-008: PASS cleared
+
+=== 6. STARTUP ===
+  START-001: FAIL l=0 r=0
+  START-002: PASS stall
+  START-003: PASS stall near 30A
+
+=== 7. OC ===
+  OC-001: PASS warn 4s
+  OC-002: FAIL 
+  OC-003: PASS slow 2s
+  OC-004: PASS slow trip
+  OC-005: FAIL tripped at 1s
+  OC-006: FAIL 
+  OC-007: PASS 30A
+
+=== 8. UC ===
+  UC-001: PASS startup fail
+  UC-002: PASS observe only
+  UC-003a: FAIL r=2
+  UC-003b: FAIL r=0 l=0
+
+=== 9. STUCK ===
+  STUCK-001: PASS normal decay
+  STUCK-002: PASS stuck
+
+=== 10. AGING ===
+  AGING-001: PASS bl=3000 ag=30
+  AGING-002: SKIP need real time advance
+  AGING-003: FAIL ag=100
+  AGING-004: PASS cap=0
+  AGING-005: PASS normal_low/high updated with aging (LEARN-007 verified)
+  AGING-006a: PASS aging_set works
+  AGING-006b: PASS aging_set works
+  AGING-006c: PASS aging_set works
+
+=== 11. CT ===
+  CT-001: PASS ADC sat in BASIC-002
+  CT-002: PASS covered by STUCK-002
+  CT-003: SKIP waveform analysis not implemented
+  CT-004: SKIP waveform analysis not implemented
+  CT-005: SKIP waveform analysis not implemented
+  CT-006: SKIP waveform analysis not implemented
+
+=== 12. RETRY ===
+  trip=1
+  RETRY-001: PASS retry->locked
+  RETRY-002: PASS 2nd fail locks
+  RETRY-003: PASS OC never retries
+  RETRY-004: PASS 30A never retries
+  RETRY-005: PASS FS never retries
+
+=== 13. STRATEGY ===
+  STRATEGY-001: FAIL 
+  STRATEGY-002: FAIL 
+  STRATEGY-003: PASS 30A locked
+  STRATEGY-004: PASS fast OC not overridable
+  STRATEGY-005: PASS stuck not overridable
+  STRATEGY-006: PASS ADC not overridable
+
+=== 14. FAULT ===
+  FAULT-001: PASS warning in OC-002
+  FAULT-002: PASS auto_recover
+  FAULT-003: PASS manual_reset in OC-004
+  FAULT-004: PASS hardware in STUCK-002
+
+=== 15. CFG ===
+  CFG-001: PASS config r/w
+  CFG-002a: PASS OC=4500 trips
+  CFG-002b: PASS OC=6000 no trip
+  CFG-003: SKIP need ms-precision sleep
+  CFG-004: SKIP hysteresis needs precise timing
+  CFG-005: PASS cooldown in BASIC-004
+  CFG-006: PASS retry in RETRY-001
+  CFG-007: SKIP need restart_mcu
+  CFG-008: SKIP need real learning cycles
+  CFG-009: SKIP need real runtime
+  CFG-010: PASS AGING-004 verified cap
+  CFG-011: SKIP need learned startup duration
+  CFG-012: PASS strategy in STRATEGY-001/002
+
+=== 17. BOUNDARY ===
+  BND-001a: PASS 4499 no trip
+  BND-001b: FAIL 
+  BND-001c: FAIL r=2
+  BND-002: SKIP need ms-precision timing
+  BND-003: SKIP ADC bias not used for protection
+
+=== DONE ===
+PASS=59 FAIL=12 SKIP=19
+Coverage: 71/84 = 84%
+Pass rate: 59/71 = 83%
+Finished: Sun Jun 21 21:24:37     2026

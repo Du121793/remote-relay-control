@@ -70,6 +70,7 @@ static uint32_t sched_crc32(const uint8_t *data, size_t len)
    DR2-DR17=pause_until[0..15] (bit0=pause_blocks_auto_trigger) */
 /* Forward declarations */
 static uint32_t scheduler_flash_addr(void);
+static uint32_t scheduler_flash_bank(void);
 static uint32_t scheduler_flash_sector(void);
 static uint32_t g_last_flash_crc = 0;
 
@@ -109,6 +110,7 @@ void scheduler_load_from_flash(void)
 
 /* RTC backup dirty flag — only write when state actually changed */
 static volatile uint8_t g_scheduler_rtc_dirty = 0U;
+void scheduler_mark_rtc_dirty(void);
 void scheduler_mark_rtc_dirty(void) { g_scheduler_rtc_dirty = 1U; }
 
 void scheduler_save_to_flash(void)
@@ -160,6 +162,16 @@ static uint32_t scheduler_flash_sector(void)
 #endif
 }
 
+static uint32_t scheduler_flash_bank(void)
+{
+#if defined(FLASH_OPTCR_nDBANK)
+  if ((FLASH->OPTCR & FLASH_OPTCR_nDBANK) != 0U) return FLASH_BANK_1;
+  return FLASH_BANK_2;
+#else
+  return FLASH_BANK_1;
+#endif
+}
+
 void scheduler_save_weekly_to_flash(void)
 {
     uint32_t now = HAL_GetTick();
@@ -191,12 +203,21 @@ void scheduler_save_weekly_to_flash(void)
     {
       uint32_t addr = scheduler_flash_addr();
       uint32_t sector = scheduler_flash_sector();
+      FLASH_EraseInitTypeDef erase_init;
+      uint32_t sector_error = 0U;
       uint8_t write_ok = 1U;
 
+      flash_storage_lock();
       HAL_FLASH_Unlock();
-      __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP);
-      FLASH_Erase_Sector(sector, VOLTAGE_RANGE_3);
-      if (__HAL_FLASH_GET_FLAG(FLASH_FLAG_EOP) != RESET)
+
+      memset(&erase_init, 0, sizeof(erase_init));
+      erase_init.TypeErase = FLASH_TYPEERASE_SECTORS;
+      erase_init.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+      erase_init.Banks = scheduler_flash_bank();
+      erase_init.Sector = sector;
+      erase_init.NbSectors = 1U;
+
+      if (HAL_FLASHEx_Erase(&erase_init, &sector_error) == HAL_OK)
       {
         for (size_t i = 0; i < sizeof(data); i += 4)
         {
@@ -208,12 +229,18 @@ void scheduler_save_weekly_to_flash(void)
                 break;
             }
         }
+        /* Verify written data matches */
+        if (write_ok != 0U && memcmp((const void *)addr, &data, sizeof(data)) != 0)
+        {
+            write_ok = 0U;
+        }
       }
       else
       {
         write_ok = 0U;
       }
       HAL_FLASH_Lock();
+      flash_storage_unlock();
 
       /* Only clear dirty + update CRC on success */
       if (write_ok != 0U) {
@@ -394,8 +421,8 @@ void scheduler_handle_auto_hold(const auto_hold_cmd_t *cmd, uint32_t monotonic_m
 
     /* request target state */
     request_relay(cmd->channel, hold->target_state);
-}
     scheduler_mark_rtc_dirty();
+}
 
 /* ═══════════════════════════════════════════════════════════════
    Auto Hold finish

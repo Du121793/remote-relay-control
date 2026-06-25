@@ -1,0 +1,73 @@
+=== RELAY PROTECTION FULL TEST v2 ===
+Started: Sun Jun 21 14:18:51     2026
+=== INIT ===
+  BASIC-004: FAIL during=0 after=0
+TC-OC-007: 30A hard limit
+  OC-007: PASS 30A
+TC-STUCK-002: Stuck
+Init done. All relays OFF.
+
+=== P0: BASIC SAFETY ===
+TC-BASIC-001: prot=0, 30A
+  BASIC-001: PASS 30A locked
+TC-BASIC-002: prot=0, ADC sat
+  STUCK-002: FAIL reason=0 locked=0
+
+=== P1: PHASE + PROTECTION ===
+TC-PHASE-001: ON->STARTUP
+  BASIC-002: FAIL reason=0 locked=0
+TC-BASIC-003: Force Stop priority
+  BASIC-003: PASS ch2=0
+TC-BASIC-004: Cooldown
+  PHASE-001: FAIL phase=0
+TC-PHASE-002: Stable->RUNNING
+  PHASE-002: FAIL phase=0
+TC-UNLEARNED-002: Manual OC
+  BASIC-004: FAIL during=0 after=0
+TC-OC-007: 30A hard limit
+  OC-007: PASS 30A
+TC-STUCK-002: Stuck
+  UNLEARNED-002: FAIL reason=4
+TC-UC-001: Startup no current
+  STUCK-002: FAIL reason=0 locked=0
+
+=== P1: PHASE + PROTECTION ===
+TC-PHASE-001: ON->STARTUP
+  UC-001: FAIL reason=0
+TC-LEARN-007: Baseline+aging
+  PHASE-001: FAIL phase=0
+TC-PHASE-002: Stable->RUNNING
+  PHASE-002: FAIL phase=0
+TC-UNLEARNED-002: Manual OC
+  DEBUG: baseline= aging=0 learning=1
+  LEARN-007: FAIL baseline= aging=0 learning=1
+TC-LEARN-008: Clear learning
+  LEARN-008: PASS cleared
+TC-RETRY-001: Auto-retry (waiting 40s)...
+  UNLEARNED-002: FAIL reason=0
+TC-UC-001: Startup no current
+  trip after 1st fail: 0
+  UC-001: FAIL reason=0
+TC-LEARN-007: Baseline+aging
+  DEBUG: baseline= aging=0 learning=1
+  LEARN-007: FAIL baseline= aging=0 learning=1
+TC-LEARN-008: Clear learning
+  LEARN-008: PASS cleared
+TC-RETRY-001: Auto-retry (waiting 40s)...
+  trip after 1st fail: 0
+  trip after retry: 0 locked=0
+  RETRY-001: FAIL trip=0 locked=0
+TC-STRATEGY-003: Continuity vs 30A
+  STRATEGY-003: PASS 30A still locked
+
+=== DONE ===
+PASS=5 FAIL=9 SKIP=0
+Finished: Sun Jun 21 14:20:45     2026
+  trip after retry: 0 locked=0
+  RETRY-001: FAIL trip=0 locked=0
+TC-STRATEGY-003: Continuity vs 30A
+  STRATEGY-003: PASS 30A still locked
+
+=== DONE ===
+PASS=5 FAIL=9 SKIP=0
+Finished: Sun Jun 21 14:21:13     2026

@@ -1,0 +1,54 @@
+Master: http://192.168.0.209
+=== RELAY PROTECTION TEST v4 ===
+Started: Sun Jun 21 14:57:48     2026
+=== GLOBAL INIT ===
+Init done (queue drained, all enabled)
+
+=== P0: BASIC SAFETY ===
+BASIC-001: prot=0, 30A
+  BASIC-001: PASS 30A
+BASIC-002: prot=0, ADC sat
+  BASIC-002: PASS ADC
+BASIC-003: Force Stop
+  BASIC-003: PASS ch5=0
+BASIC-004: Cooldown
+  BASIC-004: FAIL d=0 a=0
+OC-007: 30A
+  OC-007: PASS 30A
+STUCK-002: Stuck
+  STUCK-002: PASS stuck
+
+=== P1: PHASE ===
+PHASE-001: ON->STARTUP
+  PHASE-001: PASS STARTUP
+PHASE-002: Stable->RUNNING
+  PHASE-002: FAIL phase=0
+UNLEARNED-002: Manual OC
+  UNLEARNED-002: FAIL r=0
+UC-001: Startup fail
+  UC-001: FAIL r=0 t=0
+
+=== LEARN/AGING/RETRY/STRATEGY ===
+LEARN-007: baseline unchanged, aging updates
+  DEBUG: baseline=3000 aging=0 learning=1
+  LEARN-007: PASS bl=3000 ag=0
+LEARN-008: Clear learning
+  LEARN-008: PASS cleared
+FAULT-002: Auto-recoverable (startup fail)
+  FAULT-002: FAIL level=0 reason=0
+FAULT-004: Hardware fault (stuck)
+  FAULT-004: FAIL level=0 r=0 l=0
+RETRY-001: Auto-retry (wait 40s)
+  trip after 1st fail: 0
+  trip after retry: 0 locked=0
+  RETRY-001: FAIL trip=0 locked=0
+STRATEGY-003: Continuity cannot override 30A
+  STRATEGY-003: PASS 30A locked
+CFG-001: Config API read/write
+  CFG-001: PASS config r/w
+CH-001: 16ch sequential ON/OFF
+  CH-001: FAIL mask=0
+
+=== DONE ===
+PASS=10 FAIL=8 SKIP=0
+Finished: Sun Jun 21 15:01:30     2026

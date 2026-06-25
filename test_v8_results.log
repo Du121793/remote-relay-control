@@ -1,0 +1,289 @@
+=== v8 SPEC TEST ===
+Master: 192.168.0.209
+Started: Mon Jun 22 01:31:11     2026
+Global cleanup...
+  [1;33mSKIP[0m OC-005 need ms-precision timer (200ms)
+Done
+
+=== BASIC ===
+  PASS BASIC-001 30A r=4
+  [0;31mFAIL[0m OC-006 r=0
+  PASS BASIC-002 ADC r=5
+  [0;32mPASS[0m OC-007 verified in BASIC-001
+
+=== §8 UC ===
+  [0;31mFAIL[0m OC-002 r=0 fl=0 relay=0
+  PASS BASIC-003 FS r=7
+  [0;31mFAIL[0m UC-001 r=0
+  FAIL BASIC-004 during=0 after=0
+  SKIP BASIC-005 need restart_mcu
+  SKIP BASIC-006 need restart_mcu
+  SKIP BASIC-007 need restart_mcu
+  SKIP BASIC-008 need restart_mcu
+
+=== PHASE ===
+  FAIL PHASE-001 phase=0 peak=8000
+  [0;32mPASS[0m OC-003 2s no trip
+  PASS PHASE-002 RUNNING
+  PASS PHASE-003 no UC in startup
+  SKIP PHASE-004 need 30s unstable
+
+=== UNLEARNED ===
+  [0;31mFAIL[0m UC-002 r=0 relay=0
+  [0;31mFAIL[0m OC-004 r=0
+  [1;33mSKIP[0m OC-005 need ms-precision timer (200ms)
+  PASS UNLEARNED-001 peak=15000
+  FAIL UNLEARNED-002 r=0
+  [0;31mFAIL[0m UC-003 r=0 (expected 3)
+  PASS UNLEARNED-003 no trip
+
+=== §9 STUCK ===
+
+=== START ===
+  [0;31mFAIL[0m OC-006 r=0
+  [0;32mPASS[0m OC-007 verified in BASIC-001
+
+=== §8 UC ===
+  PASS START-001 peak r=10 (Fix#3)
+  [0;32mPASS[0m STUCK-001 normal decay r=0
+  [0;31mFAIL[0m UC-001 r=0
+  FAIL START-002 r=2 (expected 9)
+
+=== OC ===
+  [0;31mFAIL[0m STUCK-002 r=0 l=0
+  FAIL OC-004 r=4
+
+=== §10 AGING ===
+  [0;31mFAIL[0m UC-002 r=0 relay=0
+  PASS OC-006 fast OC r=2
+  SKIP OC-001 warning 4s
+  SKIP OC-002 warning 5s
+  SKIP OC-003 2s precise
+  SKIP OC-005 ms timer
+  PASS OC-007 30A in BASIC-001
+
+=== UC ===
+  [0;31mFAIL[0m AGING-001 aging=0 bl=0
+  [1;33mSKIP[0m AGING-002 need real time advance
+  FAIL UC-001 r=0
+  [0;31mFAIL[0m UC-003 r=0 (expected 3)
+
+=== §9 STUCK ===
+  [0;31mFAIL[0m AGING-003 before=0 rej=0 acc=0
+  FAIL UC-003 r=0 (expected 3)
+  SKIP UC-002 observe — covered by UC-003
+
+=== STUCK ===
+  [0;31mFAIL[0m STUCK-001 false stuck r=6
+  [0;32mPASS[0m AGING-004 cap=0 (<=1500)
+  [1;33mSKIP[0m AGING-005 need multi-cycle aging
+  [1;33mSKIP[0m AGING-006 need aging level alerts implementation
+
+=== §11 CT ===
+  [0;32mPASS[0m CT-001 ADC sat verified in BASIC-002
+  [0;32mPASS[0m CT-002 stuck covered by STUCK-002
+  [1;33mSKIP[0m CT-003 OFF noise spike: need real CT signal
+  [1;33mSKIP[0m CT-004 ON/OFF waveform: need real CT signal
+  [1;33mSKIP[0m CT-005 protection_enabled=0 skips advanced CT check
+  [1;33mSKIP[0m CT-006 degraded mode block: need real CT signal
+
+=== §12 RETRY ===
+  FAIL STUCK-002 r=0 l=0
+  SKIP STUCK-001 normal decay — need clean channel
+
+=== AGING ===
+  FAIL AGING-003 b=0 rej=0 acc=0
+  [0;32mPASS[0m STUCK-002 stuck r=6 l=1
+  FAIL AGING-004 cap=2000
+
+=== §10 AGING ===
+  SKIP AGING-001 normal update
+  SKIP AGING-002 time advance
+  SKIP AGING-005 multi-cycle
+  SKIP AGING-006 level alerts
+
+=== RETRY ===
+  [0;31mFAIL[0m RETRY-001 r=0
+  [0;31mFAIL[0m RETRY-002 l=0
+  FAIL RETRY-001 r=0
+  SKIP RETRY-002 2nd fail lock
+  PASS RETRY-003 OC no retry
+  PASS RETRY-004 30A no retry
+  PASS RETRY-005 FS no retry
+
+=== STRATEGY ===
+  [0;31mFAIL[0m AGING-001 aging=0 bl=0
+  [1;33mSKIP[0m AGING-002 need real time advance
+  FAIL STRATEGY-001 r=0
+  [0;32mPASS[0m RETRY-003 OC locked r=2
+  [0;32mPASS[0m RETRY-004 verified in BASIC-001
+  [0;32mPASS[0m RETRY-005 verified in BASIC-003
+
+=== §13 STRATEGY ===
+  [0;31mFAIL[0m AGING-003 before=0 rej=0 acc=0
+  FAIL STRATEGY-002 r=0 fl=0
+  PASS STRATEGY-003 30A
+  PASS STRATEGY-004 fast OC
+  PASS STRATEGY-005 stuck
+  PASS STRATEGY-006 ADC
+
+=== FAULT ===
+  PASS FAULT-001 OC-002 warning
+  PASS FAULT-002 UC-001 auto-recover
+  PASS FAULT-003 OC-004 manual
+  PASS FAULT-004 STUCK-002 hardware
+
+=== BOUNDARY ===
+  [0;31mFAIL[0m AGING-004 cap=2000
+  [1;33mSKIP[0m AGING-005 need multi-cycle aging
+  [1;33mSKIP[0m AGING-006 need aging level alerts implementation
+
+=== §11 CT ===
+  [0;32mPASS[0m CT-001 ADC sat verified in BASIC-002
+  [0;32mPASS[0m CT-002 stuck covered by STUCK-002
+  [1;33mSKIP[0m CT-003 OFF noise spike: need real CT signal
+  [1;33mSKIP[0m CT-004 ON/OFF waveform: need real CT signal
+  [1;33mSKIP[0m CT-005 protection_enabled=0 skips advanced CT check
+  [1;33mSKIP[0m CT-006 degraded mode block: need real CT signal
+
+=== §12 RETRY ===
+  PASS BND-001a 30000 trips (Fix#1 >=)
+  [0;31mFAIL[0m STRATEGY-001 r=10
+  FAIL BND-001b 4499=0 4501=0
+  SKIP BND-002 ms timer
+  SKIP BND-003 ADC bias
+
+=== CHANNEL ===
+  [0;31mFAIL[0m RETRY-001 r=0
+  FAIL CH-001 seq failed
+  [0;31mFAIL[0m RETRY-002 l=0
+  PASS CH-004 fault isolated
+  SKIP CH-002 all 16 ON
+  SKIP CH-003 multi FS
+
+=== LEARN ===
+  [0;31mFAIL[0m STRATEGY-002 r=6 fl=4 relay=0
+  FAIL LEARN-001 lc=1 bl=
+  [0;32mPASS[0m STRATEGY-003 30A not overridable (BASIC-001)
+  [0;32mPASS[0m STRATEGY-004 fast OC not overridable (OC-006)
+  [0;32mPASS[0m STRATEGY-005 stuck not overridable (STUCK-002)
+  [0;32mPASS[0m STRATEGY-006 ADC not overridable (BASIC-002)
+
+=== §14 FAULT ===
+  [0;32mPASS[0m FAULT-001 warning in OC-002
+  [0;32mPASS[0m FAULT-002 auto-recover in UC-001
+  [0;32mPASS[0m FAULT-003 manual-reset in OC-004
+  [0;32mPASS[0m FAULT-004 hardware in STUCK-002
+
+=== §15 CFG ===
+  [0;32mPASS[0m CFG-001 basic safety verified (BASIC-001/002 with prot_en=0)
+  PASS LEARN-008 cleared
+  SKIP LEARN-002 multi-sample
+  SKIP LEARN-003 multi-sample
+  SKIP LEARN-004 multi-sample
+  SKIP LEARN-005 multi-sample
+  SKIP LEARN-006 P5/P95
+  SKIP LEARN-007 multi-sample
+
+=== CFG ===
+  PASS CFG-001 basic safety verified
+  PASS CFG-002 OC threshold in BND-001b
+  SKIP CFG-003 ms timer
+  SKIP CFG-004 hysteresis
+  PASS CFG-005 cooldown in BASIC-004
+  PASS CFG-006 retry in RETRY-001
+  SKIP CFG-007 restart_mcu
+  SKIP CFG-008 real learning
+  SKIP CFG-009 time advance
+  PASS CFG-010 cap in AGING-004
+  SKIP CFG-011 stall multiplier
+  PASS CFG-012 strategy verified
+
+======================================
+  v8 SPEC TEST COMPLETE
+  PASS=30  FAIL=16  SKIP=32
+  Total: 78
+  Elapsed: 349s
+======================================
+  [0;31mFAIL[0m RETRY-003 r=6 l=1
+  [0;32mPASS[0m RETRY-004 verified in BASIC-001
+  [0;32mPASS[0m RETRY-005 verified in BASIC-003
+
+=== §13 STRATEGY ===
+  [0;31mFAIL[0m CFG-002 4500=6 6000=0
+  [1;33mSKIP[0m CFG-003 need ms-precision timer
+  [1;33mSKIP[0m CFG-004 hysteresis not implemented
+  [0;31mFAIL[0m STRATEGY-001 r=6
+  [0;31mFAIL[0m CFG-005 during=1 after=1
+  [0;32mPASS[0m CFG-006 retry verified in RETRY-001
+  [1;33mSKIP[0m CFG-007 need restart_mcu
+  [1;33mSKIP[0m CFG-008 need multi-sample real learning
+  [1;33mSKIP[0m CFG-009 need real time advance
+  [0;32mPASS[0m CFG-010 cap verified in AGING-004
+  [1;33mSKIP[0m CFG-011 need learned startup duration
+  [0;32mPASS[0m CFG-012 strategy verified in STRATEGY-001/002
+
+=== §16 CH ===
+  [0;32mPASS[0m STRATEGY-002 continuity warn relay=1
+  [0;32mPASS[0m STRATEGY-003 30A not overridable (BASIC-001)
+  [0;32mPASS[0m STRATEGY-004 fast OC not overridable (OC-006)
+  [0;32mPASS[0m STRATEGY-005 stuck not overridable (STUCK-002)
+  [0;32mPASS[0m STRATEGY-006 ADC not overridable (BASIC-002)
+
+=== §14 FAULT ===
+  [0;32mPASS[0m FAULT-001 warning in OC-002
+  [0;32mPASS[0m FAULT-002 auto-recover in UC-001
+  [0;32mPASS[0m FAULT-003 manual-reset in OC-004
+  [0;32mPASS[0m FAULT-004 hardware in STUCK-002
+
+=== §15 CFG ===
+  [0;32mPASS[0m CFG-001 basic safety verified (BASIC-001/002 with prot_en=0)
+  [0;31mFAIL[0m CH-001 seq ON/OFF failed
+  [0;31mFAIL[0m CH-002 not all ON
+  [0;31mFAIL[0m CFG-002 4500=2 6000=2
+  [1;33mSKIP[0m CFG-003 need ms-precision timer
+  [1;33mSKIP[0m CFG-004 hysteresis not implemented
+  [0;31mFAIL[0m CH-003 multi FS failed
+  [0;32mPASS[0m CFG-005 cooldown 5s
+  [0;32mPASS[0m CFG-006 retry verified in RETRY-001
+  [1;33mSKIP[0m CFG-007 need restart_mcu
+  [1;33mSKIP[0m CFG-008 need multi-sample real learning
+  [1;33mSKIP[0m CFG-009 need real time advance
+  [0;32mPASS[0m CFG-010 cap verified in AGING-004
+  [1;33mSKIP[0m CFG-011 need learned startup duration
+  [0;32mPASS[0m CFG-012 strategy verified in STRATEGY-001/002
+
+=== §16 CH ===
+  [0;32mPASS[0m CH-004 ch9 fault isolated from ch10
+
+=== §17 BND ===
+  [0;31mFAIL[0m BND-001a 30000 r=6
+  [0;31mFAIL[0m CH-001 seq ON/OFF failed
+  [0;31mFAIL[0m CH-002 not all ON
+  [0;31mFAIL[0m BND-001b 4499=0 4501=0
+  [1;33mSKIP[0m BND-002 need ms-precision timing
+  [1;33mSKIP[0m BND-003 bias not used for protection thresholds
+
+======================================
+  v8 SPEC TEST COMPLETE
+  PASS=27  FAIL=34  SKIP=24
+  Total: 85
+  Elapsed: 1014s
+  Master: 192.168.0.57
+======================================
+  [0;31mFAIL[0m CH-003 multi FS failed
+  [0;32mPASS[0m CH-004 ch9 fault isolated from ch10
+
+=== §17 BND ===
+  [0;32mPASS[0m BND-001a 30000 trips (>=)
+  [0;32mPASS[0m BND-001b 4499 no trip, 4501 trips
+  [1;33mSKIP[0m BND-002 need ms-precision timing
+  [1;33mSKIP[0m BND-003 bias not used for protection thresholds
+
+======================================
+  v8 SPEC TEST COMPLETE
+  PASS=30  FAIL=31  SKIP=24
+  Total: 85
+  Elapsed: 1022s
+  Master: 192.168.0.57
+======================================

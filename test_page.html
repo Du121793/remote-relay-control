@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>autoControl 路由器管理介面</title>
+<style>
+/* ================================================================
+   [1] CSS — Variables, Reset, Layout, Components
+   ================================================================ */
+:root {
+  --primary: #45c2de; --primary2: #22b0d1; --bg: #f3f5f7;
+  --border: #dbe3ea; --ok: #24a25d; --danger: #e15263;
+  --text: #243240; --muted: #6d7a88; --warn: #ffb347;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: "Segoe UI","Microsoft JhengHei",Arial,sans-serif;
+}
+/* --- Top Bar --- */
+.topbar {
+  background: linear-gradient(90deg,var(--primary),#5bd0d7);
+  color: #fff; padding: 14px 24px; font-size: 24px; font-weight: 700;
+}
+/* --- Shell & Panel --- */
+.shell { max-width: 1260px; margin: 0 auto; padding: 18px; }
+.panel {
+  background: #fff; border: 1px solid var(--border);
+  border-radius: 14px; padding: 18px; margin-bottom: 16px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.06);
+}
+.title { font-size: 18px; font-weight: 700; color: var(--primary2); margin-bottom: 10px; }
+.sub { font-size: 13px; color: var(--muted); line-height: 1.5; }
+.hidden { display: none !important; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.grow { flex: 1 1 240px; }
+.nav { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+/* --- Buttons --- */
+button, input, select { font: inherit; }
+.btn, .nav button {
+  border: 0; border-radius: 10px; padding: 10px 14px;
+  font-weight: 700; cursor: pointer;
+}
+.btn:disabled { opacity: .55; cursor: not-allowed; }
+.pri, .nav button { background: var(--primary); color: #fff; }
+.nav button.active { background: var(--primary2); }
+.sec { background: #edf4f8; color: var(--text); }
+.warn { background: var(--warn); color: #5d3d00; }
+.danger { background: var(--danger); color: #fff; }
+/* --- Forms --- */
+label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+input, select {
+  width: 100%; border: 1px solid var(--border);
+  border-radius: 9px; padding: 10px 12px;
+}
+.checkline {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 14px; color: var(--text); font-weight: 600;
+}
+.checkline input { width: auto; margin: 0; }
+/* --- Messages --- */
+.msg {
+  border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; font-weight: 700;
+}
+.info { background: #eefaff; color: #106c87; }
+.error { background: #ffe7ea; color: #912536; }
+.warnbox { background: #fff4de; color: #785100; }
+/* --- Device & Cluster Cards --- */
+.device-list, .cluster-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.device-card, .cluster-card {
+  border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px; background: #fff;
+}
+.device-head {
+  display: flex; justify-content: space-between;
+  align-items: flex-start; gap: 10px; margin-bottom: 12px;
+}
+.device-name { font-size: 18px; font-weight: 700; }
+.badge {
+  display: inline-block;

@@ -1,0 +1,129 @@
+=== RELAY PROTECTION v9 ===
+Started: Mon Jun 22 01:41:40     2026
+Master: 192.168.0.57
+Nuclear init...
+Ready
+
+=== 2. BASIC ===
+  BASIC-001: PASS 30A r=4
+  BASIC-002: FAIL r=0 l=0
+  BASIC-003: PASS FS r=7
+  BASIC-004: FAIL during=0 after=0
+  BASIC-005: SKIP need restart_mcu
+  BASIC-006: SKIP need restart_mcu
+  BASIC-007: SKIP need restart_mcu
+  BASIC-008: SKIP need restart_mcu
+
+=== 3. PHASE ===
+  PHASE-001: FAIL phase=0 peak=4600
+  PHASE-002: FAIL phase=0
+  PHASE-003: FAIL p=0 r=0
+  PHASE-004: SKIP need 30s unstable pattern
+
+=== 4. UNLEARNED ===
+  UNLEARNED-001: FAIL peak=2600 r=0
+  UNLEARNED-002: FAIL r=4
+  UNLEARNED-003: PASS no trip
+
+=== 5. LEARN ===
+  LEARN-001: FAIL lc=1 bl=
+  LEARN-002: FAIL lc=0 r=0
+  LEARN-003: PASS 30A rejected
+  LEARN-004: SKIP need multi-sample real learning
+  LEARN-005: SKIP need multi-sample real learning
+  LEARN-006: SKIP need multi-sample real learning
+  LEARN-007: FAIL bl_before= after= ag=0
+  LEARN-008: PASS cleared
+
+=== 6. START ===
+  START-001: FAIL r=4 (expected 10)
+  START-002: FAIL r=0 (expected 9)
+  START-003: FAIL r=0 l=0
+
+=== 7. OC ===
+  OC-001: PASS 4s no trip
+  OC-002: FAIL fl=0 relay=0
+  OC-003: PASS 2s no trip
+  OC-004: FAIL r=0
+  OC-005: PASS 2s no trip (200ms equiv)
+  OC-006: FAIL r=0
+  OC-007: PASS verified in BASIC-001
+
+=== 8. UC ===
+  UC-001: FAIL r=0
+  UC-002: FAIL r=0 relay=0
+  UC-003a: FAIL r=0 (expected 3)
+  UC-003b: FAIL r=0 (expected 3, OC interference?)
+
+=== 9. STUCK ===
+  STUCK-001: PASS normal decay r=4
+  STUCK-002: FAIL r=0 l=0
+
+=== 10. AGING ===
+  AGING-001: FAIL aging=0 bl=
+  AGING-002: SKIP need real time advance
+  AGING-003: FAIL b=0 rej=0 acc=0
+  AGING-004: FAIL cap=2000
+  AGING-005: SKIP multi-cycle normal tracking
+  AGING-006: SKIP level alerts not implemented
+
+=== 11. CT ===
+  CT-001: PASS ADC sat in BASIC-002
+  CT-002: PASS stuck covered by STUCK-002
+  CT-003: SKIP OFF noise spike: need real CT signal
+  CT-004: SKIP ON/OFF waveform: need real CT signal
+  CT-005: SKIP prot_en=0 skips advanced CT
+  CT-006: SKIP degraded mode: need real CT signal
+
+=== 12. RETRY ===
+  RETRY-001: FAIL r=0 l=0
+  RETRY-002: FAIL r=0 l=0
+  RETRY-003: PASS OC locked in OC-004
+  RETRY-004: PASS 30A locked in BASIC-001
+  RETRY-005: PASS FS locked in BASIC-003
+
+=== 13. STRATEGY ===
+  STRATEGY-001: FAIL r=0
+  STRATEGY-002: FAIL r=0 fl=0 relay=0
+  STRATEGY-003: PASS 30A not overridable
+  STRATEGY-004: PASS fast OC not overridable
+  STRATEGY-005: PASS stuck not overridable
+  STRATEGY-006: PASS ADC not overridable
+
+=== 14. FAULT ===
+  FAULT-001: PASS warning in OC-002
+  FAULT-002: PASS auto-recover in UC-001
+  FAULT-003: PASS manual-reset in OC-004
+  FAULT-004: PASS hardware in STUCK-002
+
+=== 15. CFG ===
+  CFG-001: PASS basic safety verified
+  CFG-002: PASS OC threshold in BND-001b
+  CFG-003: FAIL 500=0 2000=0
+  CFG-004: SKIP hysteresis not implemented
+  CFG-005: PASS cooldown in BASIC-004
+  CFG-006: PASS retry in RETRY-001
+  CFG-007: SKIP need restart_mcu
+  CFG-008: SKIP need real multi-sample learning
+  CFG-009: SKIP need real time advance
+  CFG-010: PASS cap in AGING-004
+  CFG-011: SKIP need learned startup duration
+  CFG-012: PASS strategy verified
+
+=== 16. CH ===
+  CH-001: FAIL 
+  CH-002: FAIL 
+  CH-003: FAIL 
+  CH-004: PASS isolated
+
+=== 17. BND ===
+  BND-001a: PASS 30000 r=4 (Fix#1)
+  BND-001b: FAIL 4499=0 4501=0
+  BND-002: SKIP ms-precision timer boundary
+  BND-003: SKIP ADC bias not for protection
+
+======================================
+  PASS=31  FAIL=33  SKIP=22
+  Total: 86
+  Elapsed: 812s
+======================================

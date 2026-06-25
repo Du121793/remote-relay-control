@@ -1,0 +1,19 @@
+=== BOOT SAFETY TEST ===
+Started: Sun Jun 21 22:16:14     2026
+Waiting for .57 to boot...
+Device online after 5s
+
+BASIC-005: All relays OFF after boot
+  mask=6144 boot_safety=1
+  BASIC-005: FAIL mask=6144
+BASIC-006: Boot delay blocks ON
+  during boot delay: ch1=1
+  after boot delay: ch1=0
+  BASIC-006: FAIL during=1 after=0
+BASIC-007: Rapid restart lockout (simulated)
+  restart_count set to: 3
+  BASIC-007: PASS restart_count set (lockout on next reboot)
+  BASIC-008: PASS fault lock persists (manual_reset required)
+
+=== DONE ===
+PASS=2 FAIL=2

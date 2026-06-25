@@ -1,0 +1,31 @@
+=== RELAY PROTECTION TEST v6 FINAL ===
+Started: Sun Jun 21 20:49:38     2026
+Master: http://192.168.0.209
+Init done
+
+=== 16. CH ===
+  CH-001: FAIL mask=8236
+  CH-002: PASS all OFF
+  CH-003: FAIL 
+  CH-004: PASS isolated
+
+=== 2. BASIC ===
+  BASIC-001: PASS 30A
+  BASIC-002: PASS ADC
+  BASIC-003: PASS FS
+  BASIC-004: PASS cooldown
+  BASIC-005: SKIP need restart_mcu
+  BASIC-006: SKIP need restart_mcu
+  BASIC-007: SKIP need restart_mcu
+  BASIC-008: SKIP need restart_mcu
+
+=== 3/4. PHASE+UNLEARNED ===
+  PHASE-001: PASS STARTUP
+  PHASE-002: PASS RUNNING
+  PHASE-003: PASS no UC
+  PHASE-004: SKIP need 30s unstable
+  UNLEARNED-001: PASS peak
+  UNLEARNED-002: PASS OC
+  UNLEARNED-003: PASS no trip
+
+=== 5. LEARN ===

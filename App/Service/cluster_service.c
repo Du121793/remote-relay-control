@@ -11,6 +11,7 @@
 
 #include "stm32f7xx_hal.h"
 
+extern RTC_HandleTypeDef hrtc;
 extern struct netif gnetif;
 
 #define CLUSTER_SERVICE_STALE_TIMEOUT_MS   6000UL
@@ -224,13 +225,13 @@ static uint8_t cluster_service_rtc_write(uint32_t unix_time)
             cluster_service_bin_to_bcd(day);
   RTC->ISR &= ~RTC_ISR_INIT;
   RTC->WPR = 0xFFU;
-  HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_RTC_SIGNATURE) = CLUSTER_SERVICE_RTC_SIGNATURE;
+  HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_RTC_SIGNATURE, CLUSTER_SERVICE_RTC_SIGNATURE);
   return 1U;
 }
 
 static void cluster_service_rtc_init(void)
 {
-  uint32_t fault_backup[16];
+  uint32_t fault_backup[26];
   uint32_t index;
   uint32_t start;
   uint8_t reset_backup_domain = 0U;

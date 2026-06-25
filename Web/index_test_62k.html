@@ -1,0 +1,1382 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>autoControl 路由器管理介面</title>
+<style>
+/* ================================================================
+   [1] CSS — Variables, Reset, Layout, Components
+   ================================================================ */
+:root {
+  --primary: #45c2de; --primary2: #22b0d1; --bg: #f3f5f7;
+  --border: #dbe3ea; --ok: #24a25d; --danger: #e15263;
+  --text: #243240; --muted: #6d7a88; --warn: #ffb347;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: "Segoe UI","Microsoft JhengHei",Arial,sans-serif;
+}
+/* --- Top Bar --- */
+.topbar {
+  background: linear-gradient(90deg,var(--primary),#5bd0d7);
+  color: #fff; padding: 14px 24px; font-size: 24px; font-weight: 700;
+}
+/* --- Shell & Panel --- */
+.shell { max-width: 1260px; margin: 0 auto; padding: 18px; }
+.panel {
+  background: #fff; border: 1px solid var(--border);
+  border-radius: 14px; padding: 18px; margin-bottom: 16px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.06);
+}
+.title { font-size: 18px; font-weight: 700; color: var(--primary2); margin-bottom: 10px; }
+.sub { font-size: 13px; color: var(--muted); line-height: 1.5; }
+.hidden { display: none !important; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.grow { flex: 1 1 240px; }
+.nav { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+/* --- Buttons --- */
+button, input, select { font: inherit; }
+.btn, .nav button {
+  border: 0; border-radius: 10px; padding: 10px 14px;
+  font-weight: 700; cursor: pointer;
+}
+.btn:disabled { opacity: .55; cursor: not-allowed; }
+.pri, .nav button { background: var(--primary); color: #fff; }
+.nav button.active { background: var(--primary2); }
+.sec { background: #edf4f8; color: var(--text); }
+.warn { background: var(--warn); color: #5d3d00; }
+.danger { background: var(--danger); color: #fff; }
+/* --- Forms --- */
+label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+input, select {
+  width: 100%; border: 1px solid var(--border);
+  border-radius: 9px; padding: 10px 12px;
+}
+.checkline {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 14px; color: var(--text); font-weight: 600;
+}
+.checkline input { width: auto; margin: 0; }
+/* --- Messages --- */
+.msg {
+  border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; font-weight: 700;
+}
+.info { background: #eefaff; color: #106c87; }
+.error { background: #ffe7ea; color: #912536; }
+.warnbox { background: #fff4de; color: #785100; }
+/* --- Device & Cluster Cards --- */
+.device-list, .cluster-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.device-card, .cluster-card {
+  border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px; background: #fff;
+}
+.device-head {
+  display: flex; justify-content: space-between;
+  align-items: flex-start; gap: 10px; margin-bottom: 12px;
+}
+.device-name { font-size: 18px; font-weight: 700; }
+.badge {
+  display: inline-block; padding: 4px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 700;
+}
+.badge-local { background: #dff7ea; color: #0d7a42; }
+.badge-cluster { background: #e8f4fb; color: #0f7694; }
+.device-meta { font-size: 12px; color: var(--muted); line-height: 1.5; }
+/* --- Relay Grid & Card --- */
+.relay-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill,minmax(170px,1fr));
+  gap: 10px;
+}
+.relay-card {
+  border: 1px solid var(--border); border-radius: 12px;
+  padding: 12px; background: #fafcfd;
+}
+.relay-name {
+  font-size: 14px; font-weight: 700; word-break: break-word; min-height: 20px;
+}
+.relay-state { margin-top: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
+.relay-actions {
+  margin-top: 10px; display: flex; align-items: center;
+  justify-content: space-between; gap: 8px;
+}
+.relay-buttons { display: flex; align-items: center; gap: 6px; }
+/* --- Force Stop Button --- */
+.force-stop {
+  background: #b91c1c !important; color: #fff !important;
+  border: none; border-radius: 4px; padding: 4px 8px;
+  cursor: pointer; font-size: 12px;
+}
+.force-stop:hover { background: #dc2626 !important; }
+.force-stop:disabled { background: #555 !important; cursor: not-allowed; }
+/* --- Toggle Switch --- */
+.sw {
+  position: relative; width: 52px; height: 30px; border: 0;
+  border-radius: 999px; background: #d7dee5;
+}
+.sw::after {
+  content: ""; position: absolute; top: 4px; left: 4px;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.22);
+  transition: transform .18s ease;
+}
+.sw.on { background: var(--ok); }
+.sw.on::after { transform: translateX(22px); }
+.sw.pending { background: #9bd9e8; }
+/* --- Panic / Stop Button --- */
+.panic {
+  min-width: 28px; height: 28px; padding: 0 8px; border: 0;
+  border-radius: 8px; background: var(--danger); color: #fff;
+  font-size: 12px; font-weight: 700; cursor: pointer;
+}
+/* --- Table --- */
+table { width: 100%; border-collapse: collapse; }
+th, td {
+  padding: 8px; border-bottom: 1px solid var(--border);
+  text-align: left; font-size: 14px; vertical-align: middle;
+}
+th { color: var(--muted); }
+/* --- Status Pre --- */
+pre {
+  margin: 0; background: #f6f8fa; border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px; white-space: pre-wrap;
+  word-break: break-word; font-size: 12px;
+}
+.pick-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
+/* --- Lock Badge & Unlock --- */
+.locked-badge {
+  background: #7c3aed; color: #fff; border-radius: 3px;
+  padding: 1px 6px; font-size: 11px; margin-left: 4px;
+}
+.unlock-btn {
+  background: #059669; color: #fff; border: none;
+  border-radius: 4px; padding: 3px 7px; cursor: pointer;
+  font-size: 11px; margin-left: 4px;
+}
+.unlock-btn:hover { background: #10b981; }
+/* --- Gear Button --- */
+.gear-btn {
+  background: none; border: none; cursor: pointer;
+  font-size: 16px; padding: 0 4px; opacity: .6;
+}
+.gear-btn:hover { opacity: 1; }
+/* --- Settings Modal Overlay --- */
+.sov {
+  display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,.6); z-index: 999;
+}
+.sov.on { display: block; }
+/* --- Settings Modal Panel --- */
+.spn {
+  display: none; position: fixed; top: 50%; left: 50%;
+  transform: translate(-50%,-50%); background: #1e293b;
+  border: 1px solid #475569; border-radius: 12px; padding: 20px;
+  z-index: 1000; max-width: 500px; width: 90%; max-height: 80vh;
+  overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,.5);
+}
+.spn.on { display: block; }
+.spn h3 { color: #e2e8f0; margin: 0 0 12px; }
+.spn label { display: block; color: #94a3b8; font-size: 13px; margin: 8px 0 2px; }
+.spn input, .spn select {
+  width: 100%; padding: 6px 8px; background: #0f172a;
+  border: 1px solid #475569; border-radius: 4px;
+  color: #e2e8f0; font-size: 13px;
+}
+.spn .br { display: flex; gap: 8px; margin-top: 16px; justify-content: flex-end; }
+.spn .bs, .spn .bc, .spn .bd {
+  color: #fff; padding: 8px 16px; border: none;
+  border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.spn .bs { background: #2563eb; }
+.spn .bc { background: #475569; }
+.spn .bd { background: #b91c1c; }
+/* --- Fault Reason Label --- */
+.fr { color: #f87171; font-size: 11px; margin-left: 4px; }
+/* --- Tooltip --- */
+.tip {
+  display: inline-block; width: 16px; height: 16px; line-height: 16px;
+  text-align: center; border-radius: 50%; background: #94a3b8; color: #fff;
+  font-size: 11px; font-weight: 700; cursor: help; margin-left: 3px;
+  position: relative; vertical-align: middle;
+}
+.tip::after {
+  content: attr(data-tip); position: absolute; bottom: 120%; left: 50%;
+  transform: translateX(-50%); background: #1e293b; color: #e2e8f0;
+  padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: 400;
+  white-space: nowrap; pointer-events: none; opacity: 0; transition: opacity .15s;
+  z-index: 2000;
+}
+.tip:hover::after { opacity: 1; }
+</style>
+</head>
+<body>
+
+<!-- ================================================================
+     [2] HTML — Structure
+     ================================================================ -->
+<div class="topbar">autoControl 路由器管理介面</div>
+<div class="shell">
+  <div id="msg" class="msg info hidden"></div>
+
+  <!-- Login -->
+  <div id="loginView" class="panel">
+    <div class="title">登入驗證</div>
+    <div class="row">
+      <div class="grow">
+        <label for="pwd">管理密碼</label>
+        <input id="pwd" type="password" placeholder="預設：admin">
+      </div>
+      <div style="padding-top:24px">
+        <button class="btn pri" onclick="login()">登入</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- App (hidden until login) -->
+  <div id="appView" class="hidden">
+    <!-- Header -->
+    <div class="panel">
+      <div class="row" style="justify-content:space-between">
+        <div>
+          <div class="title" id="headTitle">控制中心</div>
+          <div class="sub" id="headSub">---</div>
+        </div>
+        <div class="row">
+          <button id="goMasterBtn" class="btn warn hidden" onclick="goToMaster()">前往 Master</button>
+          <button class="btn sec" onclick="refreshAll(true,'manual')">重新整理</button>
+          <button class="btn danger" onclick="logout()">登出</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="nav">
+      <button id="tabBtn-home" class="active" onclick="showTab('home')">主畫面</button>
+      <button id="tabBtn-cluster" onclick="showTab('cluster')">叢集與節點</button>
+      <button id="tabBtn-settings" onclick="showTab('settings')">設定</button>
+      <button id="tabBtn-status" onclick="showTab('status')">系統狀態</button>
+    </div>
+
+    <!-- Tab: Home -->
+    <div id="tab-home">
+      <div class="panel">
+        <div class="title">設備與繼電器</div>
+        <div class="sub">只有 Master 可以控制繼電器。</div>
+        <div id="deviceList" class="device-list"></div>
+      </div>
+    </div>
+
+    <!-- Tab: Cluster -->
+    <div id="tab-cluster" class="hidden">
+      <div class="panel">
+        <div class="title">可見節點</div>
+        <div id="clusterNodes" class="cluster-grid"></div>
+      </div>
+    </div>
+
+    <!-- Tab: Settings -->
+    <div id="tab-settings" class="hidden">
+      <!-- Local Cluster Config -->
+      <div class="panel">
+        <div class="title">本地叢集設定</div>
+        <div class="sub">設定設備名稱、叢集、後端與雲端連線。</div>
+        <div class="pick-row" style="margin-top:10px">
+          <div><label for="detectedCluster">偵測到的叢集</label><select id="detectedCluster"></select></div>
+          <button class="btn sec" onclick="applyDetectedCluster()">套用選取叢集</button>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <div class="grow"><label for="cfgDevice">設備名稱</label><input id="cfgDevice"></div>
+          <div class="grow"><label for="cfgCluster">叢集名稱</label><input id="cfgCluster"></div>
+        </div>
+        <div class="row">
+          <div class="grow"><label for="cfgPassword">叢集密碼</label><input id="cfgPassword" type="password" placeholder="留空表示清除密碼"></div>
+          <div class="grow"><label for="cfgAuto">自動加入</label><select id="cfgAuto"><option value="1">啟用</option><option value="0">停用</option></select></div>
+        </div>
+        <div class="row">
+          <div class="grow"><label for="cfgBackendHost">後端主機</label><input id="cfgBackendHost" placeholder="例如 192.168.0.139"></div>
+          <div class="grow"><label for="cfgBackendPort">後端埠號</label><input id="cfgBackendPort" type="number" min="1" max="65535" placeholder="42001"></div>
+        </div>
+        <div class="row">
+          <div class="grow"><label for="cfgBackendKey">後端金鑰</label><input id="cfgBackendKey" type="password" placeholder="例如 dev-key"></div>
+        </div>
+        <div class="row">
+          <label class="checkline"><input id="cfgEnabled" type="checkbox"> <span>啟用叢集</span></label>
+          <label class="checkline"><input id="cfgCloudEnabled" type="checkbox"> <span>啟用雲端連線</span></label>
+        </div>
+        <div class="row">
+          <div class="grow"><label for="cfgCloudBrokerHost">雲端 Broker 主機</label><input id="cfgCloudBrokerHost" placeholder="例如 mqtt.example.com"></div>
+          <div class="grow"><label for="cfgCloudBrokerPort">雲端 Broker 埠號</label><input id="cfgCloudBrokerPort" type="number" min="1" max="65535" placeholder="8883"></div>
+        </div>
+        <div class="row">
+          <div class="grow"><label for="cfgCloudClusterId">Cloud Cluster ID</label><input id="cfgCloudClusterId" placeholder="自動產生" readonly></div>
+          <div class="grow"><label for="cfgCloudDeviceId">Cloud Device ID</label><input id="cfgCloudDeviceId" placeholder="自動產生" readonly></div>
+        </div>
+        <div class="row">
+          <div class="grow"><label for="cfgCloudKeyId">Cloud Key ID</label><input id="cfgCloudKeyId" placeholder="自動產生" readonly></div>
+          <div class="grow"><label for="cfgCloudTransport">雲端傳輸</label><select id="cfgCloudTransport"><option value="1">MQTT/TLS</option></select></div>
+        </div>
+        <div class="row">
+          <div class="grow"><label for="cfgCloudClusterCaFingerprint">Cluster CA 指紋</label><input id="cfgCloudClusterCaFingerprint" placeholder="由雲端 provisioning 帶入"></div>
+          <div class="grow"><label for="cfgCloudClusterBindingSecret">Binding Secret（留空=不變）</label><input id="cfgCloudClusterBindingSecret" type="password" placeholder="手動輸入新的 binding secret" autocomplete="off"></div>
+        </div>
+        <div class="row">
+          <label for="cfgCloudClusterCaCert">CA 根憑證（PEM 格式）</label>
+          <textarea id="cfgCloudClusterCaCert" rows="6" placeholder="貼入 CA 根憑證 PEM"></textarea>
+        </div>
+        <div class="row"><button class="btn pri" onclick="saveClusterConfig()">儲存本地叢集設定</button></div>
+      </div>
+
+      <!-- Global Protection Config -->
+      <div class="panel">
+        <div class="title">全域保護參數</div>
+        <div class="sub">這些設定影響所有通道的基本安全行為。<span class="tip" data-tip="變更後立即生效，不需重啟">?</span></div>
+        <div class="row" style="margin-top:10px">
+          <div class="grow"><label>冷卻時間 (秒) <span class="tip" data-tip="繼電器 OFF 後拒絕再次 ON 的強制等待時間">?</span></label><input id="gCfgCooldown" type="number" min="0" max="3600"></div>
+          <div class="grow"><label>重試延遲 (秒) <span class="tip" data-tip="啟動失敗後等待多久才自動重試">?</span></label><input id="gCfgRetryDelay" type="number" min="1" max="3600"></div>
+          <div class="grow"><label>最大重試次數 <span class="tip" data-tip="啟動失敗後最多自動重試幾次，超過則鎖定">?</span></label><input id="gCfgMaxRetry" type="number" min="0" max="10"></div>
+        </div>
+        <div class="row">
+          <div class="grow"><label>開機延遲 (秒) <span class="tip" data-tip="MCU 重啟後禁止所有輸出的安全延遲時間">?</span></label><input id="gCfgBootDelay" type="number" min="1" max="300"></div>
+          <div class="grow"><label>學習樣本次數 <span class="tip" data-tip="需要收集幾次有效啟動週期才算學習完成">?</span></label><input id="gCfgLearnSamples" type="number" min="2" max="20"></div>
+          <div class="grow"><label>老化更新間隔 (時) <span class="tip" data-tip="連續運轉中每幾小時更新一次 aging offset">?</span></label><input id="gCfgAgingHours" type="number" min="1" max="720"></div>
+        </div>
+        <div class="row">
+          <div class="grow"><label>老化上限 (%) <span class="tip" data-tip="aging offset 不可超過 initial baseline 的百分之幾">?</span></label><input id="gCfgAgingCap" type="number" min="10" max="100"></div>
+          <div class="grow"><label>卡轉倍數 (×0.1) <span class="tip" data-tip="啟動後若超過「學習的啟動時間 × (此值÷10)」秒仍未穩定，判定為卡轉（馬達堵轉/泵浦卡死）並關閉。例：設 20 = 2.0 倍，學習啟動時間 4 秒 → 8 秒未穩定即跳脫">?</span></label><input id="gCfgStallMult" type="number" min="10" max="50"></div>
+        </div>
+        <div class="row"><button class="btn pri" onclick="saveGlobalProtectionConfig()">儲存全域保護設定</button></div>
+      </div>
+
+      <!-- Local Relay Config -->
+      <div class="panel">
+        <div class="title">本地繼電器設定</div>
+        <div class="sub">設定每路 relay 的名稱、啟用與保護參數。門檻與延遲單位為 A / ms。<span class="tip" data-tip="未學習時使用手動門檻；學習完成後以學習值為準">?</span></div>
+        <table>
+          <thead><tr><th>通道</th><th>名稱</th><th>啟用</th><th>記憶</th><th>開機開</th><th>ADC</th><th>過流保護</th><th>門檻 (A) <span class="tip" data-tip="未學習時的手動過流門檻。單位：安培 (A)">?</span></th><th>延遲 (ms) <span class="tip" data-tip="電流超過門檻後須持續多久才跳脫。單位：毫秒 (ms)">?</span></th><th>遲滯 (A) <span class="tip" data-tip="電流需降到此值以下才清除過流狀態。復歸遲滯 = 門檻 − 遲滯。單位：安培 (A)">?</span></th><th>儲存</th></tr></thead>
+          <tbody id="relayCfgBody"></tbody>
+        </table>
+      </div>
+      <div id="remoteRelayConfigPanels"></div>
+    </div>
+
+    <!-- Tab: Status -->
+    <div id="tab-status" class="hidden">
+      <div class="panel">
+        <div class="title">系統狀態</div>
+        <pre id="statusText">{}</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Settings Modal -->
+<div class="sov" id="sov" onclick="clsSet()"></div>
+<div class="spn" id="spn">
+  <h3 id="stt">Relay 設定</h3>
+  <div id="sname" style="color:#94a3b8;font-size:13px;margin-bottom:8px"></div>
+  <label>保護開關 <span class="tip" data-tip="啟用後才進行智慧保護（過流/欠流/老化/CT 判斷）。基本安全不受影響">?</span></label>
+  <select id="sprot"><option value="0">關閉</option><option value="1">啟用</option></select>
+  <label>過流門檻 (A) <span class="tip" data-tip="未學習時的手動過流門檻。單位：安培 (A)，例如 4.5 = 4500mA">?</span></label>
+  <input id="sthr" type="number" step="0.01" min="0.1" max="100">
+  <label>跳脫延遲 (ms) <span class="tip" data-tip="電流超過門檻後須持續多久才跳脫。單位：毫秒 (ms)">?</span></label>
+  <input id="sdel" type="number" min="0" max="600000">
+  <label>復歸遲滯 (A) <span class="tip" data-tip="電流需降到此值以下才清除過流狀態。復歸遲滯 = 門檻 − 此值。單位：安培 (A)">?</span></label>
+  <input id="shys" type="number" step="0.01" min="0" max="100">
+  <label>設備策略 <span class="tip" data-tip="安全優先：欠流/CT 異常時關閉。連續優先：保持運轉但發出警告。致命故障不受策略影響">?</span></label>
+  <select id="sstr"><option value="0">安全優先</option><option value="1">連續優先</option></select>
+  <div class="br">
+    <button class="bd" onclick="clrLearn()">清除學習</button>
+    <button class="bc" onclick="clsSet()">關閉</button>
+    <button class="bs" onclick="savSet()">儲存</button>
+  </div>
+</div>
+
+<script>
+/* ================================================================
+   [1] CONSTANTS
+   ================================================================ */
+var REMOTE_ADMIN_PASSWORD = 'admin';
+var UI_POLL_INTERVAL_MS = 5000;
+
+/* ================================================================
+   [2] APPLICATION STATE
+   ================================================================ */
+var state = {
+  token: null,
+  authenticated: false,
+  previousAuthenticated: false,
+  clusterConfig: null,
+  relayState: null,
+  relayConfig: [],
+  relayConfigLoaded: false,
+  remoteRelayConfigs: {},
+  remoteTokens: {},
+  nodes: [],
+  status: null,
+  refreshInFlight: false,
+  refreshPending: false,
+  activeTab: 'home',
+  protectionState: null,
+  protectionConfig: null,
+  pendingLocal: {},
+  pendingRemote: {},
+  pollTimer: null,
+  pollTick: 0,
+  settingsChannel: 0
+};
+
+/* ================================================================
+   [3] PURE UTILITY FUNCTIONS
+   ================================================================ */
+var FAULT_REASON_TEXT = {
+  0: '', 1: '啟動失敗', 2: '過流跳脫', 3: '欠流異常',
+  4: '30A硬上限', 5: 'ADC飽和', 6: '接點黏住',
+  7: '強制停止', 8: '重啟鎖定', 9: '卡轉保護', 10: '峰值異常'
+};
+function faultReasonText(r) { return FAULT_REASON_TEXT[r] || '未知'; }
+
+var PHASE_TEXT = { 0: '關閉', 1: '開機', 2: '啟動', 3: '運轉', 4: '故障', 5: '冷卻' };
+function phaseText(p) { return PHASE_TEXT[p] || '?'; }
+
+function esc(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function bit(mask, ch) { return (((mask >>> 0) >>> (ch - 1)) & 1) === 1; }
+function mutateRelayMask(m, ch, v) {
+  var x = 1 << (ch - 1);
+  return v ? ((m | x) >>> 0) : ((m & (~x)) >>> 0);
+}
+function roleText(r) {
+  return r === 2 ? 'Master' : r === 1 ? 'Member' : 'Standalone';
+}
+function deviceStateText(v) { return v === 2 ? '凍結' : v === 1 ? '開啟' : '停止'; }
+
+function isMaster() {
+  return !!(state.clusterConfig && (!state.clusterConfig.cluster_enabled || state.clusterConfig.is_local_master));
+}
+function masterIp() {
+  return state.clusterConfig && state.clusterConfig.master_ip ? state.clusterConfig.master_ip : '';
+}
+
+function localPending(ch) {
+  return Object.prototype.hasOwnProperty.call(state.pendingLocal, String(ch));
+}
+function remotePending(id, ch) {
+  return Object.prototype.hasOwnProperty.call(state.pendingRemote, id + ':' + ch);
+}
+
+function localRelayConfig(ch) {
+  return state.relayConfig.find(function(r) { return Number(r.channel) === Number(ch); }) || null;
+}
+function localRelayName(ch) {
+  var r = localRelayConfig(ch);
+  return r && r.name ? r.name : 'Relay ' + ch;
+}
+function localEnabledMask() {
+  return state.relayConfig.reduce(function(m, r) {
+    return r.enabled ? (m | (1 << (Number(r.channel) - 1))) : m;
+  }, 0) >>> 0;
+}
+
+function remoteRelayConfig(id, ch) {
+  return (state.remoteRelayConfigs[String(id)] || []).find(function(r) {
+    return Number(r.channel) === Number(ch);
+  }) || null;
+}
+function remoteRelayName(id, ch) {
+  var r = remoteRelayConfig(id, ch);
+  return r && r.name ? r.name : 'CH' + ch;
+}
+
+function formatAdc(a) {
+  if (!a.adc_valid) return '尚無有效取樣';
+  var vdda = a.adc_vref_valid ? '、VDDA ' + a.adc_vdda_millivolts + ' mV' : '';
+  var detail = '偏壓 ' + a.adc_millivolts + ' mV、AC RMS ' + a.adc_rms_millivolts + ' mV' + vdda +
+    '、' + a.adc_sample_rate_hz + ' Hz / ' + a.adc_window_samples + ' 點';
+  if (!a.adc_ct_valid) return 'CT 未就緒（' + detail + '）';
+  return '電流 ' + (a.adc_current_milliamps / 1000).toFixed(3) + ' A（' + detail + '）';
+}
+
+/* ================================================================
+   [4] API LAYER
+   ================================================================ */
+function fetchJson(url, options, useToken, timeoutMs) {
+  var ctl = new AbortController();
+  var tid = setTimeout(function() { ctl.abort(); }, timeoutMs);
+  var opts = {
+    method: (options && options.method) || 'GET',
+    signal: ctl.signal,
+    headers: {}
+  };
+  if (options && options.headers) {
+    for (var k in options.headers) { opts.headers[k] = options.headers[k]; }
+  }
+  if (options && options.body) { opts.body = options.body; }
+  if (useToken && state.token) { opts.headers['X-Auth-Token'] = String(state.token); }
+
+  return fetch(url, opts).then(function(res) {
+    return res.text().then(function(text) {
+      var data;
+      try { data = JSON.parse(text); } catch(e) { data = { ok: false, error: 'bad_json', raw: text }; }
+      if (!res.ok && !data.error) { data.error = 'http_' + res.status; }
+      return data;
+    });
+  }).catch(function(err) {
+    if (err && err.name === 'AbortError') { return { ok: false, error: 'timeout' }; }
+    return { ok: false, error: 'network_error' };
+  }).finally(function() { clearTimeout(tid); });
+}
+
+function apiFetch(url, options) {
+  return fetchJson(url, options, true, 3500);
+}
+function apiFetchAbsolute(url, options) {
+  return fetchJson(url, options, false, 4000);
+}
+
+function remoteApiFetch(ip, path, options, retry) {
+  if (retry === undefined) retry = true;
+  function loginRemote() {
+    return apiFetchAbsolute('http://' + ip + '/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'password=' + encodeURIComponent(REMOTE_ADMIN_PASSWORD)
+    }).then(function(r) {
+      if (r.ok && r.token) { state.remoteTokens[ip] = r.token; return true; }
+      return false;
+    });
+  }
+  function doRequest() {
+    var headers = {};
+    if (options && options.headers) {
+      for (var k in options.headers) { headers[k] = options.headers[k]; }
+    }
+    headers['X-Auth-Token'] = String(state.remoteTokens[ip]);
+    var reqOpts = {
+      method: (options && options.method) || 'GET',
+      headers: headers
+    };
+    if (options && options.body) { reqOpts.body = options.body; }
+    return apiFetchAbsolute('http://' + ip + path, reqOpts).then(function(r) {
+      if (retry && (r.error === 'unauthorized' || r.error === 'http_401')) {
+        delete state.remoteTokens[ip];
+        return loginRemote().then(function(ok) {
+          if (!ok) return { ok: false, error: 'remote_login_failed' };
+          return remoteApiFetch(ip, path, options, false);
+        });
+      }
+      return r;
+    });
+  }
+  if (!state.remoteTokens[ip]) {
+    return loginRemote().then(function(ok) {
+      if (!ok) return { ok: false, error: 'remote_login_failed' };
+      return doRequest();
+    });
+  }
+  return doRequest();
+}
+
+/* ================================================================
+   [5] AUTH
+   ================================================================ */
+function showMessage(t, k) {
+  var b = document.getElementById('msg');
+  b.textContent = t;
+  b.className = 'msg ' + (k === 'error' ? 'error' : k === 'warn' ? 'warnbox' : 'info');
+  b.classList.remove('hidden');
+}
+function hideMessage() { document.getElementById('msg').classList.add('hidden'); }
+
+async function login() {
+  var d = await apiFetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'password=' + encodeURIComponent(document.getElementById('pwd').value)
+  });
+  if (!d.ok) { showMessage('登入失敗：' + d.error, 'error'); return; }
+  state.token = d.token;
+  state.authenticated = true;
+  state.previousAuthenticated = true;
+  document.getElementById('loginView').classList.add('hidden');
+  document.getElementById('appView').classList.remove('hidden');
+  hideMessage();
+  startPoller();
+  await refreshAll(true, 'manual');
+}
+
+async function logout() {
+  await apiFetch('/api/logout', { method: 'POST' });
+  state.token = null;
+  state.authenticated = false;
+  state.previousAuthenticated = false;
+  state.clusterConfig = null;
+  state.relayState = null;
+  state.nodes = [];
+  state.pendingLocal = {};
+  state.pendingRemote = {};
+  document.getElementById('appView').classList.add('hidden');
+  document.getElementById('loginView').classList.remove('hidden');
+  document.getElementById('pwd').value = '';
+  showMessage('已登出。');
+}
+
+/* ================================================================
+   [6] STATE FETCHERS
+   ================================================================ */
+async function fetchSession() {
+  var d = await apiFetch('/api/session');
+  if (!d.ok) return false;
+  var a = !!d.authenticated;
+  if (state.previousAuthenticated && !a) {
+    state.token = null; state.authenticated = false;
+    state.clusterConfig = null; state.relayState = null; state.nodes = [];
+    state.pendingLocal = {}; state.pendingRemote = {};
+    document.getElementById('appView').classList.add('hidden');
+    document.getElementById('loginView').classList.remove('hidden');
+    showMessage('LAN 控制權已由其他使用者接管，請重新登入。', 'warn');
+    return false;
+  }
+  state.authenticated = a;
+  state.previousAuthenticated = a;
+  return a;
+}
+
+async function fetchClusterConfig() {
+  var d = await apiFetch('/api/config/cluster');
+  if (d.ok) state.clusterConfig = d;
+  return d.ok;
+}
+
+async function fetchRelayState() {
+  var d = await apiFetch('/api/relay');
+  if (d.ok) state.relayState = d;
+  return d.ok;
+}
+
+async function fetchRelayConfig() {
+  var d = await apiFetch('/api/config/relays');
+  if (d.ok) { state.relayConfig = Array.isArray(d.relays) ? d.relays : []; state.relayConfigLoaded = true; }
+  return d.ok;
+}
+
+async function fetchNodes() {
+  var d = await apiFetch('/api/cluster/nodes');
+  if (d.ok) state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
+  return d.ok;
+}
+
+async function fetchProtection() {
+  var d = await apiFetch('/api/protection');
+  if (d.ok) state.protectionState = d;
+  return d.ok;
+}
+
+async function fetchProtectionConfig() {
+  var d = await apiFetch('/api/config/protection');
+  if (d.ok) state.protectionConfig = d;
+  return d.ok;
+}
+
+async function fetchStatus() {
+  var d = await apiFetch('/api/status');
+  if (d.ok) state.status = d;
+  return d.ok;
+}
+
+async function fetchRemoteRelayConfigs() {
+  var targets = state.nodes.filter(function(x) {
+    return x.same_cluster && x.controllable && x.ip_text;
+  });
+  for (var i = 0; i < targets.length; i++) {
+    var n = targets[i];
+    var d = await remoteApiFetch(n.ip_text, '/api/config/relays');
+    if (d.ok && Array.isArray(d.relays)) {
+      state.remoteRelayConfigs[String(n.node_id)] = d.relays;
+    }
+  }
+  return true;
+}
+
+/* ================================================================
+   [7] POLLING & REFRESH
+   ================================================================ */
+function shouldPoll(name, force, source) {
+  if (force || source !== 'poll') return true;
+  var tick = state.pollTick;
+  switch (name) {
+    case 'session': return true;
+    case 'clusterConfig': return (tick % 2) === 0;
+    case 'relay': return state.activeTab === 'home';
+    case 'nodes': return state.activeTab === 'cluster' || (state.activeTab === 'home' && (tick % 2) === 0);
+    case 'relayConfig': return false;
+    case 'status': return state.activeTab === 'status' || state.activeTab === 'home';
+    default: return false;
+  }
+}
+
+async function refreshAll(force, source) {
+  if (state.refreshInFlight) { state.refreshPending = true; return; }
+  state.refreshInFlight = true;
+  try {
+    if (shouldPoll('session', force, source)) { var ok = await fetchSession(); if (!ok) { renderAll(); return; } }
+    document.getElementById('loginView').classList.add('hidden');
+    document.getElementById('appView').classList.remove('hidden');
+    if (shouldPoll('clusterConfig', force, source)) await fetchClusterConfig();
+    if (shouldPoll('relay', force, source)) await fetchRelayState();
+    if (shouldPoll('nodes', force, source)) await fetchNodes();
+    if ((state.activeTab === 'settings' && !state.relayConfigLoaded) || force) await fetchRelayConfig();
+    if (shouldPoll('status', force, source)) await fetchStatus();
+    if (shouldPoll('status', force, source)) await fetchProtection();
+    if (state.activeTab === 'settings') await fetchProtectionConfig();
+    if (state.activeTab === 'settings' && isMaster()) await fetchRemoteRelayConfigs();
+    syncPending();
+    renderAll();
+  } finally {
+    state.refreshInFlight = false;
+    if (state.refreshPending) { state.refreshPending = false; refreshAll(false, 'poll'); }
+  }
+}
+
+function startPoller() {
+  if (state.pollTimer) return;
+  state.pollTimer = setInterval(function() {
+    if (document.hidden || !state.authenticated || state.activeTab === 'settings') return;
+    state.pollTick += 1;
+    refreshAll(false, 'poll');
+  }, UI_POLL_INTERVAL_MS);
+}
+
+function syncPending() {
+  if (state.relayState) {
+    Object.keys(state.pendingLocal).forEach(function(k) {
+      if (bit(state.relayState.relay_mask, Number(k)) === !!state.pendingLocal[k]) {
+        delete state.pendingLocal[k];
+      }
+    });
+  }
+  state.nodes.forEach(function(n) {
+    for (var ch = 1; ch <= 16; ch++) {
+      var key = n.node_id + ':' + ch;
+      if (Object.prototype.hasOwnProperty.call(state.pendingRemote, key) &&
+          bit(n.relay_mask, ch) === !!state.pendingRemote[key]) {
+        delete state.pendingRemote[key];
+      }
+    }
+  });
+}
+
+/* ================================================================
+   [8] NAVIGATION & HEADER
+   ================================================================ */
+function showTab(name) {
+  state.activeTab = name;
+  ['home','cluster','settings','status'].forEach(function(t) {
+    document.getElementById('tab-' + t).classList.toggle('hidden', t !== name);
+    document.getElementById('tabBtn-' + t).classList.toggle('active', t === name);
+  });
+  if (state.authenticated) refreshAll(name === 'settings' || name === 'status', 'manual');
+}
+
+function updateHeader() {
+  var t = document.getElementById('headTitle');
+  var s = document.getElementById('headSub');
+  var b = document.getElementById('goMasterBtn');
+  if (!state.clusterConfig) {
+    t.textContent = '控制中心'; s.textContent = '---';
+    b.classList.add('hidden'); return;
+  }
+  t.textContent = (state.clusterConfig.device_name || 'autoControl') + ' / ' + roleText(state.clusterConfig.role);
+  s.textContent = '叢集：' + (state.clusterConfig.cluster_name || '-') +
+    ' · 節點 ID：' + state.clusterConfig.self_node_id + ' · Term：' + state.clusterConfig.term;
+  b.classList.toggle('hidden', isMaster() || !masterIp());
+}
+
+function goToMaster() {
+  if (!masterIp()) { showMessage('目前找不到 Master。', 'warn'); return; }
+  window.location.href = 'http://' + masterIp() + '/';
+}
+
+/* ================================================================
+   [9] UI RENDERERS
+   ================================================================ */
+function buildDeviceCards() {
+  var cards = [];
+  if (state.relayState) {
+    var a = state.status && state.status.adc ? state.status.adc : {};
+    cards.push({
+      kind: '本地',
+      role: state.clusterConfig ? state.clusterConfig.role : 0,
+      name: state.clusterConfig && state.clusterConfig.device_name ? state.clusterConfig.device_name : '本機',
+      ip: '',
+      relay_mask: state.relayState.relay_mask >>> 0,
+      enabled_mask: localEnabledMask(),
+      controllable: isMaster(),
+      local: true,
+      online: true,
+      device_state: (state.relayState.relay_mask >>> 0) !== 0 ? 1 : 0,
+      adc_valid: !!a.valid, adc_ct_valid: !!a.ct_valid,
+      adc_signal_present: !!a.signal_present,
+      adc_raw: Number(a.raw || 0), adc_millivolts: Number(a.millivolts || 0),
+      adc_rms_millivolts: Number(a.rms_millivolts || 0),
+      adc_current_milliamps: Number(a.current_milliamps || 0),
+      adc_sample_rate_hz: Number(a.sample_rate_hz || 0),
+      adc_window_samples: Number(a.window_samples || 0),
+      adc_dma_overruns: Number(a.dma_overrun_count || 0),
+      adc_saturation_count: Number(a.saturation_count || 0),
+      adc_vref_valid: !!a.vref_valid,
+      adc_vdda_millivolts: Number(a.vdda_millivolts || 0)
+    });
+  }
+  state.nodes.filter(function(n) { return n.same_cluster; }).forEach(function(n) {
+    cards.push({
+      kind: '同叢集', role: n.role,
+      name: n.name || 'Node ' + n.node_id,
+      ip: n.ip_text || '',
+      relay_mask: n.relay_mask >>> 0,
+      enabled_mask: (typeof n.enabled_mask === 'number' ? n.enabled_mask : 0xFFFF) >>> 0,
+      controllable: isMaster() && !!n.controllable && !!n.online,
+      local: false, node_id: n.node_id, online: !!n.online,
+      device_state: Number(n.device_state || 0),
+      adc_valid: !!n.adc_valid, adc_ct_valid: !!n.adc_ct_valid,
+      adc_signal_present: !!n.adc_signal_present,
+      adc_raw: Number(n.adc_raw || 0), adc_millivolts: Number(n.adc_millivolts || 0),
+      adc_rms_millivolts: Number(n.adc_rms_millivolts || 0),
+      adc_current_milliamps: Number(n.adc_current_milliamps || 0),
+      adc_sample_rate_hz: Number(n.adc_sample_rate_hz || 0),
+      adc_window_samples: Number(n.adc_window_samples || 0),
+      adc_dma_overruns: Number(n.adc_dma_overruns || 0),
+      adc_saturation_count: Number(n.adc_saturation_count || 0),
+      adc_vref_valid: false, adc_vdda_millivolts: 0
+    });
+  });
+  return cards;
+}
+
+function effectiveMask(card) {
+  var mask = card.relay_mask >>> 0;
+  if (card.local) {
+    for (var ch = 1; ch <= 16; ch++) {
+      if (localPending(ch)) mask = mutateRelayMask(mask, ch, !!state.pendingLocal[String(ch)]);
+    }
+  } else {
+    for (var ch = 1; ch <= 16; ch++) {
+      if (remotePending(card.node_id, ch)) {
+        mask = mutateRelayMask(mask, ch, !!state.pendingRemote[card.node_id + ':' + ch]);
+      }
+    }
+  }
+  return mask >>> 0;
+}
+
+function relayMeasurementText(card, ch) {
+  var acd = (state.status && state.status.adc_channels || []).find(function(a) { return a.ch === ch - 1; });
+  var ps = state.protectionState && state.protectionState.channels
+    ? state.protectionState.channels.find(function(p) { return p.ch === ch; }) : null;
+  var t = '';
+  if (acd) {
+    if (acd.ct) { t += ' · ' + (acd.mA / 1000).toFixed(3) + ' A'; }
+    else { t += ' · CT 未就緒'; }
+  }
+  if (ps) {
+    t += ' · ' + phaseText(ps.phase);
+    if (ps.fault_locked) {
+      t += '<span class="locked-badge">🔒凍結</span> ';
+      var reason = faultReasonText(ps.fault_reason);
+      if (reason) t += '<span class="fr">' + reason + '</span>';
+    }
+  }
+  return t;
+}
+
+function renderHome() {
+  var box = document.getElementById('deviceList');
+  var cards = buildDeviceCards();
+  if (!cards.length) { box.innerHTML = '<div class="sub">目前沒有可顯示的設備。</div>'; return; }
+  box.innerHTML = cards.map(function(card) {
+    var mask = effectiveMask(card);
+    var relays = [];
+    for (var ch = 1; ch <= 16; ch++) {
+      if (!bit(card.enabled_mask, ch)) continue;
+      var on = bit(mask, ch);
+      var pending = card.local ? localPending(ch) : remotePending(card.node_id, ch);
+      var toggleDisabled = !card.controllable || pending;
+      var stopDisabled = !card.controllable;
+      var name = card.local ? localRelayName(ch) : remoteRelayName(card.node_id, ch);
+      var toggleCall = card.local
+        ? 'setLocalRelay(' + ch + ',' + (on ? 0 : 1) + ')'
+        : 'setRemoteRelay(' + card.node_id + ',' + ch + ',' + (on ? 0 : 1) + ')';
+      var stopCall = card.local
+        ? 'setLocalRelay(' + ch + ',0)'
+        : 'setRemoteRelay(' + card.node_id + ',' + ch + ',0)';
+      var forceStopCall = card.local
+        ? 'forceStopRelay(' + ch + ')'
+        : 'forceStopRemoteRelay(' + card.node_id + ',' + ch + ')';
+
+      var ps = state.protectionState && state.protectionState.channels
+        ? state.protectionState.channels.find(function(p) { return p.ch === ch; }) : null;
+      var unlockHtml = (ps && ps.fault_locked)
+        ? '<button class="unlock-btn" onclick="unlockRelay(' + ch + ')">解凍</button>'
+        : '';
+
+      relays.push(
+        '<div class="relay-card">' +
+        '<div class="relay-name">' + esc(name) + '</div>' +
+        '<div class="relay-state">CH' + ch + ' / ' + (on ? '開' : '關') + relayMeasurementText(card, ch) + '</div>' +
+        '<div class="relay-actions">' +
+        '<span class="sub">' + (pending ? '等待中' : '') + '</span>' +
+        '<div class="relay-buttons">' +
+        '<button class="sw ' + (on ? 'on' : '') + (pending ? ' pending' : '') + '" ' + (toggleDisabled ? 'disabled' : '') + ' onclick="' + toggleCall + '"></button>' +
+        '<button class="panic" ' + (stopDisabled ? 'disabled' : '') + ' onclick="' + stopCall + '">停</button>' +
+        '<button class="force-stop" ' + (stopDisabled ? 'disabled' : '') + ' onclick="' + forceStopCall + '">強停</button>' +
+        unlockHtml +
+        '<button class="gear-btn" onclick="openSet(' + ch + ')">⚙</button>' +
+        '</div></div></div>'
+      );
+    }
+    var adc = ' · ADC：' + formatAdc(card);
+    var meta = (card.ip ? esc(card.ip) + ' · ' : '') + roleText(card.role) +
+      ' · 在線：' + (card.online ? '是' : '否') +
+      ' · 狀態：' + deviceStateText(card.device_state) + adc +
+      (card.local ? ' · 只有 Master 可以控制本地繼電器' : '');
+    return (
+      '<div class="device-card">' +
+      '<div class="device-head">' +
+      '<div><div class="device-name">' + esc(card.name) + '</div>' +
+      '<div class="device-meta">' + meta + '</div></div>' +
+      '<span class="badge ' + (card.kind === '本地' ? 'badge-local' : 'badge-cluster') + '">' + card.kind + '</span>' +
+      '</div>' +
+      '<div class="relay-grid">' + (relays.length ? relays.join('') : '<div class="sub">這台設備沒有啟用任何可控制繼電器。</div>') + '</div>' +
+      '</div>'
+    );
+  }).join('');
+}
+
+function renderCluster() {
+  var box = document.getElementById('clusterNodes');
+  if (!state.nodes.length) { box.innerHTML = '<div class="sub">目前沒有偵測到其他節點。</div>'; return; }
+  box.innerHTML = state.nodes.map(function(n) {
+    var forgetBtn = (!n.online && isMaster())
+      ? '<button class="btn danger" onclick="forgetNode(' + n.node_id + ')">刪除記憶</button>' : '';
+    return (
+      '<div class="cluster-card">' +
+      '<div class="device-head">' +
+      '<div class="device-name">' + esc(n.name || 'Node ' + n.node_id) + '</div>' + forgetBtn +
+      '</div>' +
+      '<div class="device-meta">' +
+      'IP：' + esc(n.ip_text || '-') + '<br>' +
+      '叢集：' + esc(n.cluster_name || '-') + '<br>' +
+      '角色：' + roleText(n.role) + ' · Load：' + n.load + ' · Term：' + n.term + '<br>' +
+      '在線：' + (n.online ? '是' : '否') + ' · 狀態：' + deviceStateText(n.device_state) + '<br>' +
+      'ADC：' + formatAdc(n) + '<br>' +
+      '密碼匹配：' + (n.auth_match ? '是' : '否') + ' · 可由本頁控制：' + (n.controllable ? '是' : '否') +
+      '</div></div>'
+    );
+  }).join('');
+}
+
+function relayConfigRow(r, prefix) {
+  var p = prefix ? prefix + '_' : '';
+  // Display as A, store as mA internally
+  var thrA = (Number(r.overcurrent_milliamps || 4500) / 1000).toFixed(2);
+  var hystA = (Number(r.reset_hysteresis_milliamps || 500) / 1000).toFixed(2);
+  return '<tr>' +
+    '<td>' + r.channel + '</td>' +
+    '<td><input id="' + p + 'relayName' + r.channel + '" value="' + esc(r.name || '') + '"></td>' +
+    '<td><input id="' + p + 'relayEnabled' + r.channel + '" type="checkbox" ' + (r.enabled ? 'checked' : '') + '></td>' +
+    '<td><input id="' + p + 'relayRemember' + r.channel + '" type="checkbox" ' + (r.remember_state ? 'checked' : '') + '></td>' +
+    '<td><input id="' + p + 'relayBoot' + r.channel + '" type="checkbox" ' + (r.boot_default_on ? 'checked' : '') + '></td>' +
+    '<td><span>ADC' + (r.channel - 1) + '</span></td>' +
+    '<td><input id="' + p + 'relayProtect' + r.channel + '" type="checkbox" ' + (r.protection_enabled ? 'checked' : '') + '></td>' +
+    '<td><input id="' + p + 'relayThreshold' + r.channel + '" type="number" step="0.01" min="0.1" max="100" value="' + thrA + '"></td>' +
+    '<td><input id="' + p + 'relayDelay' + r.channel + '" type="number" min="0" max="600000" value="' + (Number(r.trip_delay_ms || 0)) + '"></td>' +
+    '<td><input id="' + p + 'relayHyst' + r.channel + '" type="number" step="0.01" min="0" max="100" value="' + hystA + '"></td>' +
+    '<td><button class="btn pri" onclick="' + (prefix ? 'saveRemoteRelayConfig(' + prefix + ',' + r.channel + ')' : 'saveRelayConfig(' + r.channel + ')') + '">儲存</button></td>' +
+    '</tr>';
+}
+
+function renderRelayConfig() {
+  var body = document.getElementById('relayCfgBody');
+  if (!state.relayConfig.length) {
+    body.innerHTML = '<tr><td colspan="11" class="sub">尚未載入本地繼電器設定。</td></tr>'; return;
+  }
+  body.innerHTML = state.relayConfig.map(function(r) { return relayConfigRow(r); }).join('');
+}
+
+function renderRemoteRelayConfigs() {
+  var box = document.getElementById('remoteRelayConfigPanels');
+  var nodes = state.nodes.filter(function(n) { return n.same_cluster && n.controllable && n.ip_text; });
+  if (!nodes.length) { box.innerHTML = ''; return; }
+  box.innerHTML = nodes.map(function(n) {
+    var rows = state.remoteRelayConfigs[String(n.node_id)] || [];
+    if (!rows.length) {
+      return '<div class="panel"><div class="title">' + esc(n.name || n.ip_text) + ' / 遠端繼電器設定</div><div class="sub">尚未載入遠端設定。</div></div>';
+    }
+    return '<div class="panel"><div class="title">' + esc(n.name || n.ip_text) + ' / 遠端繼電器設定</div>' +
+      '<table><thead><tr><th>通道</th><th>名稱</th><th>啟用</th><th>記憶</th><th>開機開</th><th>ADC</th><th>過流保護</th><th>門檻 mA</th><th>延遲 ms</th><th>遲滯 mA</th><th>儲存</th></tr></thead>' +
+      '<tbody>' + rows.map(function(r) { return relayConfigRow(r, String(n.node_id)); }).join('') + '</tbody></table></div>';
+  }).join('');
+}
+
+function renderStatus() {
+  document.getElementById('statusText').textContent = JSON.stringify(state.status || {}, null, 2);
+}
+
+function renderAll() {
+  updateHeader();
+  fillSettings();
+  fillDetectedClusters();
+  fillGlobalProtectionConfig();
+  renderHome();
+  renderCluster();
+  renderRelayConfig();
+  renderRemoteRelayConfigs();
+  renderStatus();
+}
+
+/* ================================================================
+   [10] SETTINGS MODAL
+   ================================================================ */
+function openSet(ch) {
+  state.settingsChannel = ch;
+  var r = localRelayConfig(ch);
+  var name = r && r.name ? r.name : 'CH' + ch;
+  document.getElementById('stt').textContent = 'Relay ' + ch + ' 設定';
+  document.getElementById('sname').textContent = '名稱：' + name;
+  document.getElementById('sprot').value = (r && r.protection_enabled) ? '1' : '0';
+  // Display as A
+  document.getElementById('sthr').value = (Number(r ? r.overcurrent_milliamps || 4500 : 4500) / 1000).toFixed(2);
+  document.getElementById('sdel').value = r ? Number(r.trip_delay_ms || 0) : 0;
+  document.getElementById('shys').value = (Number(r ? r.reset_hysteresis_milliamps || 500 : 500) / 1000).toFixed(2);
+  var strategy = 0;
+  if (state.protectionState && state.protectionState.channels) {
+    var ps = state.protectionState.channels.find(function(p) { return p.ch === ch; });
+    if (ps) strategy = ps.device_strategy || 0;
+  }
+  document.getElementById('sstr').value = String(strategy);
+  document.getElementById('sov').classList.add('on');
+  document.getElementById('spn').classList.add('on');
+}
+
+function clsSet() {
+  document.getElementById('sov').classList.remove('on');
+  document.getElementById('spn').classList.remove('on');
+}
+
+async function savSet() {
+  var ch = state.settingsChannel;
+  // Convert A display back to mA
+  var thrA = parseFloat(document.getElementById('sthr').value) || 4.5;
+  var hystA = parseFloat(document.getElementById('shys').value) || 0.5;
+  var body = [
+    'channel=' + ch,
+    'name=' + encodeURIComponent(localRelayConfig(ch) && localRelayConfig(ch).name ? localRelayConfig(ch).name : ''),
+    'protection_enabled=' + document.getElementById('sprot').value,
+    'overcurrent_milliamps=' + Math.round(thrA * 1000),
+    'trip_delay_ms=' + encodeURIComponent(document.getElementById('sdel').value),
+    'reset_hysteresis_milliamps=' + Math.round(hystA * 1000)
+  ].join('&');
+  var d = await apiFetch('/api/config/relay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body
+  });
+  if (!d.ok) { showMessage('儲存設定失敗：' + d.error, 'error'); return; }
+  // Also save strategy
+  await apiFetch('/api/protection/strategy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'channel=' + ch + '&strategy=' + document.getElementById('sstr').value
+  });
+  showMessage('通道 ' + ch + ' 設定已更新。');
+  clsSet();
+  state.relayConfigLoaded = false;
+  await refreshAll(true, 'manual');
+}
+
+async function clrLearn() {
+  var ch = state.settingsChannel;
+  var d = await apiFetch('/api/protection/clear-learning', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'channel=' + ch
+  });
+  if (!d.ok) { showMessage('清除學習失敗：' + d.error, 'error'); return; }
+  showMessage('通道 ' + ch + ' 學習資料已清除。');
+  clsSet();
+  await refreshAll(true, 'manual');
+}
+
+/* ================================================================
+   [11] RELAY CONTROL
+   ================================================================ */
+async function setLocalRelay(channel, value) {
+  if (!isMaster()) { showMessage('只有 Master 可以控制本地繼電器。', 'warn'); return; }
+  state.pendingLocal[String(channel)] = !!value;
+  renderHome();
+  var d = await apiFetch('/api/relay-channel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'channel=' + channel + '&value=' + value
+  });
+  if (!d.ok) {
+    delete state.pendingLocal[String(channel)];
+    renderHome();
+    showMessage(
+      d.error === 'not_master' && d.master_ip ? '這台是 Member，請前往 Master：' + d.master_ip : '繼電器控制失敗：' + d.error,
+      d.error === 'not_master' ? 'warn' : 'error'
+    );
+    return;
+  }
+  if (typeof d.relay_mask === 'number') state.relayState = d;
+  await new Promise(function(r) { setTimeout(r, 150); });
+  await fetchRelayState();
+  syncPending();
+  renderHome();
+}
+
+async function setRemoteRelay(nodeId, channel, value) {
+  if (!isMaster()) { showMessage('只有 Master 可以控制同叢集成員。', 'warn'); return; }
+  var key = nodeId + ':' + channel;
+  state.pendingRemote[key] = !!value;
+  renderHome();
+  var d = await apiFetch('/api/cluster/node-relay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'node_id=' + nodeId + '&channel=' + channel + '&value=' + value
+  });
+  if (!d.ok) { delete state.pendingRemote[key]; renderHome(); showMessage('遠端繼電器控制失敗：' + d.error, 'error'); return; }
+  fetchNodes().then(function() { syncPending(); renderHome(); });
+}
+
+async function forceStopRelay(channel) {
+  if (!isMaster()) { showMessage('只有 Master 可以控制本地繼電器。', 'warn'); return; }
+  var d = await apiFetch('/api/protection/force-stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'channel=' + channel
+  });
+  if (!d.ok) { showMessage('強制停止失敗：' + d.error, 'error'); return; }
+  showMessage('通道 ' + channel + ' 已強制停止，冷卻 3 秒。');
+  await new Promise(function(r) { setTimeout(r, 500); });
+  await refreshAll(true, 'manual');
+}
+
+async function forceStopRemoteRelay(nodeId, channel) {
+  if (!isMaster()) { showMessage('只有 Master 可以控制遠端繼電器。', 'warn'); return; }
+  var node = state.nodes.find(function(n) { return Number(n.node_id) === Number(nodeId); });
+  if (!node || !node.ip_text) { showMessage('找不到遠端節點。', 'error'); return; }
+  var d = await remoteApiFetch(node.ip_text, '/api/protection/force-stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'channel=' + channel
+  });
+  if (!d.ok) { showMessage('遠端強制停止失敗：' + d.error, 'error'); return; }
+  showMessage('遠端通道 ' + channel + ' 已強制停止。');
+  await new Promise(function(r) { setTimeout(r, 500); });
+  await refreshAll(true, 'manual');
+}
+
+async function unlockRelay(channel) {
+  var d = await apiFetch('/api/protection/unlock', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'channel=' + channel
+  });
+  if (!d.ok) { showMessage('解凍失敗：' + d.error, 'error'); return; }
+  showMessage('通道 ' + channel + ' 已解凍。');
+  await new Promise(function(r) { setTimeout(r, 300); });
+  await refreshAll(true, 'manual');
+}
+
+/* ================================================================
+   [12] CLUSTER & RELAY CONFIG
+   ================================================================ */
+function fillSettings() {
+  if (!state.clusterConfig) return;
+  document.getElementById('cfgDevice').value = state.clusterConfig.device_name || '';
+  document.getElementById('cfgCluster').value = state.clusterConfig.cluster_name || '';
+  document.getElementById('cfgEnabled').checked = !!state.clusterConfig.cluster_enabled;
+  document.getElementById('cfgAuto').value = String(state.clusterConfig.auto_join_cluster ? 1 : 0);
+  document.getElementById('cfgBackendHost').value = state.clusterConfig.backend_host || '';
+  document.getElementById('cfgBackendPort').value = state.clusterConfig.backend_port || '';
+  document.getElementById('cfgBackendKey').value = '';
+  document.getElementById('cfgCloudEnabled').checked = !!state.clusterConfig.cloud_enabled;
+  document.getElementById('cfgCloudBrokerHost').value = state.clusterConfig.cloud_broker_host || '';
+  document.getElementById('cfgCloudBrokerPort').value = state.clusterConfig.cloud_broker_port || '';
+  document.getElementById('cfgCloudClusterId').value = state.clusterConfig.cloud_cluster_id || '';
+  document.getElementById('cfgCloudDeviceId').value = state.clusterConfig.cloud_device_id || '';
+  document.getElementById('cfgCloudKeyId').value = state.clusterConfig.cloud_key_id || '';
+  document.getElementById('cfgCloudTransport').value = String(state.clusterConfig.cloud_transport || 1);
+  document.getElementById('cfgCloudClusterCaFingerprint').value = state.clusterConfig.cloud_cluster_ca_fingerprint || '';
+  document.getElementById('cfgCloudClusterBindingSecret').value = '';
+}
+
+function fillDetectedClusters() {
+  var sel = document.getElementById('detectedCluster');
+  var names = [];
+  state.nodes.forEach(function(n) { if (n.cluster_name && names.indexOf(n.cluster_name) < 0) names.push(n.cluster_name); });
+  sel.innerHTML = names.length
+    ? names.map(function(n) { return '<option value="' + esc(n) + '">' + esc(n) + '</option>'; }).join('')
+    : '<option value="">目前沒有偵測到其他叢集</option>';
+}
+
+function applyDetectedCluster() {
+  var sel = document.getElementById('detectedCluster');
+  if (!sel.value) { showMessage('目前沒有可套用的叢集。', 'warn'); return; }
+  document.getElementById('cfgCluster').value = sel.value;
+  document.getElementById('cfgEnabled').checked = true;
+  document.getElementById('cfgAuto').value = '1';
+  showMessage('已套用叢集名稱：' + sel.value);
+}
+
+async function saveClusterConfig() {
+  var body = [
+    'device_name=' + encodeURIComponent(document.getElementById('cfgDevice').value),
+    'cluster_name=' + encodeURIComponent(document.getElementById('cfgCluster').value),
+    'cluster_password=' + encodeURIComponent(document.getElementById('cfgPassword').value),
+    'cluster_enabled=' + (document.getElementById('cfgEnabled').checked ? 1 : 0),
+    'auto_join_cluster=' + encodeURIComponent(document.getElementById('cfgAuto').value),
+    'backend_host=' + encodeURIComponent(document.getElementById('cfgBackendHost').value),
+    'backend_port=' + encodeURIComponent(document.getElementById('cfgBackendPort').value),
+    'backend_key=' + encodeURIComponent(document.getElementById('cfgBackendKey').value),
+    'cloud_enabled=' + (document.getElementById('cfgCloudEnabled').checked ? 1 : 0),
+    'cloud_transport=' + encodeURIComponent(document.getElementById('cfgCloudTransport').value),
+    'cloud_broker_host=' + encodeURIComponent(document.getElementById('cfgCloudBrokerHost').value),
+    'cloud_broker_port=' + encodeURIComponent(document.getElementById('cfgCloudBrokerPort').value),
+    'cloud_cluster_ca_fingerprint=' + encodeURIComponent(document.getElementById('cfgCloudClusterCaFingerprint').value),
+    'cloud_cluster_binding_secret=' + encodeURIComponent(document.getElementById('cfgCloudClusterBindingSecret').value),
+    'cloud_cluster_ca_cert=' + encodeURIComponent(document.getElementById('cfgCloudClusterCaCert').value)
+  ].join('&');
+  var d = await apiFetch('/api/config/cluster', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body
+  });
+  if (!d.ok) { showMessage('儲存叢集設定失敗：' + d.error, 'error'); return; }
+  document.getElementById('cfgPassword').value = '';
+  document.getElementById('cfgBackendKey').value = '';
+  document.getElementById('cfgCloudClusterBindingSecret').value = '';
+  document.getElementById('cfgCloudClusterCaCert').value = '';
+  showMessage('本地叢集設定已更新。');
+  await refreshAll(true, 'manual');
+}
+
+function relayConfigBody(channel, prefix) {
+  var p = prefix ? prefix + '_' : '';
+  // Convert A display back to mA for API
+  var thrA = parseFloat(document.getElementById(p + 'relayThreshold' + channel).value) || 4.5;
+  var hystA = parseFloat(document.getElementById(p + 'relayHyst' + channel).value) || 0.5;
+  return [
+    'channel=' + channel,
+    'name=' + encodeURIComponent(document.getElementById(p + 'relayName' + channel).value),
+    'enabled=' + (document.getElementById(p + 'relayEnabled' + channel).checked ? 1 : 0),
+    'remember_state=' + (document.getElementById(p + 'relayRemember' + channel).checked ? 1 : 0),
+    'boot_default_on=' + (document.getElementById(p + 'relayBoot' + channel).checked ? 1 : 0),
+    'protection_enabled=' + (document.getElementById(p + 'relayProtect' + channel).checked ? 1 : 0),
+    'overcurrent_milliamps=' + Math.round(thrA * 1000),
+    'trip_delay_ms=' + encodeURIComponent(document.getElementById(p + 'relayDelay' + channel).value),
+    'reset_hysteresis_milliamps=' + Math.round(hystA * 1000)
+  ].join('&');
+}
+
+async function saveRelayConfig(channel) {
+  var d = await apiFetch('/api/config/relay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: relayConfigBody(channel)
+  });
+  if (!d.ok) { showMessage('儲存本地繼電器設定失敗：' + d.error, 'error'); return; }
+  showMessage('通道 ' + channel + ' 設定已更新。');
+  state.relayConfigLoaded = false;
+  await refreshAll(true, 'manual');
+}
+
+async function saveRemoteRelayConfig(nodeId, channel) {
+  var node = state.nodes.find(function(n) { return Number(n.node_id) === Number(nodeId); });
+  if (!node || !node.ip_text) { showMessage('找不到遠端節點。', 'error'); return; }
+  var d = await remoteApiFetch(node.ip_text, '/api/config/relay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: relayConfigBody(channel, String(nodeId))
+  });
+  if (!d.ok) { showMessage('遠端繼電器設定儲存失敗：' + d.error, 'error'); return; }
+  if (Array.isArray(d.relays)) state.remoteRelayConfigs[String(nodeId)] = d.relays;
+  else await fetchRemoteRelayConfigs();
+  showMessage('已更新 ' + (node.name || node.ip_text) + ' 的繼電器設定。');
+  renderAll();
+}
+
+async function forgetNode(nodeId) {
+  if (!isMaster()) { showMessage('只有 Master 可以刪除已記憶節點。', 'warn'); return; }
+  var d = await apiFetch('/api/cluster/forget', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'node_id=' + nodeId
+  });
+  if (!d.ok) { showMessage('刪除已記憶節點失敗：' + d.error, 'error'); return; }
+  showMessage('已刪除節點 ' + nodeId + ' 的記憶。');
+  await refreshAll(true, 'manual');
+}
+
+/* ── Global Protection Config (§14) ── */
+function fillGlobalProtectionConfig() {
+  var c = state.protectionConfig;
+  if (!c) return;
+  document.getElementById('gCfgCooldown').value = Number(c.cooldown_seconds || 3);
+  document.getElementById('gCfgRetryDelay').value = Number(c.retry_delay_seconds || 30);
+  document.getElementById('gCfgMaxRetry').value = Number(c.max_retry_count || 1);
+  document.getElementById('gCfgBootDelay').value = Number(c.boot_delay_seconds || 5);
+  document.getElementById('gCfgLearnSamples').value = Number(c.learning_samples || 5);
+  document.getElementById('gCfgAgingHours').value = Number(c.aging_update_hours || 24);
+  document.getElementById('gCfgAgingCap').value = Number(c.aging_cap_percent || 50);
+  document.getElementById('gCfgStallMult').value = Number(c.stall_multiplier_x10 || 20);
+}
+
+async function saveGlobalProtectionConfig() {
+  var body = [
+    'cooldown_seconds=' + document.getElementById('gCfgCooldown').value,
+    'retry_delay_seconds=' + document.getElementById('gCfgRetryDelay').value,
+    'max_retry_count=' + document.getElementById('gCfgMaxRetry').value,
+    'boot_delay_seconds=' + document.getElementById('gCfgBootDelay').value,
+    'learning_samples=' + document.getElementById('gCfgLearnSamples').value,
+    'aging_update_hours=' + document.getElementById('gCfgAgingHours').value,
+    'aging_cap_percent=' + document.getElementById('gCfgAgingCap').value,
+    'stall_multiplier_x10=' + document.getElementById('gCfgStallMult').value
+  ].join('&');
+  var d = await apiFetch('/api/config/protection', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body
+  });
+  if (!d.ok) { showMessage('儲存全域保護設定失敗：' + d.error, 'error'); return; }
+  showMessage('全域保護參數已更新。');
+  await refreshAll(true, 'manual');
+}
+
+/* ================================================================
+   [13] BOOTSTRAP
+   ================================================================ */
+document.addEventListener('visibilitychange', function() {
+  if (!document.hidden && state.authenticated) refreshAll(false, 'poll');
+});
+
+(function() {
+  fetchSession().then(function(ok) {
+    if (ok) {
+      document.getElementById('loginView').classList.add('hidden');
+      document.getElementById('appView').classList.remove('hidden');
+      startPoller();
+      refreshAll(true, 'manual');
+    } else {
+      document.getElementById('loginView').classList.remove('hidden');
+      document.getElementById('appView').classList.add('hidden');
+    }
+  });
+})();
+</script>
+</body>
+</html>

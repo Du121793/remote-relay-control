@@ -2,6 +2,7 @@
 #include "../Config/rtc_backup_layout.h"
 
 #include "main.h"
+extern RTC_HandleTypeDef hrtc;
 
 #include <string.h>
 
@@ -84,4 +85,27 @@ uint8_t fault_service_load_record(fault_service_record_t *record)
   record->cfsr  = cfsr;
   record->hfsr  = hfsr;
   return 1U;
+}
+
+void fault_service_record_simple(fault_service_type_t type)
+{
+  fault_service_record_t record;
+  memset(&record, 0, sizeof(record));
+  record.valid = 1U;
+  record.type  = (uint8_t)type;
+  record.pc    = 0U;
+  record.lr    = 0U;
+  record.cfsr  = 0U;
+  record.hfsr  = 0U;
+  fault_service_store_record(&record);
+}
+
+uint8_t fault_service_peek(fault_service_record_t *record)
+{
+  return fault_service_load_record(record);
+}
+
+void fault_service_clear(void)
+{
+  fault_service_clear_record();
 }

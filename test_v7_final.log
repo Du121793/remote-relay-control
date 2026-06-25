@@ -1,0 +1,41 @@
+=== RELAY PROTECTION FINAL TEST ===
+Started: Mon Jun 22 01:10:41     2026
+Master: 192.168.0.57
+
+=== Global cleanup ===
+Done
+
+=== A. CORE SAFETY ===
+  [0;32mPASS[0m A1-30A>= r=4 (Fix#1 30000mA trips)
+  [0;32mPASS[0m A2-FS r=7 relay=0
+  [0;32mPASS[0m A3-ADC r=5
+
+=== B. PHASE + OC/UC (Fix #6) ===
+  [0;32mPASS[0m B1-STARTUP phase=2
+  [0;31mFAIL[0m B2-OC r=10
+  [0;31mFAIL[0m B3-UC r=2 (expected 3)
+  [0;32mPASS[0m B4-OC-UC r=3 (UC after brief OC, Fix#6)
+
+=== C. STARTUP PEAK (Fix #3) ===
+  [0;32mPASS[0m C1-PEAK r=10 (peak immediate, Fix#3)
+  [0;31mFAIL[0m C2-STALL r=0 (expected 9)
+  [0;31mFAIL[0m C3-STALL-FB r=0 (expected 9)
+
+=== D. AGING (Fix #2) ===
+  [0;31mFAIL[0m D1-AGING before=50 rej=135 acc=135
+
+=== E. UNLOCK ===
+  [0;32mPASS[0m E1-UNLOCK before=6 after=0 sp=0
+
+=== F. STRATEGY ===
+  [0;31mFAIL[0m F1-CONT r=0 fl=0
+  [0;32mPASS[0m F2-SAFE r=3 (safety trip)
+
+=== G. BOUNDARY ===
+  [0;32mPASS[0m G1-4499 r=0 (no trip)
+
+======================================
+  FINAL: PASS=9  FAIL=6  SKIP=0
+  Total: 15
+  Elapsed: 319s
+======================================
