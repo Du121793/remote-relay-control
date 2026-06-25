@@ -3991,6 +3991,8 @@ app.post("/api/sensor/alert", (req, res) => {
   let mqttResult = null;
   if (shouldSendMqtt) {
     const payload = {
+    const nodeInfo = resolveKnownNode(targetNodeId);
+    const clusterName = nodeInfo?.cluster || clusterId;
       channel,
       target,
       duration_seconds: durationSec,
@@ -4000,7 +4002,7 @@ app.post("/api/sensor/alert", (req, res) => {
       node_id: targetNodeId,
       request_id: crypto.randomBytes(8).toString("hex"),
     };
-    const mqttOk = mqttPublishCommand(clusterId, "auto-hold", payload);
+    const mqttOk = mqttPublishCommand(clusterName, "auto-hold", payload);
     mqttResult = mqttOk ? "sent" : "mqtt_unavailable";
     if (mqttOk) {
       sensor.lastMqttRenewMs = nowMs;
@@ -4035,6 +4037,8 @@ app.post("/api/sensor/recover", (req, res) => {
   }
 
   const nowUnix = Math.floor(Date.now() / 1000);
+  const nodeInfo = resolveKnownNode(sensor.targetNodeId);
+  const clusterName = nodeInfo?.cluster || clusterId;
   const payload = {
     channel,
     target: sensor.target,       // must match creation target
@@ -4046,7 +4050,7 @@ app.post("/api/sensor/recover", (req, res) => {
     request_id: crypto.randomBytes(8).toString("hex"),
   };
 
-  const mqttOk = mqttPublishCommand(clusterId, "auto-hold", payload);
+  const mqttOk = mqttPublishCommand(clusterName, "auto-hold", payload);
   activeSensors.delete(key);
 
   return res.json({
