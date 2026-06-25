@@ -1927,7 +1927,7 @@ void mqtt_link_service_poll(void)
   err_t error;
 
   mqtt_link_service_init();
-  config = device_config_get();
+  device_config_t cfg_snap; device_config_copy(&cfg_snap); config = &cfg_snap;
   configured = mqtt_link_configured(config);
   should_run = mqtt_link_should_run(configured);
   mqtt_link_capture_config(config);

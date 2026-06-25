@@ -1367,7 +1367,7 @@ static void http_service_sync_backend_config_to_cluster_async(void)
 {
   cluster_service_state_t cluster_state;
   const cluster_node_t *nodes;
-  const device_config_t *config = device_config_get();
+  device_config_t config_snap; device_config_copy(&config_snap); const device_config_t *config = &config_snap;
   uint32_t count = 0U;
   uint32_t index;
   cluster_service_get_state(&cluster_state);

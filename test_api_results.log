@@ -383,3 +383,58 @@
   Total: 60
   Elapsed: 14s
 ======================================
+============================================
+  Board: 192.168.0.157
+============================================
+--- 0. Basic Connectivity ---
+       cluster_id=579948958 role=2 term=1 name=default
+--- 1. Auth ---
+       token=2931473473
+--- 2. Relay Read ---
+       relay_mask=0
+--- 3. Relay Control ---
+--- 4. Config/Cluster ---
+       "device_name":"autoControl"
+--- 5. Config/Relays ---
+--- 6. Relay Config Update ---
+--- 7. Protection ---
+--- 8. Cluster Nodes ---
+       node_count=1
+--- 9. Scheduler ---
+--- 10. Auto Hold ---
+--- 11. Manual Control ---
+--- 12. Web UI ---
+       html_size=68632 bytes
+--- 13. Status Integrity ---
+
+============================================
+  Board: 192.168.0.245
+============================================
+--- 0. Basic Connectivity ---
+       cluster_id=1165657530 role=1 term=1 name=default
+--- 1. Auth ---
+       token=2333951307
+--- 2. Relay Read ---
+       relay_mask=0
+--- 3. Relay Control ---
+--- 4. Config/Cluster ---
+       "device_name":"autoControl"
+--- 5. Config/Relays ---
+--- 6. Relay Config Update ---
+--- 7. Protection ---
+--- 8. Cluster Nodes ---
+       node_count=1
+--- 9. Scheduler ---
+--- 10. Auto Hold ---
+--- 11. Manual Control ---
+--- 12. Web UI ---
+       html_size=68632 bytes
+--- 13. Status Integrity ---
+
+
+======================================
+  API TEST COMPLETE
+  PASS=51  FAIL=9  SKIP=0
+  Total: 60
+  Elapsed: 19s
+======================================

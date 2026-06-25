@@ -265,6 +265,24 @@ weekly_schedule_t *scheduler_get_weekly(uint8_t channel)
     return &g_weekly_schedule[channel - 1];
 }
 
+uint8_t scheduler_get_state_copy(uint8_t channel, channel_scheduler_state_t *dst)
+{
+    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT || dst == NULL) return 0U;
+    taskENTER_CRITICAL();
+    *dst = g_scheduler_state[channel - 1];
+    taskEXIT_CRITICAL();
+    return 1U;
+}
+
+uint8_t scheduler_get_weekly_copy(uint8_t channel, weekly_schedule_t *dst)
+{
+    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT || dst == NULL) return 0U;
+    taskENTER_CRITICAL();
+    *dst = g_weekly_schedule[channel - 1];
+    taskEXIT_CRITICAL();
+    return 1U;
+}
+
 /* ── interval validation ── */
 bool scheduler_validate_intervals(const daily_schedule_t *day)
 {
