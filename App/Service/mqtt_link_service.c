@@ -1313,11 +1313,6 @@ static void mqtt_link_process_command(void)
       mqtt_link_publish_ack(request_id, 0U, "bad_scheduler_set", target_node_id);
       return;
     }
-    weekly_schedule_t *ws = scheduler_get_weekly((uint8_t)sch_ch);
-    if (!ws) {
-      mqtt_link_publish_ack(request_id, 0U, "not_found", target_node_id);
-      return;
-    }
     daily_schedule_t new_day;
     memset(&new_day, 0, sizeof(new_day));
     new_day.interval_count = (uint8_t)sch_count;
@@ -1335,8 +1330,11 @@ static void mqtt_link_process_command(void)
       new_day.intervals[k].start_minute = (uint16_t)sv;
       new_day.intervals[k].end_minute = (uint16_t)ev;
     }
-    ws->days[(uint8_t)sch_weekday] = new_day;
-      scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
+    if (scheduler_validate_intervals(&new_day) == false ||
+        scheduler_set_weekly_day((uint8_t)sch_ch, (uint8_t)sch_weekday, &new_day) == 0U) {
+      mqtt_link_publish_ack(request_id, 0U, "bad_scheduler_set", target_node_id);
+      return;
+    }
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;
   }
@@ -1346,10 +1344,11 @@ static void mqtt_link_process_command(void)
     uint32_t sch_en_ch = 0, sch_enabled = 0;
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &sch_en_ch);
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "enabled", &sch_enabled);
-    channel_scheduler_state_t *st = scheduler_get_state((uint8_t)sch_en_ch);
-    if (st) { st->schedule_enabled = (uint8_t)(sch_enabled ? 1 : 0); }
+    if (scheduler_set_enabled((uint8_t)sch_en_ch, (uint8_t)(sch_enabled ? 1 : 0)) == 0U) {
+      mqtt_link_publish_ack(request_id, 0U, "not_found", target_node_id);
+      return;
+    }
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
-      scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
     return;
   }
   else if (strcmp(g_mqtt_link_context.rx_topic,
@@ -1361,18 +1360,21 @@ static void mqtt_link_process_command(void)
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "duration_seconds", &sp_dur);
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "until", &sp_until);
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "pause_blocks_auto_trigger", &sp_blocks);
-    channel_scheduler_state_t *st = scheduler_get_state((uint8_t)sp_ch);
-    if (st) {
-      uint8_t tv; uint32_t now_unix = cluster_service_get_unix_time(&tv);
+    {
+      uint8_t tv;
+      uint32_t now_unix = cluster_service_get_unix_time(&tv);
+      uint32_t pause_until = now_unix + 60U;
       switch (sp_mode) {
-        case 0: st->schedule_pause_until = now_unix + 60; break;
-        case 1: st->schedule_pause_until = now_unix + sp_dur; break;
-        case 2: st->schedule_pause_until = sp_until; break;
-        case 3: st->schedule_pause_until = SCHEDULER_PAUSE_FOREVER; break;
-        default: st->schedule_pause_until = now_unix + 60; break;
+        case 0: pause_until = now_unix + 60U; break;
+        case 1: pause_until = now_unix + sp_dur; break;
+        case 2: pause_until = sp_until; break;
+        case 3: pause_until = SCHEDULER_PAUSE_FOREVER; break;
+        default: pause_until = now_unix + 60U; break;
       }
-      st->pause_blocks_auto_trigger = (uint8_t)(sp_blocks ? 1 : 0);
-      scheduler_mark_rtc_dirty();
+      if (scheduler_set_pause((uint8_t)sp_ch, pause_until, (uint8_t)(sp_blocks ? 1 : 0)) == 0U) {
+        mqtt_link_publish_ack(request_id, 0U, "not_found", target_node_id);
+        return;
+      }
     }
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;

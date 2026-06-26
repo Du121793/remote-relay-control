@@ -1,7 +1,10 @@
 ; *************************************************************
-; *** autoControl Flash Layout — IROM limited to 768KB
-; *** Code:  0x08000000–0x080BFFFF (sectors 0–6)
-; *** Reserved: sectors 7–11 (single-bank) / 21–23 (dual-bank)
+; *** autoControl Flash/RAM Layout
+; *** Firmware IROM : 0x08000000-0x080BFFFF (768KB)
+; *** Persist Flash : 0x080C0000+ reserved for scheduler/config
+; *** DTCM          : FreeRTOS heap only (CPU-only, no DMA)
+; *** SRAM1         : normal RW/ZI, task stacks, lwIP heap
+; *** SRAM2         : ETH DMA descriptors/buffers/RX pool only
 ; *************************************************************
 
 LR_IROM1 0x08000000 0x000C0000  {
@@ -11,13 +14,16 @@ LR_IROM1 0x08000000 0x000C0000  {
    .ANY (+RO)
    .ANY (+XO)
   }
+
   RW_DTCM 0x20000000 0x00020000  {
    startup_stm32f767xx.o (STACK, HEAP)
-   heap_4.o (.bss.ucHeap)
+   *(.ARM.__at_0x20000000)
   }
+
   RW_SRAM1 0x20020000 0x0005C000  {
    .ANY (+RW +ZI)
   }
+
   RW_SRAM2 0x2007C000 0x00004000  {
    *(.ARM.__at_0x2007C000)
    *(.ARM.__at_0x2007C0A0)

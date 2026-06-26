@@ -411,7 +411,7 @@ POST /api/sensor/recover { channel:3 }
 | PUT | `/api/relay/channels/:ch/schedule-week/:wd` | `count=N&s0=M&e0=N...` | ✅ | 覆寫某天 |
 | POST | `/api/relay/channels/:ch/schedule-week/:wd/copy` | `target_weekdays=1,2&mode=overwrite` | ✅ | 複製排程 |
 | PATCH | `/api/relay/channels/:ch/scheduler/enabled` | `enabled=0\|1` | ✅ | 啟用/關閉 |
-| POST | `/api/relay/channels/:ch/scheduler/pause` | `mode=0-3&duration_seconds=N&pause_blocks=0\|1` | ✅ | 暫停 |
+| POST | `/api/relay/channels/:ch/scheduler/pause` | `mode=0-3&duration_seconds=N&pause_blocks_auto_trigger=0\|1` | ✅ | 暫停；`pause_blocks` 為相容 alias |
 | POST | `/api/relay/channels/:ch/scheduler/resume` | - | ✅ | 恢復 |
 
 ### 6.7 Auto Hold / 手動控制
@@ -419,7 +419,7 @@ POST /api/sensor/recover { channel:3 }
 | Method | Path | Body | Auth | 說明 |
 |------|------|------|:---:|------|
 | POST | `/api/relay/channels/:ch/auto-hold` | `target=0\|1&duration_seconds=N&session=S&command_ts=T&reason=R` | ✅ | Auto Hold |
-| POST | `/api/relay/channels/:ch/control` | `target=0\|1&pause_mode=0-3&pause_duration_seconds=N&pause_blocks=0\|1` | ✅ | 手動控制 |
+| POST | `/api/relay/channels/:ch/control` | `target=0\|1&pause_mode=0-3&pause_duration_seconds=N&pause_blocks_auto_trigger=0\|1` | ✅ | 手動控制；`pause_blocks` 為相容 alias |
 | GET | `/api/relay/channels/:ch/scheduler/status` | - | ✅ | 完整狀態 |
 
 ### 6.8 全域狀態
@@ -435,12 +435,22 @@ POST /api/sensor/recover { channel:3 }
 
 | 區域 | Single-bank | Dual-bank | 用途 |
 |------|------|------|------|
-| Sector 7 | 0x080E0000 | - | Scheduler Flash |
-| Sector 21 | - | 0x081A0000 | Scheduler Flash |
+| Firmware IROM | 0x08000000–0x080BFFFF | 0x08000000–0x080BFFFF | Keil scatter/Target Options 必須限制為 768KB |
+| Sector 7 erase base | 0x080C0000 | - | Scheduler Flash sector，整個 sector 保留 |
+| Scheduler data address | 0x080E0000 | 0x081A0000 | Scheduler payload 寫入位址 |
 | Sector 10 | 0x08180000 | - | Config Slot A |
 | Sector 22 | - | 0x081C0000 | Config Slot A |
 | Sector 11 | 0x081C0000 | - | Config Slot B |
 | Sector 23 | - | 0x081E0000 | Config Slot B |
+
+Flash 寫入規則：
+
+- 所有 `HAL_FLASHEx_Erase` / `HAL_FLASH_Program` 必須經過 `flash_storage` mutex。
+- single-bank Flash erase/program 期間必須保存 PRIMASK、disable IRQ，完成後恢復原 PRIMASK。
+- 不可從 ISR 或未受控的 lwIP callback 直接寫 Flash。
+- Scheduler 對外只允許 copy getter + setter；外部不得持有 writable raw pointer 修改排程狀態。
+- Keil 必須同時設定 Target IROM1=`0x08000000/0x000C0000`，且 Linker 使用 `MDK-ARM/autoControl/autoControl.sct`；不能只手改 `.sct`。
+- Rebuild 後 map file 必須出現 `RW_DTCM`、`RW_SRAM1`、`RW_SRAM2`，且 `ucHeap=0x20000000`、ETH DMA/RX pool 位於 `0x2007C000–0x2007FFFF`。
 
 ### A/B Slot 格式
 

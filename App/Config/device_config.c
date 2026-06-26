@@ -14,6 +14,7 @@
 
 #include "mbedtls/sha256.h"
 #include "mbedtls/md.h"
+#include "../Service/flash_storage.h"
 
 static device_config_t g_device_config __attribute__((aligned(8)));
 static uint32_t g_device_config_last_flash_error = 0U;
@@ -88,8 +89,6 @@ static StaticTask_t g_device_config_task_buffer;
 static StackType_t g_device_config_task_stack[4096]; /* 16 KB — provisioning path needs >8 KB */
 static StaticSemaphore_t g_device_config_save_mutex_buffer;
 static SemaphoreHandle_t g_device_config_save_mutex = NULL;
-static StaticSemaphore_t g_flash_storage_mutex_buffer;
-static SemaphoreHandle_t g_flash_storage_mutex = NULL;
 static uint8_t g_device_config_sync_result = 0U;
 
 typedef struct
@@ -216,6 +215,7 @@ static void device_config_build_current_defaults(device_config_t *config);
 
 static uint32_t device_config_flash_erase_slot(uint8_t slot)
 {
+  /* Caller must hold flash_storage_lock() and mask IRQs on single-bank Flash. */
   FLASH_EraseInitTypeDef erase_init;
   uint32_t sector_error = 0U;
   memset(&erase_init, 0, sizeof(erase_init));
@@ -1055,6 +1055,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   uint8_t save_slot;
   uint32_t save_addr;
   device_config_slot_header_t hdr;
+  uint32_t primask;
 
   if ((config == NULL) || (device_config_is_valid(config) == 0U))
   {
@@ -1078,6 +1079,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
      fault (CFSR=0x00000400).  The HAL flash helpers do not guarantee
      full interrupt masking for the complete operation window. */
   flash_storage_lock();
+  primask = __get_PRIMASK();
   __disable_irq();
 
   HAL_FLASH_Unlock();
@@ -1087,8 +1089,8 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   if (device_config_flash_erase_slot(save_slot) == 0U)
   {
     HAL_FLASH_Lock();
+    if (primask == 0U) { __enable_irq(); }
     flash_storage_unlock();
-    __enable_irq();
     return 0U;
   }
 
@@ -1107,7 +1109,9 @@ static uint8_t device_config_save_direct(const device_config_t *config)
                             hdr32[hdr_offset / sizeof(uint32_t)]) != HAL_OK)
       {
         g_device_config_last_flash_error = HAL_FLASH_GetError();
-        HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
+        HAL_FLASH_Lock();
+        if (primask == 0U) { __enable_irq(); }
+        flash_storage_unlock();
         return 0U;
       }
     }
@@ -1120,7 +1124,9 @@ static uint8_t device_config_save_direct(const device_config_t *config)
                           src32[offset / sizeof(uint32_t)]) != HAL_OK)
     {
       g_device_config_last_flash_error = HAL_FLASH_GetError();
-      HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
+      HAL_FLASH_Lock();
+      if (primask == 0U) { __enable_irq(); }
+      flash_storage_unlock();
       return 0U;
     }
   }
@@ -1129,7 +1135,9 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   if (memcmp((const void *)(save_addr + sizeof(device_config_slot_header_t)),
              &temp, sizeof(temp)) != 0)
   {
-    HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
+    HAL_FLASH_Lock();
+    if (primask == 0U) { __enable_irq(); }
+    flash_storage_unlock();
     return 0U;
   }
 
@@ -1141,15 +1149,17 @@ static uint8_t device_config_save_direct(const device_config_t *config)
                           commit_word) != HAL_OK)
     {
       g_device_config_last_flash_error = HAL_FLASH_GetError();
-      HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
+      HAL_FLASH_Lock();
+      if (primask == 0U) { __enable_irq(); }
+      flash_storage_unlock();
       return 0U;
     }
     g_device_config_active_slot = save_slot;
   }
 
   HAL_FLASH_Lock();
+  if (primask == 0U) { __enable_irq(); }
   flash_storage_unlock();
-  __enable_irq();
   return 1U;
 }
 
@@ -1207,11 +1217,7 @@ static void device_config_worker_init(void)
     g_device_config_save_mutex =
       xSemaphoreCreateMutexStatic(&g_device_config_save_mutex_buffer);
   }
-  if (g_flash_storage_mutex == NULL)
-  {
-    g_flash_storage_mutex =
-      xSemaphoreCreateMutexStatic(&g_flash_storage_mutex_buffer);
-  }
+  flash_storage_init();
   if ((g_device_config_queue != NULL) &&
       (g_device_config_save_mutex != NULL) &&
       (g_device_config_task_handle == NULL))
@@ -1371,21 +1377,3 @@ void device_config_poll(void)
 }
 
 UBaseType_t device_config_stack_high_water(void) { if (g_device_config_task_handle == NULL) return 0; return uxTaskGetStackHighWaterMark(g_device_config_task_handle); }
-
-void flash_storage_lock(void)
-{
-  if (g_flash_storage_mutex != NULL &&
-      xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
-  {
-    (void)xSemaphoreTake(g_flash_storage_mutex, portMAX_DELAY);
-  }
-}
-
-void flash_storage_unlock(void)
-{
-  if (g_flash_storage_mutex != NULL &&
-      xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
-  {
-    (void)xSemaphoreGive(g_flash_storage_mutex);
-  }
-}

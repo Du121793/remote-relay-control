@@ -68,10 +68,8 @@ void scheduler_init(void);
 void scheduler_tick(uint32_t monotonic_ms, uint32_t unix_time, uint8_t time_valid);
 
 /* State access */
-/* [DEPRECATED for writes — use setter functions] */
-channel_scheduler_state_t *scheduler_get_state(uint8_t channel);
-/* [DEPRECATED for writes — use setter functions] */
-weekly_schedule_t         *scheduler_get_weekly(uint8_t channel);
+const channel_scheduler_state_t *scheduler_get_state(uint8_t channel);
+const weekly_schedule_t         *scheduler_get_weekly(uint8_t channel);
 uint8_t scheduler_get_state_copy(uint8_t channel, channel_scheduler_state_t *dst);
 uint8_t scheduler_get_weekly_copy(uint8_t channel, weekly_schedule_t *dst);
 

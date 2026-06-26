@@ -10,12 +10,25 @@
 #include <string.h>
 #include "FreeRTOS.h"
 #include "task.h"
+#include "flash_storage.h"
 
 extern RTC_HandleTypeDef hrtc;
 
 /* ── Per-channel state arrays ── */
 static channel_scheduler_state_t g_scheduler_state[SCHEDULER_CHANNEL_COUNT];
 static weekly_schedule_t g_weekly_schedule[SCHEDULER_CHANNEL_COUNT];
+
+static channel_scheduler_state_t *scheduler_state_mut(uint8_t channel)
+{
+    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
+    return &g_scheduler_state[channel - 1];
+}
+
+static weekly_schedule_t *scheduler_weekly_mut(uint8_t channel)
+{
+    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
+    return &g_weekly_schedule[channel - 1];
+}
 
 /* ── Monotonic time helpers ── */
 static bool time_after_or_equal(uint32_t a, uint32_t b)
@@ -40,7 +53,7 @@ void scheduler_init(void)
    Sector chosen to avoid overlap with device_config at 0x081E0000.
    ═══════════════════════════════════════════════════════════════ */
 
-#define SCHEDULER_FLASH_ADDR_DUAL 0x081A0000UL  /* dual-bank: sector 22 */
+#define SCHEDULER_FLASH_ADDR_DUAL 0x081A0000UL  /* dual-bank: sector 21 */
 #define SCHEDULER_FLASH_ADDR_SINGLE 0x080E0000UL /* single-bank: sector 7 */
 #define SCHEDULER_FLASH_MAGIC2 0x53434833U  /* "SCH3" — bumped for sector fix */
 #define SCHEDULER_FLASH_VERSION 2U
@@ -277,55 +290,65 @@ uint8_t scheduler_get_weekly_copy(uint8_t channel, weekly_schedule_t *dst)
 }
 
 /* ── state access ── */
-channel_scheduler_state_t *scheduler_get_state(uint8_t channel)
+const channel_scheduler_state_t *scheduler_get_state(uint8_t channel)
 {
     if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
     return &g_scheduler_state[channel - 1];
 }
-weekly_schedule_t *scheduler_get_weekly(uint8_t channel)
+const weekly_schedule_t *scheduler_get_weekly(uint8_t channel)
 {
     if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
     return &g_weekly_schedule[channel - 1];
 }
 
 uint8_t scheduler_set_enabled(uint8_t channel, uint8_t enabled) {
-    channel_scheduler_state_t *st = scheduler_get_state(channel);
+    channel_scheduler_state_t *st = scheduler_state_mut(channel);
     if (!st) return 0U;
+    taskENTER_CRITICAL();
     st->schedule_enabled = (enabled != 0U) ? 1U : 0U;
+    taskEXIT_CRITICAL();
     scheduler_mark_flash_dirty();
     scheduler_mark_rtc_dirty();
     return 1U;
 }
 uint8_t scheduler_set_pause(uint8_t channel, uint32_t pause_until, uint8_t pause_blocks) {
-    channel_scheduler_state_t *st = scheduler_get_state(channel);
+    channel_scheduler_state_t *st = scheduler_state_mut(channel);
     if (!st) return 0U;
+    taskENTER_CRITICAL();
     st->schedule_pause_until = pause_until;
     st->pause_blocks_auto_trigger = (pause_blocks != 0U) ? 1U : 0U;
+    taskEXIT_CRITICAL();
     scheduler_mark_rtc_dirty();
     return 1U;
 }
 void scheduler_clear_pause(uint8_t channel) {
-    channel_scheduler_state_t *st = scheduler_get_state(channel);
+    channel_scheduler_state_t *st = scheduler_state_mut(channel);
     if (!st) return;
+    taskENTER_CRITICAL();
     st->schedule_pause_until = 0U;
     st->pause_blocks_auto_trigger = 0U;
+    taskEXIT_CRITICAL();
     scheduler_mark_rtc_dirty();
 }
 uint8_t scheduler_set_weekly_day(uint8_t channel, uint8_t weekday, const daily_schedule_t *day) {
-    weekly_schedule_t *ws = scheduler_get_weekly(channel);
+    weekly_schedule_t *ws = scheduler_weekly_mut(channel);
     if (!ws || weekday > 6 || !day) return 0U;
+    taskENTER_CRITICAL();
     ws->days[weekday] = *day;
+    taskEXIT_CRITICAL();
     scheduler_mark_flash_dirty();
     return 1U;
 }
 uint8_t scheduler_copy_weekly_day(uint8_t channel, uint8_t src_wd, const uint8_t *target_wds, uint8_t count) {
-    weekly_schedule_t *ws = scheduler_get_weekly(channel);
+    weekly_schedule_t *ws = scheduler_weekly_mut(channel);
     if (!ws || src_wd > 6 || !target_wds || count == 0 || count > 7) return 0U;
+    taskENTER_CRITICAL();
     daily_schedule_t src = ws->days[src_wd];
     for (uint8_t i = 0; i < count; i++) {
         uint8_t tw = target_wds[i];
         if (tw <= 6) ws->days[tw] = src;
     }
+    taskEXIT_CRITICAL();
     scheduler_mark_flash_dirty();
     return 1U;
 }
