@@ -736,14 +736,26 @@ static err_t mqtt_link_publish_fault(void)
                            MQTT_LINK_PUBLISH_FAULT);
 }
 
+/* Subscription state machine: topics subscribed one-by-one waiting for SUBACK */
+static uint8_t  g_mqtt_sub_index = 0U;
+static const char *g_mqtt_sub_topics[12];
+static uint8_t  g_mqtt_sub_count = 0U;
+
 static void mqtt_link_subscription_callback(void *argument, err_t error)
 {
   (void)argument;
-
   if (error != ERR_OK)
   {
     g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_SUBSCRIBE + (uint32_t)(-error);
     mqtt_link_log_value("[mqtt] subscribe fail=", (uint32_t)(-error));
+  }
+  /* Chain to next topic */
+  g_mqtt_sub_index++;
+  if (g_mqtt_sub_index < g_mqtt_sub_count)
+  {
+    (void)mqtt_subscribe(g_mqtt_link_context.client,
+                         g_mqtt_sub_topics[g_mqtt_sub_index],
+                         1U, mqtt_link_subscription_callback, NULL);
   }
 }
 
@@ -1494,34 +1506,29 @@ static void mqtt_link_incoming_data(void *argument,
 
 static void mqtt_link_subscribe_commands(void)
 {
-  err_t error = ERR_OK;
-  err_t last_err = ERR_OK;
+  /* Build topic array and start SUBACK-driven chain.
+     lwIP MQTT client only allows one outstanding subscribe at a time;
+     each SUBACK triggers the next subscribe via the callback. */
+  g_mqtt_sub_topics[0]  = g_mqtt_link_context.stats.topic_command_relay;
+  g_mqtt_sub_topics[1]  = g_mqtt_link_context.stats.topic_command_mask;
+  g_mqtt_sub_topics[2]  = g_mqtt_link_context.stats.topic_command_config_relay;
+  g_mqtt_sub_topics[3]  = g_mqtt_link_context.stats.topic_command_time;
+  g_mqtt_sub_topics[4]  = g_mqtt_link_context.stats.topic_command_auto_hold;
+  g_mqtt_sub_topics[5]  = g_mqtt_link_context.stats.topic_command_control;
+  g_mqtt_sub_topics[6]  = g_mqtt_link_context.stats.topic_command_scheduler_set;
+  g_mqtt_sub_topics[7]  = g_mqtt_link_context.stats.topic_command_scheduler_enabled;
+  g_mqtt_sub_topics[8]  = g_mqtt_link_context.stats.topic_command_scheduler_pause;
+  g_mqtt_sub_topics[9]  = g_mqtt_link_context.stats.topic_command_protection_force_stop;
+  g_mqtt_sub_topics[10] = g_mqtt_link_context.stats.topic_command_protection_unlock;
+  g_mqtt_sub_topics[11] = g_mqtt_link_context.stats.topic_command_protection_clear_learning;
+  g_mqtt_sub_count = 12U;
+  g_mqtt_sub_index = 0U;
 
-  /* Subscribe all topics independently — one failure does not stop the rest. */
-  #define MQTT_SUB(topic_field) do { \
-    err_t e = mqtt_subscribe(g_mqtt_link_context.client, \
-      g_mqtt_link_context.stats.topic_field, 1U, \
-      mqtt_link_subscription_callback, NULL); \
-    if (e != ERR_OK) { error = e; last_err = e; } \
-  } while(0)
-
-  MQTT_SUB(topic_command_relay);
-  MQTT_SUB(topic_command_mask);
-  MQTT_SUB(topic_command_config_relay);
-  MQTT_SUB(topic_command_time);
-  MQTT_SUB(topic_command_auto_hold);
-  MQTT_SUB(topic_command_control);
-  MQTT_SUB(topic_command_scheduler_set);
-  MQTT_SUB(topic_command_scheduler_enabled);
-  MQTT_SUB(topic_command_scheduler_pause);
-  MQTT_SUB(topic_command_protection_force_stop);
-  MQTT_SUB(topic_command_protection_unlock);
-  MQTT_SUB(topic_command_protection_clear_learning);
-  #undef MQTT_SUB
-
-  if (error != ERR_OK)
+  /* Kick off first subscribe — the rest chain via mqtt_link_subscription_callback */
+  if (mqtt_subscribe(g_mqtt_link_context.client, g_mqtt_sub_topics[0],
+                     1U, mqtt_link_subscription_callback, NULL) != ERR_OK)
   {
-    g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_SUBSCRIBE + (uint32_t)(-last_err);
+    g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_SUBSCRIBE;
   }
 }
 
