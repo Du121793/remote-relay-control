@@ -1328,9 +1328,16 @@ void device_config_runtime_relay_mask_set(uint32_t relay_mask)
 
   if (new_saved_mask != g_device_config.saved_relay_mask)
   {
+    uint32_t old_mask = g_device_config.saved_relay_mask;
+    uint32_t added = new_saved_mask & ~old_mask;     /* relays turned ON */
+    uint32_t removed = old_mask & ~new_saved_mask;    /* relays turned OFF */
     g_device_config.saved_relay_mask = new_saved_mask;
     g_device_config_runtime_dirty = 1U;
-    g_device_config_runtime_due_ms = HAL_GetTick() + DEVICE_CONFIG_RUNTIME_SAVE_DELAY_MS;
+    /* ON=60s debounce, OFF=10s.  If both happen, use 10s (safer). */
+    if (removed != 0U || added == 0U)
+      g_device_config_runtime_due_ms = HAL_GetTick() + 10000U;
+    else
+      g_device_config_runtime_due_ms = HAL_GetTick() + 60000U;
   }
   taskEXIT_CRITICAL();
 }
