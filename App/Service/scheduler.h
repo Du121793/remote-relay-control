@@ -67,12 +67,18 @@ typedef enum {
 void scheduler_init(void);
 void scheduler_tick(uint32_t monotonic_ms, uint32_t unix_time, uint8_t time_valid);
 
-/* State access for HTTP API — raw pointers (use with care, hold briefly) */
-channel_scheduler_state_t *scheduler_get_state(uint8_t channel);
-weekly_schedule_t         *scheduler_get_weekly(uint8_t channel);
-/* Safe snapshot accessors — return copies for consistent reads */
+/* State access — const pointers for reads, snapshot for long-lived access */
+const channel_scheduler_state_t *scheduler_get_state(uint8_t channel);
+const weekly_schedule_t         *scheduler_get_weekly(uint8_t channel);
 uint8_t scheduler_get_state_copy(uint8_t channel, channel_scheduler_state_t *dst);
 uint8_t scheduler_get_weekly_copy(uint8_t channel, weekly_schedule_t *dst);
+
+/* State modifiers — REQUIRED for writes (raw pointer writes blocked by const) */
+uint8_t scheduler_set_enabled(uint8_t channel, uint8_t enabled);
+uint8_t scheduler_set_pause(uint8_t channel, uint32_t pause_until, uint8_t pause_blocks);
+uint8_t scheduler_set_weekly_day(uint8_t channel, uint8_t weekday, const daily_schedule_t *day);
+uint8_t scheduler_copy_weekly_day(uint8_t channel, uint8_t src_weekday, const uint8_t *target_wds, uint8_t count);
+void    scheduler_clear_pause(uint8_t channel);
 
 /* Auto Hold command from backend */
 typedef struct {

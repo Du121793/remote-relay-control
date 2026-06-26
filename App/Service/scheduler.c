@@ -255,19 +255,7 @@ void scheduler_save_weekly_to_flash(void)
     }
 }
 
-/* ── state access ── */
-channel_scheduler_state_t *scheduler_get_state(uint8_t channel)
-{
-    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
-    return &g_scheduler_state[channel - 1];
-}
-
-weekly_schedule_t *scheduler_get_weekly(uint8_t channel)
-{
-    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
-    return &g_weekly_schedule[channel - 1];
-}
-
+/* ── state access (snapshot-only, no raw pointers exposed) ── */
 uint8_t scheduler_get_state_copy(uint8_t channel, channel_scheduler_state_t *dst)
 {
     if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT || dst == NULL) return 0U;
@@ -283,6 +271,69 @@ uint8_t scheduler_get_weekly_copy(uint8_t channel, weekly_schedule_t *dst)
     taskENTER_CRITICAL();
     *dst = g_weekly_schedule[channel - 1];
     taskEXIT_CRITICAL();
+    return 1U;
+}
+
+/* ── state modifiers (use internally to write; public getters return const) ── */
+const channel_scheduler_state_t *scheduler_get_state(uint8_t channel)
+{
+    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
+    return (const channel_scheduler_state_t *)&g_scheduler_state[channel - 1];
+}
+const weekly_schedule_t *scheduler_get_weekly(uint8_t channel)
+{
+    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
+    return (const weekly_schedule_t *)&g_weekly_schedule[channel - 1];
+}
+/* Internal non-const accessors — used by setter functions and scheduler internals */
+static channel_scheduler_state_t *sched_state_mut(uint8_t channel) {
+    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
+    return &g_scheduler_state[channel - 1];
+}
+static weekly_schedule_t *sched_weekly_mut(uint8_t channel) {
+    if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
+    return &g_weekly_schedule[channel - 1];
+}
+
+uint8_t scheduler_set_enabled(uint8_t channel, uint8_t enabled) {
+    channel_scheduler_state_t *st = sched_state_mut(channel);
+    if (!st) return 0U;
+    st->schedule_enabled = (enabled != 0U) ? 1U : 0U;
+    scheduler_mark_flash_dirty();
+    scheduler_mark_rtc_dirty();
+    return 1U;
+}
+uint8_t scheduler_set_pause(uint8_t channel, uint32_t pause_until, uint8_t pause_blocks) {
+    channel_scheduler_state_t *st = sched_state_mut(channel);
+    if (!st) return 0U;
+    st->schedule_pause_until = pause_until;
+    st->pause_blocks_auto_trigger = (pause_blocks != 0U) ? 1U : 0U;
+    scheduler_mark_rtc_dirty();
+    return 1U;
+}
+void scheduler_clear_pause(uint8_t channel) {
+    channel_scheduler_state_t *st = sched_state_mut(channel);
+    if (!st) return;
+    st->schedule_pause_until = 0U;
+    st->pause_blocks_auto_trigger = 0U;
+    scheduler_mark_rtc_dirty();
+}
+uint8_t scheduler_set_weekly_day(uint8_t channel, uint8_t weekday, const daily_schedule_t *day) {
+    weekly_schedule_t *ws = sched_weekly_mut(channel);
+    if (!ws || weekday > 6 || !day) return 0U;
+    ws->days[weekday] = *day;
+    scheduler_mark_flash_dirty();
+    return 1U;
+}
+uint8_t scheduler_copy_weekly_day(uint8_t channel, uint8_t src_wd, const uint8_t *target_wds, uint8_t count) {
+    weekly_schedule_t *ws = sched_weekly_mut(channel);
+    if (!ws || src_wd > 6 || !target_wds || count == 0 || count > 7) return 0U;
+    daily_schedule_t src = ws->days[src_wd];
+    for (uint8_t i = 0; i < count; i++) {
+        uint8_t tw = target_wds[i];
+        if (tw <= 6) ws->days[tw] = src;
+    }
+    scheduler_mark_flash_dirty();
     return 1U;
 }
 

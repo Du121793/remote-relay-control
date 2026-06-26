@@ -1335,7 +1335,7 @@ static void mqtt_link_process_command(void)
       new_day.intervals[k].start_minute = (uint16_t)sv;
       new_day.intervals[k].end_minute = (uint16_t)ev;
     }
-    ws->days[(uint8_t)sch_weekday] = new_day;
+    scheduler_set_weekly_day((uint8_t)sch_ch, (uint8_t)sch_weekday, &new_day);
       scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;
@@ -1347,7 +1347,7 @@ static void mqtt_link_process_command(void)
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &sch_en_ch);
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "enabled", &sch_enabled);
     channel_scheduler_state_t *st = scheduler_get_state((uint8_t)sch_en_ch);
-    if (st) { st->schedule_enabled = (uint8_t)(sch_enabled ? 1 : 0); }
+    scheduler_set_enabled((uint8_t)sch_en_ch, (uint8_t)(sch_enabled ? 1 : 0));
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
       scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
     return;
@@ -1365,13 +1365,17 @@ static void mqtt_link_process_command(void)
     if (st) {
       uint8_t tv; uint32_t now_unix = cluster_service_get_unix_time(&tv);
       switch (sp_mode) {
-        case 0: st->schedule_pause_until = now_unix + 60; break;
-        case 1: st->schedule_pause_until = now_unix + sp_dur; break;
-        case 2: st->schedule_pause_until = sp_until; break;
-        case 3: st->schedule_pause_until = SCHEDULER_PAUSE_FOREVER; break;
-        default: st->schedule_pause_until = now_unix + 60; break;
+      uint32_t sp_pause_until;
+      switch (sp_mode) {
+        case 0: sp_pause_until = now_unix + 60; break;
+        case 1: sp_pause_until = now_unix + sp_dur; break;
+        case 2: sp_pause_until = sp_until; break;
+        case 3: sp_pause_until = SCHEDULER_PAUSE_FOREVER; break;
+        default: sp_pause_until = now_unix + 60; break;
       }
-      st->pause_blocks_auto_trigger = (uint8_t)(sp_blocks ? 1 : 0);
+      scheduler_set_pause((uint8_t)sp_ch, sp_pause_until, (uint8_t)(sp_blocks ? 1 : 0));
+      mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+      return;
       scheduler_mark_rtc_dirty();
     }
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
