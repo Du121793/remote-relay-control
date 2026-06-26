@@ -698,8 +698,6 @@ uint8_t device_config_update_and_save(const device_config_t *config)
 
   taskENTER_CRITICAL();
   unchanged = (memcmp(&g_device_config, &normalized, sizeof(normalized)) == 0) ? 1U : 0U;
-  g_device_config = normalized;
-  request.config = g_device_config;
   taskEXIT_CRITICAL();
 
   if (unchanged != 0U)
@@ -708,12 +706,22 @@ uint8_t device_config_update_and_save(const device_config_t *config)
     return 1U;
   }
 
+  /* Pass normalized config directly to worker — do NOT update g_device_config
+     until Flash save succeeds.  If Flash fails, RAM stays intact. */
+  request.config = normalized;
+
   if ((g_device_config_queue == NULL) ||
       (g_device_config_task_handle == NULL) ||
       (g_device_config_save_mutex == NULL) ||
       (xTaskGetSchedulerState() != taskSCHEDULER_RUNNING))
   {
     saved = device_config_save_direct(&request.config);
+    if (saved != 0U) {
+      taskENTER_CRITICAL();
+      g_device_config = request.config;
+      g_device_config.config_crc32 = device_config_compute_crc32(&g_device_config);
+      taskEXIT_CRITICAL();
+    }
     if (mutex_held != 0U) (void)xSemaphoreGive(g_device_config_save_mutex);
     return saved;
   }
@@ -1157,7 +1165,16 @@ static void device_config_worker_task(void *argument)
     {
       if (request.result != NULL)
       {
-        *request.result = device_config_save_direct(&request.config);
+        uint8_t saved = device_config_save_direct(&request.config);
+        *request.result = saved;
+        /* Only sync RAM after Flash succeeds — prevents RAM/Flash mismatch */
+        if (saved != 0U)
+        {
+          taskENTER_CRITICAL();
+          g_device_config = request.config;
+          g_device_config.config_crc32 = device_config_compute_crc32(&g_device_config);
+          taskEXIT_CRITICAL();
+        }
       }
 
       if (request.waiting_task != NULL)
