@@ -1078,7 +1078,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
      fault (CFSR=0x00000400).  The HAL flash helpers do not guarantee
      full interrupt masking for the complete operation window. */
   flash_storage_lock();
-  { uint32_t _primask = __get_PRIMASK(); __disable_irq();
+  __disable_irq();
 
   HAL_FLASH_Unlock();
   __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
@@ -1088,7 +1088,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   {
     HAL_FLASH_Lock();
     flash_storage_unlock();
-    if (_primask == 0U) __enable_irq(); }
+    __enable_irq();
     return 0U;
   }
 
@@ -1107,7 +1107,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
                             hdr32[hdr_offset / sizeof(uint32_t)]) != HAL_OK)
       {
         g_device_config_last_flash_error = HAL_FLASH_GetError();
-        HAL_FLASH_Lock(); flash_storage_unlock(); if (_primask == 0U) __enable_irq(); }
+        HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
         return 0U;
       }
     }
@@ -1120,7 +1120,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
                           src32[offset / sizeof(uint32_t)]) != HAL_OK)
     {
       g_device_config_last_flash_error = HAL_FLASH_GetError();
-      HAL_FLASH_Lock(); flash_storage_unlock(); if (_primask == 0U) __enable_irq(); }
+      HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
       return 0U;
     }
   }
@@ -1129,7 +1129,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   if (memcmp((const void *)(save_addr + sizeof(device_config_slot_header_t)),
              &temp, sizeof(temp)) != 0)
   {
-    HAL_FLASH_Lock(); flash_storage_unlock(); if (_primask == 0U) __enable_irq(); }
+    HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
     return 0U;
   }
 
@@ -1141,7 +1141,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
                           commit_word) != HAL_OK)
     {
       g_device_config_last_flash_error = HAL_FLASH_GetError();
-      HAL_FLASH_Lock(); flash_storage_unlock(); if (_primask == 0U) __enable_irq(); }
+      HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
       return 0U;
     }
     g_device_config_active_slot = save_slot;
@@ -1149,7 +1149,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
 
   HAL_FLASH_Lock();
   flash_storage_unlock();
-  if (_primask == 0U) __enable_irq(); }
+  __enable_irq();
   return 1U;
 }
 
@@ -1208,7 +1208,10 @@ static void device_config_worker_init(void)
       xSemaphoreCreateMutexStatic(&g_device_config_save_mutex_buffer);
   }
   if (g_flash_storage_mutex == NULL)
-    g_flash_storage_mutex = xSemaphoreCreateMutexStatic(&g_flash_storage_mutex_buffer);
+  {
+    g_flash_storage_mutex =
+      xSemaphoreCreateMutexStatic(&g_flash_storage_mutex_buffer);
+  }
   if ((g_device_config_queue != NULL) &&
       (g_device_config_save_mutex != NULL) &&
       (g_device_config_task_handle == NULL))
@@ -1325,16 +1328,9 @@ void device_config_runtime_relay_mask_set(uint32_t relay_mask)
 
   if (new_saved_mask != g_device_config.saved_relay_mask)
   {
-    uint32_t old_mask = g_device_config.saved_relay_mask;
-    uint32_t added = new_saved_mask & ~old_mask;     /* relays turned ON */
-    uint32_t removed = old_mask & ~new_saved_mask;    /* relays turned OFF */
     g_device_config.saved_relay_mask = new_saved_mask;
     g_device_config_runtime_dirty = 1U;
-    /* ON=60s debounce, OFF=10s.  If both happen, use 10s (safer). */
-    if (removed != 0U || added == 0U)
-      g_device_config_runtime_due_ms = HAL_GetTick() + 10000U;
-    else
-      g_device_config_runtime_due_ms = HAL_GetTick() + 60000U;
+    g_device_config_runtime_due_ms = HAL_GetTick() + DEVICE_CONFIG_RUNTIME_SAVE_DELAY_MS;
   }
   taskEXIT_CRITICAL();
 }
@@ -1376,21 +1372,20 @@ void device_config_poll(void)
 
 UBaseType_t device_config_stack_high_water(void) { if (g_device_config_task_handle == NULL) return 0; return uxTaskGetStackHighWaterMark(g_device_config_task_handle); }
 
-
-
 void flash_storage_lock(void)
 {
-  if (g_flash_storage_mutex == NULL) {
-    g_flash_storage_mutex = xSemaphoreCreateMutexStatic(&g_flash_storage_mutex_buffer);
-  }
-  if (g_flash_storage_mutex != NULL && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+  if (g_flash_storage_mutex != NULL &&
+      xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
+  {
     (void)xSemaphoreTake(g_flash_storage_mutex, portMAX_DELAY);
   }
 }
 
 void flash_storage_unlock(void)
 {
-  if (g_flash_storage_mutex != NULL && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+  if (g_flash_storage_mutex != NULL &&
+      xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
+  {
     (void)xSemaphoreGive(g_flash_storage_mutex);
   }
 }

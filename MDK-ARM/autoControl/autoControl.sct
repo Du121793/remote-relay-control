@@ -1,27 +1,24 @@
 ; *************************************************************
 ; *** autoControl Flash Layout — IROM limited to 768KB
 ; *** Code:  0x08000000–0x080BFFFF (sectors 0–6)
-; *** Reserved for persistence:
-; ***   Single-bank: sectors 7–11 (0x080E0000–0x081FFFFF)
-; ***   Dual-bank:   sectors 21–23 (0x081A0000–0x081FFFFF)
-; *** SRAM: DTCM 128KB + SRAM1 368KB + SRAM2 16KB
+; *** Reserved: sectors 7–11 (single-bank) / 21–23 (dual-bank)
 ; *************************************************************
 
-LR_IROM1 0x08000000 0x000C0000  {    ; 768KB — stops before sector 7
+LR_IROM1 0x08000000 0x000C0000  {
   ER_IROM1 0x08000000 0x000C0000  {
    *.o (RESET, +First)
    *(InRoot$$Sections)
    .ANY (+RO)
    .ANY (+XO)
   }
-  RW_DTCM 0x20000000 0x00020000  {  ; 128KB DTCM (CPU-only)
+  RW_DTCM 0x20000000 0x00020000  {
    startup_stm32f767xx.o (STACK, HEAP)
    heap_4.o (.bss.ucHeap)
   }
-  RW_SRAM1 0x20020000 0x0005C000  {  ; 368KB SRAM1
+  RW_SRAM1 0x20020000 0x0005C000  {
    .ANY (+RW +ZI)
   }
-  RW_SRAM2 0x2007C000 0x00004000  {  ; 16KB SRAM2 (ETH DMA)
+  RW_SRAM2 0x2007C000 0x00004000  {
    *(.ARM.__at_0x2007C000)
    *(.ARM.__at_0x2007C0A0)
    *(.ARM.__at_0x2007C200)
