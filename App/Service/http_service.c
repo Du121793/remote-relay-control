@@ -2829,7 +2829,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
         http_service_format_error_json(response_body, response_body_size, "schedule_overlap");
         return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
       }
-      scheduler_set_weekly_day((uint8_t)channel, (uint8_t)weekday, &new_day);
+      ws->days[(uint8_t)weekday] = new_day;
       scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
       return http_service_send_payload(connection, "200 OK", "application/json", response_body);
@@ -2874,7 +2874,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       http_service_extract_form_value(body, "enabled", &enabled);
       channel_scheduler_state_t *st = scheduler_get_state((uint8_t)channel);
       scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
-      scheduler_set_enabled((uint8_t)channel, (uint8_t)(enabled ? 1 : 0));
+      if (st) st->schedule_enabled = (uint8_t)(enabled ? 1 : 0);
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
       return http_service_send_payload(connection, "200 OK", "application/json", response_body);
     }
@@ -2893,21 +2893,25 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       }
       uint8_t tv;
       uint32_t now_unix = cluster_service_get_unix_time(&tv);
-	      uint32_t pause_until;
-	      switch (mode) {
-	        case 0: pause_until = now_unix + 60; break;
-	        case 1: pause_until = now_unix + dur; break;
-	        case 2: pause_until = until; break;
-	        case 3: pause_until = SCHEDULER_PAUSE_FOREVER; break;
-	        default: pause_until = now_unix + 60; break;
-	      }
-	      scheduler_set_pause((uint8_t)channel, pause_until, (uint8_t)(blocks ? 1 : 0));
+      switch (mode) {
+        case 0: st->schedule_pause_until = now_unix + 60; break;  /* current_segment_end simplified */
+        case 1: st->schedule_pause_until = now_unix + dur; break;
+        case 2: st->schedule_pause_until = until; break;
+        case 3: st->schedule_pause_until = SCHEDULER_PAUSE_FOREVER; break;
+        default: st->schedule_pause_until = now_unix + 60; break;
+      }
+      st->pause_blocks_auto_trigger = (uint8_t)(blocks ? 1 : 0);
       scheduler_mark_rtc_dirty();
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
       return http_service_send_payload(connection, "200 OK", "application/json", response_body);
     }
-	    if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/scheduler/resume") == 0)) {
-	      scheduler_clear_pause((uint8_t)channel);
+
+    /* ── 22.6 POST /api/relay/channels/:channel/scheduler/resume ── */
+    if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/scheduler/resume") == 0)) {
+      channel_scheduler_state_t *st = scheduler_get_state((uint8_t)channel);
+      if (st) {
+        st->schedule_pause_until = 0;
+      scheduler_mark_rtc_dirty();
         st->pause_blocks_auto_trigger = 0;
       }
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
