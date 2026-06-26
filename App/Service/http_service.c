@@ -2872,9 +2872,8 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     if ((strcmp(method, "PATCH") == 0) && (strcmp(rest, "/scheduler/enabled") == 0)) {
       uint32_t enabled = 0;
       http_service_extract_form_value(body, "enabled", &enabled);
-      channel_scheduler_state_t *st = scheduler_get_state((uint8_t)channel);
       scheduler_mark_flash_dirty(); scheduler_mark_rtc_dirty();
-      if (st) st->schedule_enabled = (uint8_t)(enabled ? 1 : 0);
+      scheduler_set_enabled((uint8_t)channel, (uint8_t)(enabled ? 1 : 0));
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
       return http_service_send_payload(connection, "200 OK", "application/json", response_body);
     }
