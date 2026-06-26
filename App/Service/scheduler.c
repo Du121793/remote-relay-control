@@ -211,6 +211,7 @@ void scheduler_save_weekly_to_flash(void)
       uint8_t write_ok = 1U;
 
       flash_storage_lock();
+      { uint32_t _primask = __get_PRIMASK(); __disable_irq();
       HAL_FLASH_Unlock();
 
       memset(&erase_init, 0, sizeof(erase_init));
@@ -243,6 +244,7 @@ void scheduler_save_weekly_to_flash(void)
         write_ok = 0U;
       }
       HAL_FLASH_Lock();
+      if (_primask == 0U) __enable_irq(); }
       flash_storage_unlock();
 
       /* Only clear dirty + update CRC on success */

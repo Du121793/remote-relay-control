@@ -1078,7 +1078,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
      fault (CFSR=0x00000400).  The HAL flash helpers do not guarantee
      full interrupt masking for the complete operation window. */
   flash_storage_lock();
-  __disable_irq();
+  { uint32_t _primask = __get_PRIMASK(); __disable_irq();
 
   HAL_FLASH_Unlock();
   __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
@@ -1088,7 +1088,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   {
     HAL_FLASH_Lock();
     flash_storage_unlock();
-    __enable_irq();
+    if (_primask == 0U) __enable_irq(); }
     return 0U;
   }
 
@@ -1107,7 +1107,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
                             hdr32[hdr_offset / sizeof(uint32_t)]) != HAL_OK)
       {
         g_device_config_last_flash_error = HAL_FLASH_GetError();
-        HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
+        HAL_FLASH_Lock(); flash_storage_unlock(); if (_primask == 0U) __enable_irq(); }
         return 0U;
       }
     }
@@ -1120,7 +1120,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
                           src32[offset / sizeof(uint32_t)]) != HAL_OK)
     {
       g_device_config_last_flash_error = HAL_FLASH_GetError();
-      HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
+      HAL_FLASH_Lock(); flash_storage_unlock(); if (_primask == 0U) __enable_irq(); }
       return 0U;
     }
   }
@@ -1129,7 +1129,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
   if (memcmp((const void *)(save_addr + sizeof(device_config_slot_header_t)),
              &temp, sizeof(temp)) != 0)
   {
-    HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
+    HAL_FLASH_Lock(); flash_storage_unlock(); if (_primask == 0U) __enable_irq(); }
     return 0U;
   }
 
@@ -1141,7 +1141,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
                           commit_word) != HAL_OK)
     {
       g_device_config_last_flash_error = HAL_FLASH_GetError();
-      HAL_FLASH_Lock(); flash_storage_unlock(); __enable_irq();
+      HAL_FLASH_Lock(); flash_storage_unlock(); if (_primask == 0U) __enable_irq(); }
       return 0U;
     }
     g_device_config_active_slot = save_slot;
@@ -1149,7 +1149,7 @@ static uint8_t device_config_save_direct(const device_config_t *config)
 
   HAL_FLASH_Lock();
   flash_storage_unlock();
-  __enable_irq();
+  if (_primask == 0U) __enable_irq(); }
   return 1U;
 }
 
