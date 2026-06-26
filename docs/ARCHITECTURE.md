@@ -1,314 +1,499 @@
 # autoControl 系統架構文件
 
-> 工業 IoT 電源控制節點 — STM32F767ZI + FreeRTOS + LwIP + MQTT TLS-PSK
+> 工業 IoT 繼電器控制 — STM32F767ZI + FreeRTOS + lwIP + MQTT TLS-PSK  
+> Branch: `feature/scheduler-v4` | Updated: 2026-06-26
 
 ---
 
-## 1. 整體架構圖
+## 1. 系統架構總覽
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                       後端 VM (vm402)                                │
-│                                                                      │
-│  Browser ──HTTPS──► nginx (:80/:443)                                 │
-│                       │ /api/* → proxy                               │
-│                       │ /      → proxy (dashboard)                    │
-│                       ▼                                              │
-│  ┌──────────────────────────┐         ┌─────────────────┐           │
-│  │  server.js (:4300)       │  MQTT   │  mqtt-psk-broker.js      │           │
-│  │  • dashboard HTML        │◄───────►│  (:8883)        │           │
-│  │  • provisioning (HTTPS)  │ TLS-PSK │  PSK auth + ACL │           │
-│  │  • broker control API (HTTP)           │         │                 │           │
-│  │  • key management        │         └─────────────────┘           │
-│  └──────────────────────────┘                                        │
-└──────────────────────────────────────────────────────────────────────┘
-                                    │
-                              MQTT TLS-PSK
-                              Internet (直連)
-                                    │
-┌───────────────────────────────────┼──────────────────────────────────┐
-│                        LAN (192.168.0.x)                             │
-│                                                                      │
-│  ┌──────────────────────┐    ┌──────────────────────┐               │
-│  │  MCU Master          │    │  MCU Member(s)       │               │
-│  │  HTTP :80            │◄──►│  HTTP :80            │               │
-│  │  UDP :40000          │    │  UDP :40000          │               │
-│  │  MQTT :8883 (唯一)   │    │                      │               │
-│  │                      │    │  (no MQTT — commands │               │
-│  │  config sync ────────┼───►│   forwarded by       │               │
-│  │  (AES-128-GCM)       │    │   master via LAN)    │               │
-│  └──────────────────────┘    └──────────────────────┘               │
-└──────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                       Cloudflare Tunnel                       │
+│  autocontrol.du1217.club :443 → VM:4300 (Backend HTTP)       │
+│  mqtt.autocontrol.du1217.club :8883 → VM:8883 (MQTT Broker)  │
+└──────────────────────────────────────────────────────────────┘
+          │                                    │
+          ▼                                    ▼
+┌─────────────────────┐            ┌─────────────────────────┐
+│    Backend Server    │            │    MQTT PSK Broker       │
+│   (server.js:4300)   │──HTTP:4301→│  (mqtt-psk-broker.js)   │
+│                      │            │      :8883 (TLS-PSK)     │
+│  • REST API          │            │      :4301 (Control API) │
+│  • Sensor Session    │            └─────────────────────────┘
+│  • Key Management    │                      │
+│  • Provisioning      │              MQTT TLS-PSK
+│  • Dashboard         │                      │
+└─────────────────────┘                      ▼
+                                   ┌─────────────────────────┐
+                                   │    MCU Cluster           │
+                                   │  ┌───────┐ ┌───────┐   │
+                                   │  │ 157   │ │ 245   │   │
+                                   │  │Member │ │Master │   │
+                                   │  └───────┘ └───────┘   │
+                                   │    UDP Discovery:40000   │
+                                   │    HTTP API:80           │
+                                   └─────────────────────────┘
 ```
 
 ---
 
-## 2. 通訊埠總覽
+## 2. 後端-MCU 通訊架構
 
-| Port | 協定 | 方向 | 用途 |
-|:----:|------|------|------|
-| 80 | HTTP | Browser → MCU | LAN 本機設定頁 / API |
-| 443 | HTTPS | MCU → Cloudflare → Backend | 憑證換發 (provisioning) |
-| 40000 | UDP | MCU ↔ MCU | Discovery / Announce |
-| 8883 | MQTT TLS-PSK | MCU ↔ Broker | 後端即時通訊 |
-| 4300 | HTTP | localhost (nginx → server.js) | 後端 dashboard + API |
+### 2.1 命令下發 (Backend → MCU)
 
-> Raw TCP :42001 已退役。port 41000 TCP 僅保留診斷用途（寫入已鎖）。
+```
+┌──────────┐   HTTP POST    ┌──────────┐   MQTT Publish   ┌──────────┐
+│ Grafana  │ ──────────────→│ Backend  │ ────────────────→│  MQTT    │
+│ Webhook  │  /api/sensor/* │ Server   │  cluster/default  │  Broker  │
+└──────────┘                └──────────┘  /command/xxx     └──────────┘
+                                  │                              │
+                                  │                    MQTT Subscribe
+                                  │                              │
+                                  ▼                              ▼
+                          ┌──────────────┐            ┌──────────────────┐
+                          │  MCU (Master) │            │   MCU (Master)    │
+                          │  HTTP API:80  │            │  MQTT handler     │
+                          │  (direct)     │            │  → scheduler      │
+                          └──────────────┘            │  → control_queue   │
+                                                      │  → worker → GPIO   │
+                                                      └──────────────────┘
+```
+
+### 2.2 狀態上報 (MCU → Backend)
+
+```
+┌──────────┐   MQTT Publish   ┌──────────┐   HTTP Poll    ┌──────────┐
+│   MCU    │ ────────────────→│  MQTT    │ ←──────────── │ Backend  │
+│ (Master) │  cluster/default  │  Broker  │  /api/clients │ Server   │
+│          │  /status (2s)     │          │               │          │
+│          │  /events (5s)     │          │  sync         │          │
+│          │  /ack/{req_id}    │          │  knownNodes   │          │
+└──────────┘                  └──────────┘               └──────────┘
+```
+
+### 2.3 MQTT Topic 結構
+
+| Topic | 方向 | QoS | 用途 |
+|------|------|:---:|------|
+| `cluster/{id}/status` | MCU→Broker | 0 | 設備狀態 (retained, 2s) |
+| `cluster/{id}/events` | MCU→Broker | 0 | Hello/Heartbeat (5s) |
+| `cluster/{id}/command/relay` | Broker→MCU | 1 | Relay 控制 |
+| `cluster/{id}/command/mask` | Broker→MCU | 1 | Relay mask |
+| `cluster/{id}/command/config/relay` | Broker→MCU | 1 | Relay 設定 |
+| `cluster/{id}/command/time` | Broker→MCU | 1 | 時間同步 |
+| `cluster/{id}/command/auto-hold` | Broker→MCU | 1 | Auto Hold |
+| `cluster/{id}/command/control` | Broker→MCU | 1 | 手動控制 |
+| `cluster/{id}/command/scheduler/set` | Broker→MCU | 1 | 排程設定 |
+| `cluster/{id}/command/scheduler/enabled` | Broker→MCU | 1 | 排程啟用 |
+| `cluster/{id}/command/scheduler/pause` | Broker→MCU | 1 | 暫停排程 |
+| `cluster/{id}/command/protection/force-stop` | Broker→MCU | 1 | 強制停止 |
+| `cluster/{id}/command/protection/unlock` | Broker→MCU | 1 | 解鎖保護 |
+| `cluster/{id}/command/protection/clear-learning` | Broker→MCU | 1 | 清除學習 |
+| `cluster/{id}/ack/{request_id}` | MCU→Broker | 0 | 命令確認 |
 
 ---
 
-## 3. 雙路徑通訊
+## 3. MCU-MCU 叢集通訊架構
 
-### 路徑 A — HTTPS 憑證換發（一次性）
-
-```
-MCU ──HTTPS──► Cloudflare ──► nginx ──► server.js (:4300)
-                  │                        POST /api/provision
-                  │                        { cluster_id, device_id, fingerprint }
-                  │                        ▼
-                  │                      server.js 驗證 → 產生 binding_secret
-                  │                        ▼
-                  ◄── { binding_secret, ca_cert_pem, provisioning_revision }
-```
-
-MCU 收到後存入 Flash，binding_secret 作為 MQTT PSK 的原料。
-
-### 路徑 B — MQTT TLS-PSK 即時通訊
+### 3.1 發現與選舉流程
 
 ```
-MCU (master only) ──MQTT TLS-PSK──► mqtt-psk-broker.js (:8883)
-  │                                   │
-  ├─ PUBLISH:                        ├─ 轉發給 subscribe 的 client
-  │   cluster/{id}/status            │   (server.js or other MCU)
-  │   cluster/{id}/events
-  │   cluster/{id}/measure
+┌──────────┐                          ┌──────────┐
+│ MCU 157  │                          │ MCU 245  │
+│ Member   │                          │ Master   │
+└────┬─────┘                          └────┬─────┘
+     │                                     │
+     │  UDP Multicast 239.255.42.99:40000  │
+     │◄──────────announce (2s)───────────►│
+     │                                     │
+     │  Announce Payload (v7, ~643 bytes): │
+     │  • service="autoControl"            │
+     │  • cluster_name, device_name        │
+     │  • node_id, role, term              │
+     │  • auth_tag (HMAC-SHA256)           │
+     │  • load_score, relay_mask           │
+     │  • ADC data, time info              │
+     │  • cloud_cluster/device/key_id      │
+     │  • MAC address, IP, port            │
+     │                                     │
+     ▼                                     ▼
+┌──────────────┐                    ┌──────────────┐
+│ Discovery    │                    │ Discovery    │
+│ Service      │                    │ Service      │
+│              │                    │              │
+│ parse → save │                    │ parse → save │
+│ → election   │                    │ → election   │
+└──────────────┘                    └──────────────┘
+     │                                     │
+     ▼                                     ▼
+  Role: Member                        Role: Master
+  master_node_id=1165657530           master_node_id=1165657530
+  term=2                              term=2
+```
+
+### 3.2 選舉規則
+
+```
+cluster_service_run_election():
+  1. 收到 announce → cluster_service_note_remote_node() → 立即 run_election()
+  2. 比較所有 node (含自己):
+     a. 找 role=CLUSTER_ROLE_MASTER 的遠端 node
+     b. 最高 term 者為 master candidate
+     c. 同 term 時，最低 node_id 為 master candidate
+  3. 若自己為 candidate: term = max_seen_term + 1, role = MASTER
+  4. 若遠端為 candidate: term = candidate.term, role = MEMBER
+  5. Master switch delay: CLUSTER_SERVICE_MASTER_SWITCH_DELAY_MS = 2.5s
+  6. Self-promotion delay: STARTUP=4s, FAILOVER=3s
+```
+
+### 3.3 時間同步
+
+```
+時間優先序:
+  1. MQTT Broker time (server-time command)
+  2. NTP (pool.ntp.org)
+  3. Backend time sync
+  4. Cluster Master announce
+
+Master 取得時間 → announce 含 unix_time + time_valid=1
+  → Member: cluster_service_set_unix_time(announce.unix_time,
+                                          CLUSTER_TIME_SOURCE_MASTER)
+  → RTC signature 寫入 DR7 供斷電後恢復
+```
+
+---
+
+## 4. 安全保護策略
+
+### 4.1 控制優先權
+
+```
+1. 安全保護 (最高)
+   ├─ 30A 硬體上限
+   ├─ ADC 飽和
+   ├─ Relay 黏住
+   ├─ 強制停止 (API)
+   └─ 故障鎖定
+
+2. 使用者手動控制
+   └─ 清除 Auto Hold + 設定 pause
+
+3. Pause + pause_blocks_auto_trigger
+   └─ 使用者禁止 Backend Auto Hold
+
+4. Backend Auto Hold
+   └─ 感測器短期控制租約 (≤1800s)
+
+5. Scheduler
+   └─ 每週排程 ON/OFF (最低優先)
+```
+
+### 4.2 保護觸發條件
+
+| 保護 | 條件 | 行為 | 恢復 |
+|------|------|------|------|
+| **30A Hard Limit** | mA ≥ 30000 | 立即鎖定 | 手動解鎖 |
+| **ADC Saturation** | CT saturated | 立即鎖定 | 手動解鎖 |
+| **Relay Stuck** | OFF 後 current > noise×3 (5s) | 鎖定 | 手動解鎖 |
+| **Fast OC** | mA > baseline × 2.0 | 300ms 跳脫+鎖定 | 手動解鎖 |
+| **Slow OC** | mA > baseline × 1.5 (3s) | 跳脫+鎖定 | 手動解鎖 |
+| **OC Warning** | mA > baseline × 1.25 (4s) | 僅告警 | 自動 |
+| **Under Current** | mA < ref/2 (5s) | 跳脫 | 視策略 |
+| **Startup Fail** | startup 5s 內 mA≈0 | 跳脫 | 可重試 |
+| **Startup Peak** | startup peak > history × 1.5 | 立即跳脫 | 可重試 |
+| **Force Stop** | API 命令 | 立即 OFF+鎖定 | 手動解鎖 |
+
+### 4.3 保護策略 (per-channel)
+
+| Strategy | Mode | OC | UC | Stuck |
+|------|------|:---:|:---:|:---:|
+| **Default (0)** | Safety | Trip+Lock | Trip | Lock |
+| **Continuity (1)** | Gentle | Trip | Warn Only | Lock |
+
+### 4.4 控制鏈
+
+```
+任何來源 (User / Scheduler / Auto Hold)
   │
-  └─ SUBSCRIBE:
-      cluster/{id}/command/relay        ← 後端 → MCU 單路控制
-      cluster/{id}/command/mask         ← 後端 → MCU 全路控制
-      cluster/{id}/command/config/relay ← 後端 → MCU relay 設定
-      cluster/{id}/command/time         ← 後端 → MCU 時間同步
-      cluster/{id}/command/auto-hold    ← 後端感測器 Auto Hold
-      cluster/{id}/command/control      ← 後端使用者控制
-      cluster/{id}/command/scheduler/*  ← 後端排程控制
-      cluster/{id}/command/protection/* ← 後端安全保護
+  ▼
+request_relay(channel, target)
+  │
+  ▼
+control_queue_submit_async()
+  │
+  ▼
+relay_protection_check(channel, target)
+  ├─ fault_locked?       → REJECT (最高優先)
+  ├─ cooldown_active?    → REJECT
+  ├─ force_stop?         → REJECT
+  ├─ stuck_detected?     → REJECT
+  └─ overcurrent?        → auto-OFF + lock
+  │
+  ▼ (OK)
+worker → GPIO write
 ```
 
----
+### 4.5 全域保護參數
 
-## 4. 安全模型
-
-### 4.1 認證方式
-
-| 路徑 | 方式 | 說明 |
+| 參數 | 預設 | 說明 |
 |------|------|------|
-| MCU → Broker | TLS-PSK | PSK = base64url_decode(binding_secret)，256-bit |
-| server.js → Broker | TLS-PSK | 獨立 PSK (`BACKEND_PSK_HEX`)，broker ACL 授權 |
-| Browser → Backend | HTTPS | Cloudflare TLS 憑證 |
-| MCU → Cloudflare | HTTPS | CA 根憑證驗證（mbedTLS） |
-| MCU ↔ MCU | HMAC-SHA256 + anti-replay | 叢集認證，±30s 時間窗 |
-| Browser → MCU | Session Token | HTTP `X-Auth-Token` header |
-
-### 4.2 金鑰生命週期
-
-```
-1. 用戶在後端 dashboard 產生金鑰 (server.js)
-2. 用戶手動複製 binding_secret → 貼入 MCU HTTP 設定頁
-   或 MCU 透過 HTTPS provisioning 自動取得
-3. binding_secret 存入 MCU Flash（不經網路傳送）
-4. PSK 可由後端觸發輪替 (rotate-psk)
-5. CA 根憑證由後端簽發，MCU 儲存驗證 broker 證書鏈
-```
-
-### 4.3 密碼儲存
-
-| 項目 | 演算法 | 儲存位置 |
-|------|--------|----------|
-| 叢集密碼 | SHA-256 | Flash device_config |
-| binding_secret | 256-bit base64url | Flash device_config |
-| CA 根憑證 | PEM ≤ 2KB | Flash device_config |
-| Discovery auth_tag | HMAC-SHA256 | 每次計算（含 timestamp） |
-| Config sync | AES-128-GCM | cluster_password 前 16 bytes 為 key |
+| `cooldown_seconds` | 3 | 故障後冷卻時間 |
+| `retry_delay_seconds` | 30 | 重試延遲 |
+| `max_retry_count` | 1 | 最大重試次數 |
+| `boot_delay_seconds` | 30 | 開機延遲 |
+| `learning_samples` | 100 | CT 學習樣本數 |
+| `aging_update_hours` | 24 | Aging 更新間隔 |
+| `aging_cap_percent` | 20 | Aging 上限 |
+| `stall_multiplier_x10` | 15 | Stall 判斷倍率 (×1.5) |
 
 ---
 
-## 5. 控制路徑
+## 5. Backend API 完整參考
 
-### 5.1 Dashboard → MCU（直接 HTTP）
+**Base:** `https://autocontrol.du1217.club`
 
+### 5.1 核心狀態
+
+| Method | Path | Auth | 說明 |
+|------|------|:---:|------|
+| GET | `/` | - | Dashboard HTML |
+| GET | `/api/summary` | - | 系統摘要 |
+| GET | `/events` | - | 事件串流 (SSE) |
+
+### 5.2 Key 管理
+
+| Method | Path | Body | 說明 |
+|------|------|------|------|
+| GET | `/api/keys` | - | 列出全部 keys |
+| POST | `/api/keys` | `{label, key}` | 新增 key |
+| PATCH | `/api/keys/:id` | `{label?, enabled?}` | 更新 key |
+| DELETE | `/api/keys/:id` | - | 刪除 key |
+
+### 5.3 叢集與設備
+
+| Method | Path | 說明 |
+|------|------|------|
+| GET | `/api/known-nodes` | 已知節點清單 |
+| GET | `/api/clients` | MQTT 客戶端清單 |
+| GET | `/api/cloud/devices` | 雲端設備清單 |
+| POST | `/api/cloud/devices` | 註冊新設備 |
+| PATCH | `/api/cloud/devices/:cid/:did` | 更新設備 |
+| POST | `/api/cloud/devices/from-node` | 從 MCU node 同步設備 |
+| GET | `/api/cloud/clusters` | 叢集清單 |
+| POST | `/api/cloud/clusters` | 建立叢集 |
+| PATCH | `/api/cloud/clusters/:id` | 更新叢集 |
+
+### 5.4 Provisioning 與憑證
+
+| Method | Path | 說明 |
+|------|------|------|
+| GET | `/api/cloud/clusters/:id/provision` | 取得 provisioning data |
+| POST | `/api/cloud/clusters/:id/rotate-ca` | 輪換 CA 憑證 |
+| POST | `/api/cloud/clusters/:id/rotate-psk` | 輪換 PSK 密鑰 |
+| POST | `/api/cloud/clusters/:id/apply-online` | 套用線上設定 |
+| POST | `/api/cloud/apply/:nodeId` | 對指定 node 套用設定 |
+| POST | `/api/provision` | MCU HTTPS provisioning |
+| POST | `/api/devices/:deviceId/claim` | 宣告設備所有權 |
+| GET | `/api/cloud/devices/:cid/:did/provision` | 設備 provisioning 狀態 |
+| POST | `/api/cloud/devices/:cid/:did/rotate-credential` | 輪換設備憑證 |
+
+### 5.5 MCU 命令轉發 (MQTT)
+
+| Method | Path | Body | 說明 |
+|------|------|------|------|
+| POST | `/send/:nodeId/relay` | `{channel, value}` | 單路 Relay ON/OFF |
+| POST | `/send/:nodeId/mask` | `{mask}` | 全部 Relay mask |
+| POST | `/send/:nodeId/all` | `{value}` | 全部 Relay 同值 |
+| POST | `/send/:nodeId/auto-hold` | `{channel, target, duration_seconds, session, command_ts, reason}` | Auto Hold |
+| POST | `/send/:nodeId/control` | `{channel, target, pause_mode, pause_duration_seconds?, pause_until?, pause_blocks_auto_trigger?}` | 手動控制 |
+| POST | `/send/:nodeId/scheduler/set` | `{channel, weekday, count, s0..s7, e0..e7}` | 排程設定 |
+| POST | `/send/:nodeId/scheduler/enabled` | `{channel, enabled}` | 排程啟用/關閉 |
+| POST | `/send/:nodeId/scheduler/pause` | `{channel, mode, duration_seconds?, until?, pause_blocks_auto_trigger?}` | 暫停排程 |
+| POST | `/send/:nodeId/scheduler/resume` | `{channel}` | 恢復排程 |
+| POST | `/send/:nodeId/protection/force-stop` | `{channel}` | 強制停止 |
+| POST | `/send/:nodeId/protection/unlock` | `{channel}` | 解鎖保護 |
+| POST | `/send/:nodeId/protection/clear-learning` | `{channel}` | 清除 CT 學習 |
+
+### 5.6 MCU 設定讀取 (HTTP Proxy)
+
+| Method | Path | 說明 |
+|------|------|------|
+| GET | `/api/config/:nodeId/relays` | 讀取 relay 組態 |
+| POST | `/api/config/:nodeId/device-name` | 設定裝置名稱 |
+| POST | `/api/config/:nodeId/relay` | 設定單路 relay |
+
+### 5.7 感測器 Auto Hold API ★
+
+| Method | Path | Body | 說明 |
+|------|------|------|------|
+| POST | `/api/sensor/alert` | `{channel, target, duration_seconds, reason, cluster_id?, device_id?, node_id?}` | 感測器告警 → 建立/續約 Auto Hold |
+| POST | `/api/sensor/recover` | `{channel, cluster_id?, device_id?}` | 感測器恢復 → 結束 Auto Hold |
+| GET | `/api/sensor/status` | - | 查詢所有 active 感測器 session |
+
+**Alert 流程:**
 ```
-Browser dashboard
-  │ POST /api/relay/channels/:ch/auto-hold
-  │ Content-Type: application/x-www-form-urlencoded
-  ▼
-MCU HTTP API (:80)
-  │ scheduler_handle_auto_hold()
-  ▼
-control_queue → relay_protection → GPIO
+POST /api/sensor/alert { channel:3, target:1, duration_seconds:600, reason:"..." }
+  → 後端: 產生 session, command_ts, 解析 target node
+  → MQTT → MCU: scheduler_handle_auto_hold()
+  → MCU: auto_hold_active=1, Scheduler 暫停干預
+  → 續約節流: 新告警 AND ≥5min 才重送 MQTT
+  ← { ok:true, session:4210395328, mqtt:"sent", is_new_session:true }
 ```
 
-### 5.2 Backend → MCU（MQTT）
-
+**Recover 流程:**
 ```
-server.js
-  │ mqttPublishCommand(clusterName, "relay", payload)
-  ▼
-mqtt-psk-broker.js :8883
-  │ topic: cluster/{id}/command/relay
-  ▼
-MCU Master
-  │ mqtt_link_process_command()
-  ├─ target==self → 本地執行
-  └─ target!=self → control_queue_submit_remote_async() → LAN → Member
-```
-
-### 5.3 控制優先權
-
-```
-1. 安全保護（過流/黏住/冷卻/故障鎖定）— 最高，不可覆蓋
-2. 使用者手動控制（清 Auto Hold + 設 pause）
-3. pause_blocks_auto_trigger + pause 有效
-4. 後端感測器 Auto Hold
-5. 使用者暫停排程器
-6. 一般設備排程器
-```
-
----
-
-## 6. 部署
-
-### 6.1 VM 服務
-
-```bash
-cd /srv/project/autoControl
-
-# 1. 啟動 MQTT broker（TLS-PSK，port 8883）
-MQTT_PORT=8883 node mqtt-psk-broker.js &
-
-# 2. 啟動後端 server（dashboard + API，port 4300）
-#    server.js 透過 broker control API (:4301) 發送 MQTT 命令
-#    不需要自己持有 PSK，不需要 broker control API (HTTP)
-node server.js &
-```
-
-### 6.2 nginx 設定
-
-```nginx
-# /etc/nginx/sites-enabled/autocontrol.conf
-server {
-    listen 80;
-    listen 443 ssl;
-    server_name autocontrol.du1217.club;
-
-    ssl_certificate     /etc/nginx/ssl/autocontrol.pem;
-    ssl_certificate_key /etc/nginx/ssl/autocontrol.key;
-
-    location /api/ {
-        proxy_pass http://127.0.0.1:4300;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-    location / {
-        proxy_pass http://127.0.0.1:4300;
-        proxy_set_header Host $host;
-    }
-}
-```
-
-### 6.3 MCU 燒錄
-
-```bash
-# Keil CLI
-UV4.exe -b MDK-ARM\autoControl.uvprojx -j0
-UV4.exe -f MDK-ARM\autoControl.uvprojx -j0  # flash via ST-LINK
+POST /api/sensor/recover { channel:3 }
+  → 後端: MQTT duration_seconds=0 (同 session)
+  → MCU: auto_hold_clear() → 交回 Scheduler
+  ← { ok:true, cleared:true, session:4210395328 }
 ```
 
 ---
 
-## 7. API 文件
+## 6. MCU HTTP API 完整參考
 
-詳細 MCU HTTP API 請見 [MCU_API.md](./MCU_API.md)
+**Base:** `http://192.168.0.{157,245}:80`  
+**Auth:** `X-Auth-Token` header (from `POST /api/login`)
 
-### 7.1 後端 API
+### 6.1 認證
 
-| 路由 | 用途 |
+| Method | Path | Body | 說明 |
+|------|------|------|------|
+| POST | `/api/login` | `password=admin` | 取得 token |
+| POST | `/api/login` | `password=admin&scope=service&service_key=K` | Service scope |
+| POST | `/api/logout` | - | 登出 |
+| GET | `/api/session` | - | 檢查 session |
+
+### 6.2 Relay 控制
+
+| Method | Path | Body | Auth | 說明 |
+|------|------|------|:---:|------|
+| GET | `/api/relay` | - | - | 讀取 16 路狀態 |
+| POST | `/api/relay-channel` | `channel=N&value=0\|1` | ✅ | 單路 ON/OFF |
+| POST | `/api/relay-mask` | `mask=65535` | ✅ | 全部設定 |
+
+### 6.3 叢集
+
+| Method | Path | Body | Auth | 說明 |
+|------|------|------|:---:|------|
+| GET | `/api/cluster/nodes` | - | ✅ | 節點清單 |
+| POST | `/api/cluster/node-relay` | `node_id=X&channel=N&value=0\|1` | ✅ | 遠端控制 |
+| POST | `/api/cluster/kick` | `node_id=X` | ✅ | 踢除節點 |
+| POST | `/api/cluster/forget` | `node_id=X` | ✅ | 移除節點 |
+
+### 6.4 設定
+
+| Method | Path | Body | Auth | 說明 |
+|------|------|------|:---:|------|
+| GET | `/api/config/cluster` | - | ✅ | 叢集+cloud 設定 |
+| POST | `/api/config/cluster` | 多欄位 | ✅ | 更新設定 |
+| GET | `/api/config/relays` | - | ✅ | 全部 relay 設定 |
+| POST | `/api/config/relay` | `channel=N&name=X...` | ✅ | 單路 relay |
+
+### 6.5 安全保護
+
+| Method | Path | Body | Auth | 說明 |
+|------|------|------|:---:|------|
+| GET | `/api/protection` | - | ✅ | 16 路保護狀態 |
+| GET | `/api/config/protection` | - | ✅ | 全域保護參數 |
+| POST | `/api/config/protection` | 多欄位 | ✅ | 更新全域保護 |
+| POST | `/api/protection/strategy` | `channel=N&strategy=0\|1` | ✅ | 設定策略 |
+| POST | `/api/protection/force-stop` | `channel=N` | ✅ | 強制停止 |
+| POST | `/api/protection/clear-learning` | `channel=N` | ✅ | 清除學習 |
+| POST | `/api/protection/unlock` | `channel=N` | ✅ | 解鎖故障 |
+
+### 6.6 排程器
+
+| Method | Path | Body | Auth | 說明 |
+|------|------|------|:---:|------|
+| GET | `/api/relay/channels/:ch/schedule-week` | - | ✅ | 一週排程 |
+| PUT | `/api/relay/channels/:ch/schedule-week/:wd` | `count=N&s0=M&e0=N...` | ✅ | 覆寫某天 |
+| POST | `/api/relay/channels/:ch/schedule-week/:wd/copy` | `target_weekdays=1,2&mode=overwrite` | ✅ | 複製排程 |
+| PATCH | `/api/relay/channels/:ch/scheduler/enabled` | `enabled=0\|1` | ✅ | 啟用/關閉 |
+| POST | `/api/relay/channels/:ch/scheduler/pause` | `mode=0-3&duration_seconds=N&pause_blocks=0\|1` | ✅ | 暫停 |
+| POST | `/api/relay/channels/:ch/scheduler/resume` | - | ✅ | 恢復 |
+
+### 6.7 Auto Hold / 手動控制
+
+| Method | Path | Body | Auth | 說明 |
+|------|------|------|:---:|------|
+| POST | `/api/relay/channels/:ch/auto-hold` | `target=0\|1&duration_seconds=N&session=S&command_ts=T&reason=R` | ✅ | Auto Hold |
+| POST | `/api/relay/channels/:ch/control` | `target=0\|1&pause_mode=0-3&pause_duration_seconds=N&pause_blocks=0\|1` | ✅ | 手動控制 |
+| GET | `/api/relay/channels/:ch/scheduler/status` | - | ✅ | 完整狀態 |
+
+### 6.8 全域狀態
+
+| Method | Path | Auth | 說明 |
+|------|------|:---:|------|
+| GET | `/api/status` | - | 完整 JSON (cluster, adc, cloud, http, rtos, lwip...) |
+| GET | `/` | - | Web UI (68KB SPA) |
+
+---
+
+## 7. Flash 佈局
+
+| 區域 | Single-bank | Dual-bank | 用途 |
+|------|------|------|------|
+| Sector 7 | 0x080E0000 | - | Scheduler Flash |
+| Sector 21 | - | 0x081A0000 | Scheduler Flash |
+| Sector 10 | 0x08180000 | - | Config Slot A |
+| Sector 22 | - | 0x081C0000 | Config Slot A |
+| Sector 11 | 0x081C0000 | - | Config Slot B |
+| Sector 23 | - | 0x081E0000 | Config Slot B |
+
+### A/B Slot 格式
+
+```
+Slot Header (16 bytes):
+  [0]  magic    = 0x43464732 ("CFG2")
+  [4]  sequence = 單調遞增
+  [8]  crc      = CRC32 of config data
+  [12] commit   = 0x43474744 ("CGD") when valid
+
+Config Data: device_config_t (~3.6KB)
+
+Save: 寫入 alternate slot → verify CRC → write commit marker
+Load: 選 magic + commit + CRC 都有效且 sequence 最高的 slot
+      若 primary slot 損壞 → fallback 到另一個 slot
+```
+
+---
+
+## 8. RTC Backup Register 佈局
+
+| Register | 用途 |
 |------|------|
-| `GET /` | Dashboard HTML |
-| `GET /api/summary` | 系統摘要（MQTT 狀態、金鑰數、裝置數） |
-| `GET /api/keys` | 金鑰清單 |
-| `POST /api/keys` | 產生新金鑰 |
-| `PATCH /api/keys/:id` | 編輯金鑰（標籤/啟用） |
-| `DELETE /api/keys/:id` | 刪除金鑰 |
-| `POST /api/provision` | MCU 憑證換發 |
-| `GET /api/cloud/devices` | 雲端裝置清單 |
-| `GET /api/cloud/clusters` | 雲端叢集清單 |
-| `POST /api/cloud/clusters` | 建立叢集身份 |
-| `POST /api/cloud/devices` | 建立裝置身份 |
-| `POST /send/:nodeId/relay` | MQTT 單路控制 |
-| `POST /send/:nodeId/mask` | MQTT 全路控制 |
-| `POST /send/:nodeId/all` | MQTT 全部開/關 |
-| `POST /send/:nodeId/auto-hold` | MQTT Auto Hold |
-| `POST /send/:nodeId/control` | MQTT 使用者控制 |
-| `POST /send/:nodeId/scheduler/set` | MQTT 排程設定 |
-| `POST /send/:nodeId/scheduler/enabled` | MQTT 排程啟用 |
-| `POST /send/:nodeId/scheduler/pause` | MQTT 排程暫停 |
-| `POST /send/:nodeId/protection/force-stop` | MQTT 強制停止 |
-| `POST /send/:nodeId/protection/unlock` | MQTT 解鎖 |
-| `POST /send/:nodeId/protection/clear-learning` | MQTT 清除學習 |
-| `GET /api/stream` | SSE 事件串流 |
-| `GET /clients` | 舊 TCP 鏈路清單（已廢棄） |
+| DR0 | Fault Signature |
+| DR1 | Fault Type |
+| DR2 | Fault PC |
+| DR3 | Fault LR |
+| DR4 | Fault CFSR |
+| DR5 | Fault HFSR |
+| DR6 | Scheduler Magic (low16) + Enabled Mask (hi16) |
+| DR7 | RTC Signature (Cluster Time restore) |
+| DR8 | Boot Counter |
+| DR9 | Relay Protection Restart Detection |
+| DR10–DR25 | Scheduler Pause Until (16 channels) |
+| DR26–DR31 | Free |
 
 ---
 
-## 8. Flash 配置
+## 9. SRAM 佈局
 
-| Sector | 位址 | 用途 |
-|--------|------|------|
-| 0-5 | 0x08000000 | 韌體程式碼 |
-| 10 | 0x081C0000 | 排程器資料持久化 |
-| 11 | 0x081E0000 | device_config 持久化 |
+| 區域 | 位址 | 大小 | 用途 |
+|------|------|------|------|
+| **DTCM** | 0x20000000 | 128KB | ucHeap (60KB FreeRTOS heap) — CPU only, DMA 不觸及 |
+| **SRAM1** | 0x20020000 | 368KB | RW/ZI data + lwIP heap (48KB linker-managed) — DMA accessible |
+| **SRAM2** | 0x2007C000 | 16KB | ETH DMA descriptors + TX buffers + RX pool |
 
----
+### Task Stack 配置
 
-## 9. 資源使用
-
-| 資源 | 用量 | 上限 |
-|------|:----:|:----:|
-| SRAM (RW + ZI) | ~338KB | 512KB |
-| Flash (code) | ~536KB | 2MB |
-| FreeRTOS heap | 28.5KB | 62KB |
-| lwIP heap | ~3KB | 48KB |
-
----
-
-## 10. 開發
-
-### 專案結構
-```
-App/
-  Config/     device_config 持久化
-  Domain/     業務邏輯 (ct_measurement)
-  Platform/   硬體抽象 (board_relay)
-  Proto/      通訊協定 (control_proto, discovery_proto)
-  Service/    FreeRTOS 服務層
-    scheduler.c/h        排程器 + Auto Hold
-    mqtt_link_service.c  MQTT 後端通訊
-    http_service.c       HTTP API + Web UI
-    discovery_service.c  UDP 自動發現
-    cluster_service.c    叢集管理
-    relay_protection.c   安全保護
-    control_queue.c      控制佇列
-    ...
-docs/
-  ARCHITECTURE.md  本文件
-  MCU_API.md       MCU HTTP API 參考
-tools/
-  backend-test/    後端測試伺服器 (server.js)
-Web/
-  index.html       內建 Web UI
-```
-
-### 編譯
-- Keil MDK-ARM v5, ARM Compiler 6 (armclang)
-- `UV4.exe -b MDK-ARM\autoControl.uvprojx -j0`
-- 0 Error(s), 0 Warning(s) 才能燒錄
+| Task | Stack | 說明 |
+|------|------|------|
+| TCPIP | 24KB | TLS/MQTT/HTTPS callbacks |
+| DefaultTask | 16KB | Main loop, scheduler tick |
+| CfgSave | 16KB | Flash write operations |
+| ControlQueue | 8KB | Command serialization |
+| Discovery | 4KB | UDP announce |
+| ClusterHealth | 4KB | Health check |
