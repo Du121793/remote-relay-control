@@ -532,6 +532,11 @@
               <FilePath>../App/Service/scheduler.c</FilePath>
             </File>
             <File>
+              <FileName>flash_storage.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Service/flash_storage.c</FilePath>
+            </File>
+            <File>
               <FileName>cluster_service.c</FileName>
               <FileType>1</FileType>
               <FilePath>../App/Service/cluster_service.c</FilePath>

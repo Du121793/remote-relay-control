@@ -1206,7 +1206,6 @@ static void device_config_worker_init(void)
       xSemaphoreCreateMutexStatic(&g_device_config_save_mutex_buffer);
   }
   flash_storage_init();
-  }
   if ((g_device_config_queue != NULL) &&
       (g_device_config_save_mutex != NULL) &&
       (g_device_config_task_handle == NULL))
