@@ -17,6 +17,9 @@ void https_client_service_poll(void);
    request / response), 0 when idle. */
 uint8_t https_client_service_is_busy(void);
 
+/* Trigger an immediate provisioning cycle (resets retry timer). */
+void https_client_service_trigger(void);
+
 #ifdef __cplusplus
 }
 #endif

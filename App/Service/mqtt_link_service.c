@@ -1,9 +1,12 @@
 #include "mqtt_link_service.h"
 
+#include "https_client_service.h"
 #include "adc_service.h"
 #include "cluster_service.h"
 #include "control_queue.h"
 #include "fault_service.h"
+#include "scheduler.h"
+#include "relay_protection.h"
 #include "../Config/device_config.h"
 #include "../Platform/board_relay.h"
 
@@ -177,7 +180,7 @@ static uint8_t mqtt_link_network_ready(void)
 
 static uint8_t mqtt_link_configured(const device_config_t *config)
 {
-  if ((config == NULL) || (config->cloud_enabled == 0U) || (config->cloud_transport != 1U))
+  if ((config == NULL) || (config->cloud_enabled == 0U))
   {
     return 0U;
   }
@@ -254,6 +257,30 @@ static void mqtt_link_build_topics(const device_config_t *config)
   (void)snprintf(stats->topic_command_time,
                  sizeof(stats->topic_command_time),
                  "cluster/%s/command/time", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_auto_hold,
+                 sizeof(stats->topic_command_auto_hold),
+                 "cluster/%s/command/auto-hold", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_control,
+                 sizeof(stats->topic_command_control),
+                 "cluster/%s/command/control", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_scheduler_set,
+                 sizeof(stats->topic_command_scheduler_set),
+                 "cluster/%s/command/scheduler/set", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_scheduler_enabled,
+                 sizeof(stats->topic_command_scheduler_enabled),
+                 "cluster/%s/command/scheduler/enabled", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_scheduler_pause,
+                 sizeof(stats->topic_command_scheduler_pause),
+                 "cluster/%s/command/scheduler/pause", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_protection_force_stop,
+                 sizeof(stats->topic_command_protection_force_stop),
+                 "cluster/%s/command/protection/force-stop", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_protection_unlock,
+                 sizeof(stats->topic_command_protection_unlock),
+                 "cluster/%s/command/protection/unlock", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_protection_clear_learning,
+                 sizeof(stats->topic_command_protection_clear_learning),
+                 "cluster/%s/command/protection/clear-learning", config->cloud_cluster_id);
   (void)snprintf(stats->topic_ack_prefix, sizeof(stats->topic_ack_prefix),
                  "cluster/%s/ack/", config->cloud_cluster_id);
 
@@ -709,14 +736,26 @@ static err_t mqtt_link_publish_fault(void)
                            MQTT_LINK_PUBLISH_FAULT);
 }
 
+/* Subscription state machine: topics subscribed one-by-one waiting for SUBACK */
+static uint8_t  g_mqtt_sub_index = 0U;
+static const char *g_mqtt_sub_topics[12];
+static uint8_t  g_mqtt_sub_count = 0U;
+
 static void mqtt_link_subscription_callback(void *argument, err_t error)
 {
   (void)argument;
-
   if (error != ERR_OK)
   {
     g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_SUBSCRIBE + (uint32_t)(-error);
     mqtt_link_log_value("[mqtt] subscribe fail=", (uint32_t)(-error));
+  }
+  /* Chain to next topic */
+  g_mqtt_sub_index++;
+  if (g_mqtt_sub_index < g_mqtt_sub_count)
+  {
+    (void)mqtt_subscribe(g_mqtt_link_context.client,
+                         g_mqtt_sub_topics[g_mqtt_sub_index],
+                         1U, mqtt_link_subscription_callback, NULL);
   }
 }
 
@@ -1221,6 +1260,158 @@ static void mqtt_link_process_command(void)
     command.type = CONTROL_PROTO_CMD_SET_RELAY_MASK;
     command.mask = mask;
   }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                   g_mqtt_link_context.stats.topic_command_auto_hold) == 0)
+  {
+    /* ── Auto Hold ── */
+    auto_hold_cmd_t ah_cmd;
+    uint32_t ah_ch = 0, ah_target = 0, ah_dur = 0, ah_session = 0, ah_cts = 0;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &ah_ch);
+    memset(&ah_cmd, 0, sizeof(ah_cmd));
+    ah_cmd.channel = (uint8_t)ah_ch;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "target", &ah_target);
+    ah_cmd.target = (uint8_t)(ah_target ? 1 : 0);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "duration_seconds", &ah_dur);
+    ah_cmd.duration_seconds = ah_dur;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "session", &ah_session);
+    ah_cmd.session = ah_session;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "command_ts", &ah_cts);
+    ah_cmd.command_ts = ah_cts;
+    (void)mqtt_link_extract_json_string(g_mqtt_link_context.rx_payload, "reason",
+                                        ah_cmd.reason, SCHEDULER_REASON_MAX_LEN + 1);
+    { uint8_t tv2; scheduler_handle_auto_hold(&ah_cmd, HAL_GetTick(),
+                                               cluster_service_get_unix_time(&tv2)); }
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+    return;
+  }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                   g_mqtt_link_context.stats.topic_command_control) == 0)
+  {
+    /* ── User control (atomic) ── */
+    uint32_t ctrl_ch = 0, ctrl_target = 0, ctrl_pmode = 0, ctrl_pdur = 0, ctrl_puntil = 0, ctrl_pblocks = 0;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &ctrl_ch);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "target", &ctrl_target);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "pause_mode", &ctrl_pmode);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "pause_duration_seconds", &ctrl_pdur);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "pause_until", &ctrl_puntil);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "pause_blocks_auto_trigger", &ctrl_pblocks);
+    scheduler_user_control((uint8_t)ctrl_ch, (uint8_t)(ctrl_target ? 1 : 0),
+                           (scheduler_pause_mode_t)ctrl_pmode, ctrl_pdur, ctrl_puntil,
+                           (uint8_t)(ctrl_pblocks ? 1 : 0));
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+    return;
+  }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                   g_mqtt_link_context.stats.topic_command_scheduler_set) == 0)
+  {
+    /* ── Scheduler set weekly ── */
+    uint32_t sch_ch = 0, sch_weekday = 0, sch_count = 0;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &sch_ch);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "weekday", &sch_weekday);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "count", &sch_count);
+    if (sch_weekday > 6 || sch_count > SCHEDULER_MAX_INTERVALS) {
+      mqtt_link_publish_ack(request_id, 0U, "bad_scheduler_set", target_node_id);
+      return;
+    }
+    daily_schedule_t new_day;
+    memset(&new_day, 0, sizeof(new_day));
+    new_day.interval_count = (uint8_t)sch_count;
+    char key[8];
+    for (uint32_t k = 0; k < sch_count; k++) {
+      uint32_t sv = 0, ev = 0;
+      (void)snprintf(key, sizeof(key), "s%lu", (unsigned long)k);
+      (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, key, &sv);
+      (void)snprintf(key, sizeof(key), "e%lu", (unsigned long)k);
+      (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, key, &ev);
+      if (sv >= 1440 || ev == 0 || ev > 1440 || sv >= ev) {
+        mqtt_link_publish_ack(request_id, 0U, "bad_interval", target_node_id);
+        return;
+      }
+      new_day.intervals[k].start_minute = (uint16_t)sv;
+      new_day.intervals[k].end_minute = (uint16_t)ev;
+    }
+    if (scheduler_validate_intervals(&new_day) == false ||
+        scheduler_set_weekly_day((uint8_t)sch_ch, (uint8_t)sch_weekday, &new_day) == 0U) {
+      mqtt_link_publish_ack(request_id, 0U, "bad_scheduler_set", target_node_id);
+      return;
+    }
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+    return;
+  }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                   g_mqtt_link_context.stats.topic_command_scheduler_enabled) == 0)
+  {
+    uint32_t sch_en_ch = 0, sch_enabled = 0;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &sch_en_ch);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "enabled", &sch_enabled);
+    if (scheduler_set_enabled((uint8_t)sch_en_ch, (uint8_t)(sch_enabled ? 1 : 0)) == 0U) {
+      mqtt_link_publish_ack(request_id, 0U, "not_found", target_node_id);
+      return;
+    }
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+    return;
+  }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                   g_mqtt_link_context.stats.topic_command_scheduler_pause) == 0)
+  {
+    uint32_t sp_ch = 0, sp_mode = 0, sp_dur = 0, sp_until = 0, sp_blocks = 0;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &sp_ch);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "mode", &sp_mode);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "duration_seconds", &sp_dur);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "until", &sp_until);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "pause_blocks_auto_trigger", &sp_blocks);
+    {
+      uint8_t tv;
+      uint32_t now_unix = cluster_service_get_unix_time(&tv);
+      uint32_t pause_until = now_unix + 60U;
+      switch (sp_mode) {
+        case 0: pause_until = now_unix + 60U; break;
+        case 1: pause_until = now_unix + sp_dur; break;
+        case 2: pause_until = sp_until; break;
+        case 3: pause_until = SCHEDULER_PAUSE_FOREVER; break;
+        default: pause_until = now_unix + 60U; break;
+      }
+      if (scheduler_set_pause((uint8_t)sp_ch, pause_until, (uint8_t)(sp_blocks ? 1 : 0)) == 0U) {
+        mqtt_link_publish_ack(request_id, 0U, "not_found", target_node_id);
+        return;
+      }
+    }
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+    return;
+  }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                   g_mqtt_link_context.stats.topic_command_protection_force_stop) == 0)
+  {
+    uint32_t prot_ch = 0;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &prot_ch);
+    if (prot_ch >= 1 && prot_ch <= SCHEDULER_CHANNEL_COUNT) {
+      relay_protection_force_stop((uint8_t)prot_ch);
+    }
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+    return;
+  }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                   g_mqtt_link_context.stats.topic_command_protection_unlock) == 0)
+  {
+    uint32_t prot_ch = 0;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &prot_ch);
+    if (prot_ch >= 1 && prot_ch <= SCHEDULER_CHANNEL_COUNT) {
+      relay_protection_unlock((uint8_t)prot_ch);
+    }
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+    return;
+  }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                   g_mqtt_link_context.stats.topic_command_protection_clear_learning) == 0)
+  {
+    uint32_t prot_ch = 0;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &prot_ch);
+    if (prot_ch >= 1 && prot_ch <= SCHEDULER_CHANNEL_COUNT) {
+      relay_protection_clear_learning((uint8_t)prot_ch);
+    }
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+    return;
+  }
   else
   {
     g_mqtt_link_context.stats.command_errors++;
@@ -1261,7 +1452,15 @@ static void mqtt_link_incoming_publish(void *argument, const char *topic, u32_t 
      ((strcmp(topic, g_mqtt_link_context.stats.topic_command_relay) == 0) ||
       (strcmp(topic, g_mqtt_link_context.stats.topic_command_mask) == 0) ||
       (strcmp(topic, g_mqtt_link_context.stats.topic_command_config_relay) == 0) ||
-      (strcmp(topic, g_mqtt_link_context.stats.topic_command_time) == 0))) ? 1U : 0U;
+      (strcmp(topic, g_mqtt_link_context.stats.topic_command_time) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_auto_hold) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_control) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_scheduler_set) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_scheduler_enabled) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_scheduler_pause) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_protection_force_stop) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_protection_unlock) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_protection_clear_learning) == 0))) ? 1U : 0U;
 
   if (g_mqtt_link_context.rx_accept == 0U)
   {
@@ -1309,40 +1508,29 @@ static void mqtt_link_incoming_data(void *argument,
 
 static void mqtt_link_subscribe_commands(void)
 {
-  err_t error;
+  /* Build topic array and start SUBACK-driven chain.
+     lwIP MQTT client only allows one outstanding subscribe at a time;
+     each SUBACK triggers the next subscribe via the callback. */
+  g_mqtt_sub_topics[0]  = g_mqtt_link_context.stats.topic_command_relay;
+  g_mqtt_sub_topics[1]  = g_mqtt_link_context.stats.topic_command_mask;
+  g_mqtt_sub_topics[2]  = g_mqtt_link_context.stats.topic_command_config_relay;
+  g_mqtt_sub_topics[3]  = g_mqtt_link_context.stats.topic_command_time;
+  g_mqtt_sub_topics[4]  = g_mqtt_link_context.stats.topic_command_auto_hold;
+  g_mqtt_sub_topics[5]  = g_mqtt_link_context.stats.topic_command_control;
+  g_mqtt_sub_topics[6]  = g_mqtt_link_context.stats.topic_command_scheduler_set;
+  g_mqtt_sub_topics[7]  = g_mqtt_link_context.stats.topic_command_scheduler_enabled;
+  g_mqtt_sub_topics[8]  = g_mqtt_link_context.stats.topic_command_scheduler_pause;
+  g_mqtt_sub_topics[9]  = g_mqtt_link_context.stats.topic_command_protection_force_stop;
+  g_mqtt_sub_topics[10] = g_mqtt_link_context.stats.topic_command_protection_unlock;
+  g_mqtt_sub_topics[11] = g_mqtt_link_context.stats.topic_command_protection_clear_learning;
+  g_mqtt_sub_count = 12U;
+  g_mqtt_sub_index = 0U;
 
-  error = mqtt_subscribe(g_mqtt_link_context.client,
-                         g_mqtt_link_context.stats.topic_command_relay,
-                         1U,
-                         mqtt_link_subscription_callback,
-                         NULL);
-  if (error == ERR_OK)
+  /* Kick off first subscribe — the rest chain via mqtt_link_subscription_callback */
+  if (mqtt_subscribe(g_mqtt_link_context.client, g_mqtt_sub_topics[0],
+                     1U, mqtt_link_subscription_callback, NULL) != ERR_OK)
   {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_mask,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_config_relay,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error == ERR_OK)
-  {
-    error = mqtt_subscribe(g_mqtt_link_context.client,
-                           g_mqtt_link_context.stats.topic_command_time,
-                           1U,
-                           mqtt_link_subscription_callback,
-                           NULL);
-  }
-  if (error != ERR_OK)
-  {
-    g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_SUBSCRIBE + (uint32_t)(-error);
+    g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_SUBSCRIBE;
   }
 }
 
@@ -1359,13 +1547,13 @@ static void mqtt_link_connection_callback(mqtt_client_t *client,
     g_mqtt_link_context.stats.connect_failures++;
     g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_CONNECT + (uint32_t)status;
     mqtt_link_log_value("[mqtt] disconnected status=", (uint32_t)status);
+    /* TLS/PSK failure may mean bindingSecret changed — re-provision now */
+    https_client_service_trigger();
     return;
   }
 
   g_mqtt_link_context.stats.connected = 1U;
   g_mqtt_link_context.stats.last_error = 0U;
-  g_mqtt_link_context.status_dirty = 1U;
-  g_mqtt_link_context.initial_publish_stage = 1U;
   g_mqtt_link_context.last_heartbeat_ms = 0U;
   g_mqtt_link_context.last_status_ms = 0U;
 
@@ -1373,7 +1561,11 @@ static void mqtt_link_connection_callback(mqtt_client_t *client,
                           mqtt_link_incoming_publish,
                           mqtt_link_incoming_data,
                           NULL);
+  /* Subscribe BEFORE setting dirty/stage — ensures ring buffer has room
+     for all 12 SUBSCRIBE packets before hello/status compete for space. */
   mqtt_link_subscribe_commands();
+  g_mqtt_link_context.status_dirty = 1U;
+  g_mqtt_link_context.initial_publish_stage = 1U;
   mqtt_link_log("[mqtt] connected\r\n");
 }
 
@@ -1677,7 +1869,7 @@ void mqtt_link_service_poll(void)
   err_t error;
 
   mqtt_link_service_init();
-  config = device_config_get();
+  device_config_t cfg_snap; device_config_copy(&cfg_snap); config = &cfg_snap;
   configured = mqtt_link_configured(config);
   should_run = mqtt_link_should_run(configured);
   mqtt_link_capture_config(config);
@@ -1685,7 +1877,7 @@ void mqtt_link_service_poll(void)
 
   g_mqtt_link_context.stats.configured = configured;
   g_mqtt_link_context.stats.enabled = (config->cloud_enabled != 0U) ? 1U : 0U;
-  g_mqtt_link_context.stats.transport = config->cloud_transport;
+  g_mqtt_link_context.stats.transport = 1U;  /* MQTT is the only transport */
   g_mqtt_link_context.stats.broker_port = config->cloud_broker_port;
   g_mqtt_link_context.stats.should_run = should_run;
 

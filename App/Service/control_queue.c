@@ -1,6 +1,5 @@
 #include "control_queue.h"
 #include "adc_service.h"
-#include "backend_link_service.h"
 #include "mqtt_link_service.h"
 #include "board_relay.h"
 #include "relay_protection.h"
@@ -88,7 +87,7 @@ static device_config_t g_control_queue_relay_config_snapshot;
 static volatile uint8_t g_control_queue_backend_sync_pending = 0U;
 static volatile uint8_t g_control_queue_force_stop[16];
 static StaticTask_t g_control_queue_task_buffer;
-static StackType_t g_control_queue_task_stack[1024];
+static StackType_t g_control_queue_task_stack[2048] /* 8 KB — enc_buf+ct_buf+AES ctx needed >4 KB */;
 static StaticSemaphore_t g_control_queue_sync_mutex_buffer;
 static SemaphoreHandle_t g_control_queue_sync_mutex = NULL;
 static relay_domain_result_t g_control_queue_sync_result;
@@ -188,7 +187,7 @@ size_t control_queue_encrypt_body(const char *plain_body, size_t plain_len,
                                    const uint8_t key[16],
                                    char *enc_out, size_t enc_out_size)
 {
-  uint8_t iv[12], tag[16], ct_buf[1536];
+  uint8_t iv[12], tag[16]; static uint8_t ct_buf[1536];
   size_t ct_len = plain_len, out_pos = 0U;
   mbedtls_gcm_context ctx;
   int ret; uint32_t i;
@@ -442,7 +441,7 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_sync_remote_bac
     if ((dc != NULL) && (dc->cluster_password_hash[0] != 0U))
     {
       uint8_t key[16];
-      char enc_buf[2048];
+      static char enc_buf[2048];
       size_t enc_len;
       memcpy(key, dc->cluster_password_hash, sizeof(key));
       enc_len = control_queue_encrypt_body(workspace->body,
@@ -1244,8 +1243,8 @@ static void control_queue_worker_task(void const *argument)
              (request->command.type == CONTROL_PROTO_CMD_SET_RELAY_ALL)))
         {
           device_config_runtime_relay_mask_set(target_result->relay_mask);
-          backend_link_service_mark_status_dirty();
           mqtt_link_service_mark_status_dirty();
+          /* duplicate removed */
         }
         if (target_result->error == CONTROL_PROTO_ERR_NONE)
           g_control_queue_stats.executed++;
@@ -1285,7 +1284,7 @@ void control_queue_init(void)
     g_control_queue_task_handle =
       xTaskCreateStatic((TaskFunction_t)control_queue_worker_task,
                         "ControlQueueWorker",
-                        1024U,
+                        2048U /* must match g_control_queue_task_stack */,
                         NULL,
                         (UBaseType_t)(tskIDLE_PRIORITY + 4U),
                         g_control_queue_task_stack,
@@ -1624,3 +1623,5 @@ void control_queue_get_stats(control_queue_stats_t *stats)
     }
   }
 }
+
+UBaseType_t control_queue_stack_high_water(void) { if (g_control_queue_task_handle == NULL) return 0; return uxTaskGetStackHighWaterMark((TaskHandle_t)g_control_queue_task_handle); }

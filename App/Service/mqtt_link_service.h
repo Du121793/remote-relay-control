@@ -40,6 +40,14 @@ typedef struct
   char topic_command_mask[MQTT_LINK_TOPIC_MAX_LEN];
   char topic_command_config_relay[MQTT_LINK_TOPIC_MAX_LEN];
   char topic_command_time[MQTT_LINK_TOPIC_MAX_LEN];
+  char topic_command_auto_hold[MQTT_LINK_TOPIC_MAX_LEN];
+  char topic_command_control[MQTT_LINK_TOPIC_MAX_LEN];
+  char topic_command_scheduler_set[MQTT_LINK_TOPIC_MAX_LEN];
+  char topic_command_scheduler_enabled[MQTT_LINK_TOPIC_MAX_LEN];
+  char topic_command_scheduler_pause[MQTT_LINK_TOPIC_MAX_LEN];
+  char topic_command_protection_force_stop[MQTT_LINK_TOPIC_MAX_LEN];
+  char topic_command_protection_unlock[MQTT_LINK_TOPIC_MAX_LEN];
+  char topic_command_protection_clear_learning[MQTT_LINK_TOPIC_MAX_LEN];
   char topic_ack_prefix[MQTT_LINK_TOPIC_MAX_LEN];
   char cluster_ca_fingerprint[DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN];
   char cluster_binding_secret[DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN];

@@ -46,6 +46,7 @@ typedef struct
   ip_addr_t server_addr;
   uint8_t state;
   volatile uint8_t callback_pending;
+  volatile uint8_t restart_requested;
   uint32_t deadline_ms;
   uint32_t next_attempt_ms;
   char rx_buffer[HTTPS_CLIENT_RX_BUFFER_SIZE];
@@ -171,8 +172,8 @@ static void https_client_send_request(void)
 static void https_client_parse_and_apply(const char *body, size_t body_len)
 {
   const device_config_t *config = device_config_get();
-  device_config_t updated;
-  char value_buffer[DEVICE_CONFIG_CA_CERT_MAX_LEN];
+  static device_config_t updated;
+  static char value_buffer[DEVICE_CONFIG_CA_CERT_MAX_LEN];
   const char *ptr;
 
   if ((config == NULL) || (body == NULL) || (body_len < 8U))
@@ -187,6 +188,24 @@ static void https_client_parse_and_apply(const char *body, size_t body_len)
   }
 
   updated = *config;
+
+  /* Extract cloud_key_id — the backend assigns each device a unique key
+     that serves as the MQTT username.  The MCU must store and use this
+     value so the broker's registry lookup succeeds. */
+  ptr = strstr(body, "\"cloud_key_id\":\"");
+  if (ptr != NULL)
+  {
+    const char *start = ptr + 16;
+    const char *end = strchr(start, '"');
+    size_t len;
+
+    if ((end != NULL) && (end > start) &&
+        ((len = (size_t)(end - start)) < sizeof(updated.cloud_key_id)))
+    {
+      memset(updated.cloud_key_id, 0, sizeof(updated.cloud_key_id));
+      memcpy(updated.cloud_key_id, start, len);
+    }
+  }
 
   /* Extract binding_secret */
   ptr = strstr(body, "\"cloud_cluster_binding_secret\":\"");
@@ -213,8 +232,8 @@ static void https_client_parse_and_apply(const char *body, size_t body_len)
     char *dest = value_buffer;
     size_t dest_len = 0U;
 
-    memset(value_buffer, 0, sizeof(value_buffer));
-    while ((*start != '\0') && (dest_len < (sizeof(value_buffer) - 1U)))
+    memset(value_buffer, 0, DEVICE_CONFIG_CA_CERT_MAX_LEN);
+    while ((*start != '\0') && (dest_len < (DEVICE_CONFIG_CA_CERT_MAX_LEN - 1U)))
     {
       if ((start[0] == '\\') && (start[1] == 'n'))
       {
@@ -271,7 +290,8 @@ static void https_client_parse_and_apply(const char *body, size_t body_len)
 
   if (updated.provisioning_revision != config->provisioning_revision ||
       updated.ca_revocation_tag != config->ca_revocation_tag ||
-      updated.cloud_cluster_binding_secret[0] != config->cloud_cluster_binding_secret[0])
+      strcmp(updated.cloud_key_id, config->cloud_key_id) != 0 ||
+      strcmp(updated.cloud_cluster_binding_secret, config->cloud_cluster_binding_secret) != 0)
   {
     (void)device_config_update_and_save(&updated);
     mqtt_link_service_mark_status_dirty();
@@ -325,10 +345,7 @@ static err_t https_client_recv(void *arg, struct altcp_pcb *pcb,
     }
   }
 
-  pbuf_free(p);
-
-  /* Inform the sender we processed the data */
-  altcp_recved(g_https_client_context.pcb, (u16_t)p->tot_len);
+  { u16_t rlen = (u16_t)p->tot_len; altcp_recved(pcb, rlen); } pbuf_free(p);
 
   return ERR_OK;
 }
@@ -337,7 +354,10 @@ static void https_client_err(void *arg, err_t err)
 {
   (void)arg;
   (void)err;
-  https_client_close();
+  /* lwIP error callback fires AFTER the PCB is already freed.
+     Do NOT call altcp_abort() — just clear our reference. */
+  g_https_client_context.pcb = NULL;
+  g_https_client_context.state = HTTPS_STATE_IDLE;
 }
 
 static void https_client_connect_to(const ip_addr_t *address)
@@ -450,6 +470,14 @@ static void https_client_tcpip_step(void *argument)
   (void)argument;
   g_https_client_context.callback_pending = 0U;
 
+  /* Process restart request from non-tcpip threads */
+  if (g_https_client_context.restart_requested != 0U)
+  {
+    g_https_client_context.restart_requested = 0U;
+    if (g_https_client_context.pcb != NULL) { https_client_close(); }
+    g_https_client_context.state = HTTPS_STATE_IDLE;
+  }
+
   if (https_client_is_master_online() == 0U)
   {
     https_client_close();
@@ -531,4 +559,12 @@ void https_client_service_poll(void)
 uint8_t https_client_service_is_busy(void)
 {
   return (g_https_client_context.state != HTTPS_STATE_IDLE) ? 1U : 0U;
+}
+
+void https_client_service_trigger(void)
+{
+  /* Only set flags — tcpip_step handles actual close/restart in lwIP context.
+     This avoids racing on PCB ownership from non-tcpip callers. */
+  g_https_client_context.restart_requested = 1U;
+  g_https_client_context.next_attempt_ms = 0U;
 }

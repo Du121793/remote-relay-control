@@ -1,6 +1,9 @@
-/* Force 8-byte alignment of the FreeRTOS heap by placing an aligned
-   guard variable in BSS.  The linker orders .bss contributions by object
-   file, so this file must appear in the Keil project immediately before
-   heap_4.c inside the FreeRTOS source group. */
+/* FreeRTOS heap placed in DTCM (0x20000000, 128KB CPU-only RAM).
+   DTCM is physically separate from SRAM1 — DMA cannot touch it,
+   eliminating the lwIP-heap / ETH-DMA / stack overlap that caused
+   HardFault crashes in PendSV at 0x08005E86.
+   Size must match configTOTAL_HEAP_SIZE in FreeRTOSConfig.h (61440). */
 #include <stdint.h>
-static uint64_t __attribute__((aligned(8))) bss_align_guard;
+
+uint8_t ucHeap[61440]
+  __attribute__((section(".ARM.__at_0x20000000"), aligned(8)));

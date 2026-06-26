@@ -11,8 +11,8 @@ extern "C" {
 #define DEVICE_CONFIG_NAME_MAX_LEN           32U
 #define DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN   32U
 #define DEVICE_CONFIG_PASSWORD_HASH_LEN      32U
-#define DEVICE_CONFIG_BACKEND_HOST_MAX_LEN   64U
-#define DEVICE_CONFIG_BACKEND_KEY_MAX_LEN    64U
+#define DEVICE_CONFIG_BACKEND_HOST_MAX_LEN   64U  /* deprecated */
+#define DEVICE_CONFIG_BACKEND_KEY_MAX_LEN    64U  /* deprecated */
 #define DEVICE_CONFIG_CLOUD_ID_MAX_LEN       64U
 #define DEVICE_CONFIG_CLOUD_HOST_MAX_LEN     64U
 #define DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN 96U
@@ -56,12 +56,9 @@ typedef struct
   uint8_t reserved0[2];
   char cluster_name[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN];
   uint8_t cluster_password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN];
-  char backend_host[DEVICE_CONFIG_BACKEND_HOST_MAX_LEN];
-  uint16_t backend_port;
-  uint16_t reserved1;
-  char backend_key[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
+  char backend_host[64]; uint16_t backend_port; uint16_t _reserved1; char backend_key[64]; /* deprecated — raw TCP :42001 retired */
   uint8_t cloud_enabled;
-  uint8_t cloud_transport;
+  uint8_t cloud_transport; /* deprecated — MQTT is the only transport now */
   uint8_t reserved2[2];
   char cloud_broker_host[DEVICE_CONFIG_CLOUD_HOST_MAX_LEN];
   uint16_t cloud_broker_port;
@@ -82,6 +79,7 @@ typedef struct
 void device_config_build_defaults(device_config_t *config);
 void device_config_init(void);
 const device_config_t *device_config_get(void);
+void device_config_copy(device_config_t *dst);
 void device_config_set(const device_config_t *config);
 uint8_t device_config_update_and_save(const device_config_t *config);
 uint32_t device_config_compute_crc32(const device_config_t *config);
@@ -100,6 +98,8 @@ uint32_t device_config_build_startup_relay_mask(const device_config_t *config);
 uint8_t device_config_persist_runtime_relay_mask(uint32_t relay_mask);
 void device_config_runtime_relay_mask_set(uint32_t relay_mask);
 void device_config_poll(void);
+
+unsigned long device_config_stack_high_water(void);
 
 #ifdef __cplusplus
 }

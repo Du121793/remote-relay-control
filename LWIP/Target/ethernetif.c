@@ -259,6 +259,7 @@ volatile uint32_t g_eth_last_tx_ip_dst = 0U;
 volatile uint32_t g_eth_last_tx_dst_mac_0_1 = 0U;
 volatile uint32_t g_eth_last_tx_dst_mac_2_5 = 0U;
 volatile uint32_t g_eth_tx_free_packets = 0U;
+static volatile uint32_t g_eth_tx_token = 0U;
 volatile uint32_t g_eth_last_tx_hal_status = 0U;
 volatile uint32_t g_eth_last_tx_hal_error = 0U;
 volatile uint32_t g_eth_last_tx_dma_error = 0U;
@@ -719,10 +720,11 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
   TxConfig.TxBuffer = Txbuffer;
   TxConfig.pData = p;
 
-  /* Keep using the known-good blocking TX path for now.
-     HAL_ETH_ReleaseTxPacket() depends on CurrentPacketAddress being set. */
-  pbuf_ref(p);
-  heth.TxDescList.CurrentPacketAddress = (uint32_t *)p;
+  /* Blocking TX path with TX token (not pbuf) to prevent double-free.
+       HAL_ETH_ReleaseTxPacket() calls TxFreeCallback which just counts.
+     Data is already in TxDmaBuff; DMA never needs the pbuf. */
+  /* pbuf_ref removed - data already in TxDmaBuff */
+  heth.TxDescList.CurrentPacketAddress = (uint32_t *)(uint32_t)(g_eth_tx_token + 1U);
   tx_status = HAL_ETH_Transmit(&heth, &TxConfig, ETH_DMA_TRANSMIT_TIMEOUT);
   g_eth_last_tx_hal_status = (uint32_t)tx_status;
   g_eth_last_tx_hal_error = HAL_ETH_GetError(&heth);
@@ -730,12 +732,12 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
 
   if (tx_status == HAL_OK)
   {
-    g_eth_tx_packets++;
+    g_eth_tx_token++; g_eth_tx_packets++;
     g_eth_tx_dma_index = (tx_slot + 1U) % ETH_TX_DESC_CNT;
   }
   else
   {
-    pbuf_free(p);
+    /* TX token already stored, no pbuf to undo */
     g_eth_tx_errors++;
     errval = ERR_IF;
   }
@@ -754,7 +756,7 @@ static void ethernetif_tx_reclaim_callback(void *ctx)
 
 void ethernetif_poll_tx_reclaim(void)
 {
-  if ((g_eth_tx_packets == g_eth_tx_free_packets) ||
+  if ((g_eth_tx_free_packets >= g_eth_tx_packets) ||
       (g_eth_tx_reclaim_pending != 0U))
   {
     return;
@@ -1349,7 +1351,7 @@ void HAL_ETH_TxFreeCallback(uint32_t * buff)
 {
 /* USER CODE BEGIN HAL ETH TxFreeCallback */
   g_eth_tx_free_packets++;
-  pbuf_free((struct pbuf *)buff);
+  /* pbuf_free removed - buff is a TX token, not a pbuf pointer */
 
 /* USER CODE END HAL ETH TxFreeCallback */
 }

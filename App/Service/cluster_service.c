@@ -1,5 +1,5 @@
 #include "cluster_service.h"
-#include "backend_link_service.h"
+#include "../Config/rtc_backup_layout.h"
 #include "mqtt_link_service.h"
 #include "../Platform/board_relay.h"
 
@@ -11,6 +11,7 @@
 
 #include "stm32f7xx_hal.h"
 
+extern RTC_HandleTypeDef hrtc;
 extern struct netif gnetif;
 
 #define CLUSTER_SERVICE_STALE_TIMEOUT_MS   6000UL
@@ -139,7 +140,7 @@ static uint8_t cluster_service_rtc_read(uint32_t *unix_time)
 
   if ((unix_time == NULL) ||
       (g_cluster_context.state.rtc_lse_ready == 0U) ||
-      (RTC->BKP16R != CLUSTER_SERVICE_RTC_SIGNATURE))
+      (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_RTC_SIGNATURE) != CLUSTER_SERVICE_RTC_SIGNATURE))
   {
     return 0U;
   }
@@ -224,13 +225,13 @@ static uint8_t cluster_service_rtc_write(uint32_t unix_time)
             cluster_service_bin_to_bcd(day);
   RTC->ISR &= ~RTC_ISR_INIT;
   RTC->WPR = 0xFFU;
-  RTC->BKP16R = CLUSTER_SERVICE_RTC_SIGNATURE;
+  HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_RTC_SIGNATURE, CLUSTER_SERVICE_RTC_SIGNATURE);
   return 1U;
 }
 
 static void cluster_service_rtc_init(void)
 {
-  uint32_t fault_backup[16];
+  uint32_t fault_backup[26];
   uint32_t index;
   uint32_t start;
   uint8_t reset_backup_domain = 0U;
@@ -239,7 +240,7 @@ static void cluster_service_rtc_init(void)
   HAL_PWR_EnableBkUpAccess();
   if ((RCC->BDCR & RCC_BDCR_RTCSEL) != RCC_BDCR_RTCSEL_0)
   {
-    for (index = 0U; index < 16U; ++index)
+    for (index = 0U; index < 26U; ++index)
     {
       fault_backup[index] = (&RTC->BKP0R)[index];
     }
@@ -270,7 +271,7 @@ static void cluster_service_rtc_init(void)
     {
       if (reset_backup_domain != 0U)
       {
-        for (index = 0U; index < 16U; ++index)
+        for (index = 0U; index < 26U; ++index)
         {
           (&RTC->BKP0R)[index] = fault_backup[index];
         }
@@ -283,7 +284,7 @@ static void cluster_service_rtc_init(void)
               RCC_BDCR_RTCSEL_0 | RCC_BDCR_RTCEN;
   if (reset_backup_domain != 0U)
   {
-    for (index = 0U; index < 16U; ++index)
+    for (index = 0U; index < 26U; ++index)
     {
       (&RTC->BKP0R)[index] = fault_backup[index];
     }
@@ -335,7 +336,6 @@ static uint8_t cluster_service_rtc_poll_ready(void)
 
 static void cluster_service_mark_backend_dirty(void)
 {
-  backend_link_service_mark_status_dirty();
   mqtt_link_service_mark_status_dirty();
 }
 
@@ -1308,6 +1308,7 @@ void cluster_service_note_remote_node(const cluster_node_t *node)
   }
   cluster_service_mark_backend_dirty();
   cluster_service_recount_nodes();
+  cluster_service_run_election();
 }
 
 uint8_t cluster_service_kick_node(uint32_t node_id)

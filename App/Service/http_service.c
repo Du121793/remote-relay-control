@@ -4,7 +4,6 @@
 
 #include "board_relay.h"
 #include "adc_service.h"
-#include "backend_link_service.h"
 #include "mqtt_link_service.h"
 #include "time_sync_service.h"
 #include "control_proto.h"
@@ -13,6 +12,7 @@
 #include "cluster_service.h"
 #include "discovery_service.h"
 #include "relay_protection.h"
+#include "scheduler.h"
 #include "relay_domain.h"
 #include "../Config/device_config.h"
 
@@ -38,15 +38,15 @@ size_t control_queue_decrypt_body(const char *enc_body, size_t enc_len,
                                    char *plain_out, size_t plain_out_size);
 
 #define HTTP_TCP_PORT               80U
-#define HTTP_CONN_POOL_SIZE         4U
-#define HTTP_REQUEST_BUFFER_SIZE    2048U
-#define HTTP_BODY_BUFFER_SIZE       16384U
+#define HTTP_CONN_POOL_SIZE         2U    /* 2 connections sufficient with streaming */
+#define HTTP_REQUEST_BUFFER_SIZE    1536U  /* reduced from 2048 — max form body < 1KB */
+#define HTTP_BODY_BUFFER_SIZE       12288U /* reduced from 16384 — JSON API fits in 12KB */
 #define HTTP_AUTH_TOKEN_SIZE        16U
 #define HTTP_AUTH_SESSION_TTL_MS    (15UL * 60UL * 1000UL)
 #define HTTP_AUTH_SESSION_CAPACITY  8U
 #define HTTP_AUTH_SCOPE_CONTROL     0U
 #define HTTP_AUTH_SCOPE_SERVICE     1U
-#define HTTP_CONNECTION_IDLE_TIMEOUT_MS 10000UL
+#define HTTP_CONNECTION_IDLE_TIMEOUT_MS 30000UL
 #define HTTP_AUTH_PASSWORD          "admin"
 #define HTTP_BACKEND_SYNC_FALLBACK_MS (5UL * 60UL * 1000UL)
 
@@ -763,7 +763,14 @@ static err_t http_service_send_payload_chunk(http_service_connection_t *connecti
     return ERR_OK;
   }
 
-  send_len = (u16_t)(connection->send_total - connection->send_progress);
+  {
+    size_t remaining = connection->send_total - connection->send_progress;
+    if (remaining > 0xFFFFUL)
+    {
+      remaining = 0xFFFFUL;
+    }
+    send_len = (u16_t)remaining;
+  }
   if (send_len > space)
   {
     send_len = space;
@@ -804,7 +811,7 @@ static err_t http_service_send_payload_chunk(http_service_connection_t *connecti
   {
       connection->close_pending = 1U;
   }
-  
+
   return ERR_OK;
 }
 
@@ -826,7 +833,7 @@ static err_t http_service_send_payload_streaming(http_service_connection_t *conn
   header_len = snprintf(header, sizeof(header),
                         "HTTP/1.1 %s\r\n"
                         "Content-Type: %s\r\n"
-                        "Content-Length: %u\r\n"
+                        "Content-Length: %lu\r\n"
                         "Connection: close\r\n"
                         "Cache-Control: no-store\r\n"
                         "Access-Control-Allow-Origin: *\r\n"
@@ -835,7 +842,7 @@ static err_t http_service_send_payload_streaming(http_service_connection_t *conn
                         "\r\n",
                         status_line,
                         content_type,
-                        (unsigned int)body_len);
+                        (unsigned long)body_len);
   if ((header_len <= 0) || ((size_t)header_len >= sizeof(header)))
   {
     return ERR_BUF;
@@ -881,7 +888,7 @@ static err_t http_service_send_payload(http_service_connection_t *connection,
   header_len = snprintf(header, sizeof(header),
                         "HTTP/1.1 %s\r\n"
                         "Content-Type: %s\r\n"
-                        "Content-Length: %u\r\n"
+                        "Content-Length: %lu\r\n"
                         "Connection: close\r\n"
                         "Cache-Control: no-store\r\n"
                         "Access-Control-Allow-Origin: *\r\n"
@@ -890,7 +897,7 @@ static err_t http_service_send_payload(http_service_connection_t *connection,
                         "\r\n",
                         status_line,
                         content_type,
-                        (unsigned int)body_len);
+                        (unsigned long)body_len);
   if ((header_len <= 0) || ((size_t)header_len >= sizeof(header)))
   {
     return ERR_BUF;
@@ -905,7 +912,10 @@ static err_t http_service_send_payload(http_service_connection_t *connection,
 
   /* Use progressive streaming for payloads larger than ~1 KB to avoid
      tcp_write ERR_MEM when the body exceeds tcp_sndbuf.  The sent callback
-     drives http_service_send_payload_chunk() to push remaining data. */
+     drives http_service_send_payload_chunk() to push remaining data.
+     For status / config JSON this is safe because the body pointer
+     (connection->response_buffer) lives inside the connection struct and
+     is not freed until the connection is released. */
   if (body_len > 1024U)
   {
     connection->send_data = (const unsigned char *)body;
@@ -944,14 +954,13 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
   char ip_text[16];
   char mask_text[16];
   char gw_text[16];
-  control_service_stats_t control_stats;
-  control_queue_stats_t control_queue_stats;
-  discovery_service_stats_t discovery_stats;
-  backend_link_stats_t backend_stats;
+  static control_service_stats_t control_stats;
+  static control_queue_stats_t control_queue_stats;
+  static discovery_service_stats_t discovery_stats;
   mqtt_link_stats_t *mqtt_stats = &g_http_mqtt_stats_snapshot;
-  cluster_service_state_t cluster_state;
-  adc_service_state_t adc_state;
-  time_sync_service_stats_t time_sync_stats;
+  static cluster_service_state_t cluster_state;
+  static adc_service_state_t adc_state;
+  static time_sync_service_stats_t time_sync_stats;
   size_t heap_free = xPortGetFreeHeapSize();
   size_t heap_min = xPortGetMinimumEverFreeHeapSize();
   uint32_t http_active = 0U;
@@ -963,7 +972,6 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
   control_service_get_stats(&control_stats);
   control_queue_get_stats(&control_queue_stats);
   discovery_service_get_stats(&discovery_stats);
-  backend_link_service_get_stats(&backend_stats);
   mqtt_link_service_get_stats(mqtt_stats);
   cluster_service_get_state(&cluster_state);
   adc_service_get_state(&adc_state);
@@ -1004,7 +1012,6 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  "\"discovery\":{\"rx\":%lu,\"tx_attempts\":%lu,\"announce\":%lu,\"tx_failures\":%lu,\"discover\":%lu,\"last_tx_err\":%ld,\"last_payload_len\":%lu},"
                  "\"auth\":{\"required\":1,\"active_session\":%u,\"sessions_issued\":%lu,\"login_failures\":%lu},"
                  "\"http\":{\"connections\":%lu,\"requests\":%lu,\"errors\":%lu,\"active\":%lu,\"close_pending\":%lu,\"listener_up\":%lu},"
-                 "\"backend\":{\"connected\":%u,\"should_run\":%u,\"port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"sent_hello\":%lu,\"sent_heartbeat\":%lu,\"sent_status\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"last_error\":%lu},"
                  "\"cloud\":{\"configured\":%u,\"enabled\":%u,\"should_run\":%u,\"connected\":%u,\"transport\":%u,\"broker_port\":%u,\"connect_attempts\":%lu,\"connect_failures\":%lu,\"published_hello\":%lu,\"published_heartbeat\":%lu,\"published_status\":%lu,\"published_fault_reports\":%lu,\"received_commands\":%lu,\"command_errors\":%lu,\"published_acks\":%lu,\"ack_queue_dropped\":%lu,\"ack_queue_depth\":%lu,\"last_error\":%lu,\"status_dirty_count\":%lu,\"ca_fingerprint_configured\":%u,\"binding_secret_configured\":%u},"
                  "\"lwip\":{\"mem_avail\":%lu,\"mem_used\":%lu,\"mem_err\":%lu,\"tcp_pcb_used\":%lu,\"tcp_pcb_max\":%lu,\"tcp_seg_used\":%lu,\"tcp_seg_max\":%lu,\"pbuf_used\":%lu,\"pbuf_max\":%lu,\"sys_timeout_used\":%lu,\"sys_timeout_max\":%lu,\"sys_timeout_err\":%lu,\"eth_tx\":%lu,\"eth_tx_err\":%lu,\"eth_tx_free\":%lu,\"eth_tx_reclaim\":%lu,\"eth_tx_reclaim_schedule_err\":%lu,\"eth_last_tx_hal_status\":%lu,\"eth_last_tx_hal_error\":%lu,\"eth_last_tx_dma_error\":%lu,\"eth_rx\":%lu,\"eth_rx_null\":%lu,\"eth_rx_alloc_fail\":%lu,\"eth_rx_alloc_recover\":%lu,\"eth_rx_alloc_stalled\":%lu,\"eth_last_rx_ms\":%lu,\"eth_dma_status\":%lu,\"eth_rx_build_pending\":%lu}"
                  "}",
@@ -1110,17 +1117,6 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)http_active,
                  (unsigned long)http_close_pending,
                  (unsigned long)((g_http_listener_pcb != NULL) ? 1U : 0U),
-                 (unsigned int)backend_stats.connected,
-                 (unsigned int)backend_stats.should_run,
-                 (unsigned int)backend_stats.port,
-                 (unsigned long)backend_stats.connect_attempts,
-                 (unsigned long)backend_stats.connect_failures,
-                 (unsigned long)backend_stats.sent_hello,
-                 (unsigned long)backend_stats.sent_heartbeat,
-                 (unsigned long)backend_stats.sent_status,
-                 (unsigned long)backend_stats.received_commands,
-                 (unsigned long)backend_stats.command_errors,
-                 (unsigned long)backend_stats.last_error,
                  (unsigned int)mqtt_stats->configured,
                  (unsigned int)mqtt_stats->enabled,
                  (unsigned int)mqtt_stats->should_run,
@@ -1142,6 +1138,7 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)mqtt_stats->status_dirty_count,
                  (unsigned int)(mqtt_stats->cluster_ca_fingerprint[0] != '\0'),
                  (unsigned int)(mqtt_stats->cluster_binding_secret[0] != '\0'),
+#if LWIP_STATS
                  (unsigned long)lwip_stats.mem.avail,
                  (unsigned long)lwip_stats.mem.used,
                  (unsigned long)lwip_stats.mem.err,
@@ -1151,9 +1148,16 @@ static void http_service_format_status_json(char *buffer, size_t buffer_size)
                  (unsigned long)MEMP_STATS_GET(max, MEMP_TCP_SEG),
                  (unsigned long)MEMP_STATS_GET(used, MEMP_PBUF),
                  (unsigned long)MEMP_STATS_GET(max, MEMP_PBUF),
+#else
+                 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL,
+#endif
+#if MEMP_STATS
                  (unsigned long)MEMP_STATS_GET(used, MEMP_SYS_TIMEOUT),
                  (unsigned long)MEMP_STATS_GET(max, MEMP_SYS_TIMEOUT),
                  (unsigned long)MEMP_STATS_GET(err, MEMP_SYS_TIMEOUT),
+#else
+                 0UL, 0UL, 0UL,
+#endif
                  (unsigned long)g_eth_tx_packets,
                  (unsigned long)g_eth_tx_errors,
                  (unsigned long)g_eth_tx_free_packets,
@@ -1205,12 +1209,7 @@ __attribute__((noinline)) static err_t http_service_handle_status_request(http_s
   }
 
   http_service_format_status_json(connection->response_buffer, sizeof(connection->response_buffer));
-  http_service_uart_write("[http] status ready\r\n");
-  return http_service_send_payload_streaming(connection,
-                                             "200 OK",
-                                             "application/json",
-                                             (const unsigned char *)connection->response_buffer,
-                                             strlen(connection->response_buffer));
+  return http_service_send_payload(connection, "200 OK", "application/json", connection->response_buffer);
 }
 
 static void http_service_format_relay_json(char *buffer, size_t buffer_size, uint32_t relay_mask)
@@ -1368,7 +1367,7 @@ static void http_service_sync_backend_config_to_cluster_async(void)
 {
   cluster_service_state_t cluster_state;
   const cluster_node_t *nodes;
-  const device_config_t *config = device_config_get();
+  device_config_t config_snap; device_config_copy(&config_snap); const device_config_t *config = &config_snap;
   uint32_t count = 0U;
   uint32_t index;
   cluster_service_get_state(&cluster_state);
@@ -2747,6 +2746,256 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       strlen(response_body));
   }
 
+  /* ═══════════════════ Scheduler API (§22) ═══════════════════ */
+
+  if (strncmp(path, "/api/relay/channels/", 20) == 0) {
+    const char *rest = path + 20;
+    uint32_t channel = 0;
+    while (*rest >= '0' && *rest <= '9') {
+      channel = channel * 10 + (uint32_t)(*rest - '0');
+      rest++;
+    }
+    if (channel == 0 || channel > 16) {
+      http_service_format_error_json(response_body, response_body_size, "bad_channel");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+
+    /* ── 22.1 GET /api/relay/channels/:channel/schedule-week ── */
+    if ((strcmp(method, "GET") == 0) && (strcmp(rest, "/schedule-week") == 0)) {
+      weekly_schedule_t ws;
+      channel_scheduler_state_t st;
+      if ((scheduler_get_weekly_copy((uint8_t)channel, &ws) == 0U) ||
+          (scheduler_get_state_copy((uint8_t)channel, &st) == 0U)) {
+        http_service_format_error_json(response_body, response_body_size, "not_found");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
+      int w = snprintf(response_body, response_body_size,
+        "{\"ok\":true,\"channel\":%lu,\"schedule_enabled\":%u,\"days\":[",
+        (unsigned long)channel,
+        (unsigned int)st.schedule_enabled);
+      for (uint8_t d = 0; d < 7; d++) {
+        const daily_schedule_t *day = &ws.days[d];
+        w += snprintf(response_body + w, response_body_size - w,
+          "%s{\"weekday\":%u,\"intervals\":[",
+          d > 0 ? "," : "", (unsigned int)d);
+        for (uint8_t k = 0; k < day->interval_count; k++) {
+          w += snprintf(response_body + w, response_body_size - w,
+            "%s{\"start_minute\":%u,\"end_minute\":%u}",
+            k > 0 ? "," : "",
+            (unsigned int)day->intervals[k].start_minute,
+            (unsigned int)day->intervals[k].end_minute);
+        }
+        w += snprintf(response_body + w, response_body_size - w, "]}");
+      }
+      w += snprintf(response_body + w, response_body_size - w, "]}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.2 PUT /api/relay/channels/:channel/schedule-week/:weekday ── */
+    if ((strcmp(method, "PUT") == 0) && strncmp(rest, "/schedule-week/", 15) == 0) {
+      uint32_t weekday = 0;
+      const char *wp = rest + 15;
+      while (*wp >= '0' && *wp <= '9') { weekday = weekday * 10 + (uint32_t)(*wp - '0'); wp++; }
+      if (weekday > 6) {
+        http_service_format_error_json(response_body, response_body_size, "bad_weekday");
+        return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+      }
+      /* Parse intervals from form body: count=N & s0=480 & e0=720 & s1=840 & e1=1080 */
+      uint32_t count = 0;
+      http_service_extract_form_value(body, "count", &count);
+      if (count > SCHEDULER_MAX_INTERVALS) count = SCHEDULER_MAX_INTERVALS;
+      daily_schedule_t new_day;
+      memset(&new_day, 0, sizeof(new_day));
+      new_day.interval_count = (uint8_t)count;
+      char key[8];
+      for (uint32_t k = 0; k < count; k++) {
+        uint32_t sv = 0, ev = 0;
+        snprintf(key, sizeof(key), "s%lu", (unsigned long)k);
+        http_service_extract_form_value(body, key, &sv);
+        snprintf(key, sizeof(key), "e%lu", (unsigned long)k);
+        http_service_extract_form_value(body, key, &ev);
+        if (sv >= 1440 || ev == 0 || ev > 1440 || sv >= ev) {
+          http_service_format_error_json(response_body, response_body_size, "bad_interval");
+          return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+        }
+        new_day.intervals[k].start_minute = (uint16_t)sv;
+        new_day.intervals[k].end_minute = (uint16_t)ev;
+      }
+      if (!scheduler_validate_intervals(&new_day)) {
+        http_service_format_error_json(response_body, response_body_size, "schedule_overlap");
+        return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
+      }
+      if (scheduler_set_weekly_day((uint8_t)channel, (uint8_t)weekday, &new_day) == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "not_found");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.3 POST /api/relay/channels/:channel/schedule-week/:weekday/copy ── */
+    if ((strcmp(method, "POST") == 0) && strstr(rest, "/schedule-week/") && strstr(rest, "/copy")) {
+      uint32_t src_wd = 0;
+      const char *wp = rest + 15;
+      while (*wp >= '0' && *wp <= '9') { src_wd = src_wd * 10 + (uint32_t)(*wp - '0'); wp++; }
+      if (src_wd > 6) {
+        http_service_format_error_json(response_body, response_body_size, "bad_weekday");
+        return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+      }
+      /* Parse target weekdays from form.
+         target_weekdays is the documented API; targets is kept as a legacy alias. */
+      char targets_buf[64];
+      uint8_t targets[7];
+      uint8_t target_count = 0U;
+      if ((http_service_extract_form_text(body, "target_weekdays", targets_buf, sizeof(targets_buf)) != 0U) ||
+          (http_service_extract_form_text(body, "targets", targets_buf, sizeof(targets_buf)) != 0U)) {
+        const char *t = targets_buf;
+        while (*t) {
+          while (*t == ',' || *t == ' ') t++;
+          if (*t >= '0' && *t <= '9') {
+            uint32_t tw = (uint32_t)(*t - '0');
+            if ((tw <= 6) && (target_count < 7U)) {
+              targets[target_count++] = (uint8_t)tw;
+            }
+            while (*t >= '0' && *t <= '9') t++;
+          } else break;
+        }
+      }
+      if ((target_count == 0U) ||
+          (scheduler_copy_weekly_day((uint8_t)channel, (uint8_t)src_wd, targets, target_count) == 0U)) {
+        http_service_format_error_json(response_body, response_body_size, "bad_targets");
+        return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+      }
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.4 PATCH /api/relay/channels/:channel/scheduler/enabled ── */
+    if ((strcmp(method, "PATCH") == 0) && (strcmp(rest, "/scheduler/enabled") == 0)) {
+      uint32_t enabled = 0;
+      http_service_extract_form_value(body, "enabled", &enabled);
+      if (scheduler_set_enabled((uint8_t)channel, (uint8_t)(enabled ? 1 : 0)) == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "not_found");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.5 POST /api/relay/channels/:channel/scheduler/pause ── */
+    if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/scheduler/pause") == 0)) {
+      uint32_t mode = 0, dur = 0, until = 0, blocks = 0;
+      http_service_extract_form_value(body, "mode", &mode);
+      http_service_extract_form_value(body, "duration_seconds", &dur);
+      http_service_extract_form_value(body, "until", &until);
+      if (http_service_extract_form_value(body, "pause_blocks_auto_trigger", &blocks) == 0U) {
+        http_service_extract_form_value(body, "pause_blocks", &blocks);
+      }
+      uint8_t tv;
+      uint32_t now_unix = cluster_service_get_unix_time(&tv);
+      uint32_t pause_until = now_unix + 60U;
+      switch (mode) {
+        case 0: pause_until = now_unix + 60U; break;  /* current_segment_end simplified */
+        case 1: pause_until = now_unix + dur; break;
+        case 2: pause_until = until; break;
+        case 3: pause_until = SCHEDULER_PAUSE_FOREVER; break;
+        default: pause_until = now_unix + 60U; break;
+      }
+      if (scheduler_set_pause((uint8_t)channel, pause_until, (uint8_t)(blocks ? 1 : 0)) == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "not_found");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.6 POST /api/relay/channels/:channel/scheduler/resume ── */
+    if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/scheduler/resume") == 0)) {
+      scheduler_clear_pause((uint8_t)channel);
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.7 POST /api/relay/channels/:channel/control (user manual) ── */
+    if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/control") == 0)) {
+      uint32_t target = 0, pmode = 0, pdur = 0, puntil = 0, pblocks = 0;
+      http_service_extract_form_value(body, "target", &target);
+      http_service_extract_form_value(body, "pause_mode", &pmode);
+      http_service_extract_form_value(body, "pause_duration_seconds", &pdur);
+      http_service_extract_form_value(body, "pause_until", &puntil);
+      if (http_service_extract_form_value(body, "pause_blocks_auto_trigger", &pblocks) == 0U) {
+        http_service_extract_form_value(body, "pause_blocks", &pblocks);
+      }
+      scheduler_user_control((uint8_t)channel, (uint8_t)(target ? 1 : 0),
+                             (scheduler_pause_mode_t)pmode, pdur, puntil,
+                             (uint8_t)(pblocks ? 1 : 0));
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.8 POST /api/relay/channels/:channel/auto-hold ── */
+    if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/auto-hold") == 0)) {
+      auto_hold_cmd_t cmd;
+      uint32_t target = 0, dur = 0, session = 0, cts = 0;
+      memset(&cmd, 0, sizeof(cmd));
+      cmd.channel = (uint8_t)channel;
+      http_service_extract_form_value(body, "target", &target);   cmd.target = (uint8_t)(target ? 1 : 0);
+      http_service_extract_form_value(body, "duration_seconds", &dur); cmd.duration_seconds = dur;
+      http_service_extract_form_value(body, "session", &session); cmd.session = session;
+      http_service_extract_form_value(body, "command_ts", &cts);  cmd.command_ts = cts;
+      http_service_extract_form_text(body, "reason", cmd.reason, SCHEDULER_REASON_MAX_LEN + 1);
+      { uint8_t tv2; scheduler_handle_auto_hold(&cmd, HAL_GetTick(), cluster_service_get_unix_time(&tv2)); }
+      (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* ── 22.9 GET /api/relay/channels/:channel/scheduler/status ── */
+    if ((strcmp(method, "GET") == 0) && (strcmp(rest, "/scheduler/status") == 0)) {
+      channel_scheduler_state_t st;
+      if (scheduler_get_state_copy((uint8_t)channel, &st) == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "not_found");
+        return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+      }
+      uint8_t tv; uint32_t now_unix = cluster_service_get_unix_time(&tv);
+      uint32_t remain = 0;
+      if (st.auto_hold.session != 0) {
+        uint32_t now_ms = HAL_GetTick();
+        remain = (st.auto_hold.until_ms > now_ms) ?
+                 (st.auto_hold.until_ms - now_ms) / 1000U : 0;
+      }
+      (void)snprintf(response_body, response_body_size,
+        "{\"ok\":true,\"channel\":%lu,"
+        "\"schedule_enabled\":%u,"
+        "\"pause_active\":%u,"
+        "\"schedule_pause_until\":%lu,"
+        "\"pause_blocks_auto_trigger\":%u,"
+        "\"auto_hold_active\":%u,"
+        "\"auto_hold_target\":%u,"
+        "\"auto_hold_start_state\":%u,"
+        "\"auto_hold_remaining_seconds\":%lu,"
+        "\"auto_hold_session\":%lu,"
+        "\"auto_hold_last_command_ts\":%lu,"
+        "\"auto_hold_reason\":\"%s\","
+        "\"time_valid\":%u}",
+        (unsigned long)channel,
+        (unsigned int)st.schedule_enabled,
+        (unsigned int)(st.schedule_pause_until != 0 && now_unix < st.schedule_pause_until ? 1 : 0),
+        (unsigned long)st.schedule_pause_until,
+        (unsigned int)st.pause_blocks_auto_trigger,
+        (unsigned int)(st.auto_hold.session != 0 ? 1 : 0),
+        (unsigned int)st.auto_hold.target_state,
+        (unsigned int)st.auto_hold.start_state,
+        (unsigned long)remain,
+        (unsigned long)st.auto_hold.session,
+        (unsigned long)st.last_auto_hold_command_ts,
+        st.auto_hold.reason,
+        (unsigned int)tv);
+      return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+    }
+
+    /* fallthrough: unknown scheduler sub-path */
+  }
+
   http_service_format_error_json(response_body, response_body_size, "not_found");
   return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
 }
@@ -2824,9 +3073,19 @@ static err_t http_service_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
     http_service_uart_write(message);
   }
   
-  /* Reset chunk tracking for the new request */
+  /* Reset chunk tracking for the new request, UNLESS a streaming
+     response is already in progress (e.g. GET / is still pushing the
+     large HTML page).  Clobbering send_data would silently kill the
+     streaming and leave the browser waiting forever. */
   if (connection != NULL)
   {
+     if (connection->send_data != NULL && connection->send_progress < connection->send_total)
+     {
+       /* Another streaming response is still in flight — silently
+          drop the pipelined request.  The pbuf was already freed
+          above; just return so the ongoing transfer can continue. */
+       return ERR_OK;
+     }
      connection->send_data = NULL;
      connection->send_total = 0;
      connection->send_progress = 0;
@@ -2985,6 +3244,7 @@ static err_t http_service_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
   tcp_err(newpcb, http_service_error);
   tcp_sent(newpcb, http_service_sent);
   tcp_poll(newpcb, http_service_poll_close, 1);
+  tcp_nagle_disable(newpcb);
   (void)snprintf(message, sizeof(message), "[http] accept active=%lu\r\n",
                  (unsigned long)http_service_active_connection_count());
   http_service_uart_write(message);
@@ -3097,7 +3357,7 @@ void http_service_poll(void)
 
   g_http_poll_pending = 1U;
   g_http_poll_skip_count = 0U;
-  err = tcpip_callback(http_service_tcpip_step, NULL);
+  err = tcpip_try_callback(http_service_tcpip_step, NULL);
   if (err != ERR_OK)
   {
     g_http_poll_pending = 0U;

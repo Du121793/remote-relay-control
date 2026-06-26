@@ -1,15 +1,14 @@
 ﻿const express = require("express");
-const net = require("net");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
 const HTTP_PORT = Number(process.env.HTTP_PORT || 4300);
 const HTTP_HOST = String(process.env.HTTP_HOST || "127.0.0.1");
-const TCP_PORT = Number(process.env.TCP_PORT || 42001);
+const MQTT_CONTROL_PORT = Number(process.env.MQTT_CONTROL_PORT || 4301);
 const CLOUD_BROKER_HOST = String(process.env.CLOUD_BROKER_HOST || "broker.example.com");
 const CLOUD_BROKER_PORT = Number(process.env.CLOUD_BROKER_PORT || 8883);
-const CLOUD_TRANSPORT = Number(process.env.CLOUD_TRANSPORT || 1);
+const CLOUD_TRANSPORT = 1; /* MQTT only */
 const DUPLICATE_MASTER_GRACE_MS = Number(process.env.DUPLICATE_MASTER_GRACE_MS || 15000);
 const DUPLICATE_MASTER_SCAN_MS = Number(process.env.DUPLICATE_MASTER_SCAN_MS || 2000);
 const CLIENT_STALE_MS = Number(process.env.CLIENT_STALE_MS || 12000);
@@ -55,6 +54,31 @@ const helloProvisionTimers = new Map();
 let keyStore = [];
 let stateBroadcastScheduled = false;
 let cloudRegistrySaveTimer = 0;
+
+/* ── MQTT command publishing via broker control API (:4301) ──
+   The mqtt-psk-broker.js exposes POST /api/publish so the backend
+   does not need its own MQTT client — just HTTP POST to the broker. */
+const BROKER_CONTROL_URL = `http://127.0.0.1:${MQTT_CONTROL_PORT}`;
+
+async function mqttPublishCommand(clusterName, topicSuffix, payload) {
+  try {
+    const topic = `cluster/${clusterName}/command/${topicSuffix}`;
+    const payloadJson = JSON.stringify(payload);
+    const response = await fetch(`${BROKER_CONTROL_URL}/api/publish`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ topic, payload: payloadJson }),
+    });
+    const data = await response.json();
+    if (data.ok === true) return true;
+    console.error(`[mqtt-publish] control API returned: ${JSON.stringify(data)}`);
+  } catch (err) {
+    console.error(`[mqtt-publish] control API failed: ${err.message}`);
+    console.error(`[mqtt-publish] Ensure Mosquitto HTTP listener is on port ${MQTT_CONTROL_PORT}`);
+    console.error(`[mqtt-publish] Or set MQTT_CONTROL_PORT env var to the correct port`);
+  }
+  return false;
+}
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -243,6 +267,7 @@ function ensureClusterIdentityMaterial(record) {
   record.caFingerprint = bundle.caFingerprint;
   record.bindingSecret = bundle.bindingSecret;
   record.issuedAt = record.issuedAt || bundle.issuedAt;
+  saveCloudRegistry();
   return record;
 }
 
@@ -679,7 +704,23 @@ function buildTargetedMessage(base, req) {
 }
 
 function resolveKnownNode(nodeId) {
-  return Array.from(knownNodes.values()).find((item) => Number(item.nodeId) === Number(nodeId)) || null;
+  const numId = Number(nodeId);
+  /* Direct nodeId match */
+  let found = Array.from(knownNodes.values()).find((item) => Number(item.nodeId) === numId);
+  if (found && numId > 0) return found;
+  /* Fallback: match by deviceId substring (e.g., node-XXX-54087705) */
+  if (!found) {
+    found = Array.from(knownNodes.values()).find((item) =>
+      String(item.cloudDeviceId || "").includes(String(nodeId))
+    );
+  }
+  /* Fallback: match by cloudDeviceId exact */
+  if (!found) {
+    found = Array.from(knownNodes.values()).find((item) =>
+      String(item.cloudDeviceId) === String(nodeId)
+    );
+  }
+  return found || null;
 }
 
 function effectiveMasterNodeIdForGroup(backendKey, clusterName) {
@@ -720,11 +761,17 @@ function effectiveMasterNodeIdForGroup(backendKey, clusterName) {
   return 0;
 }
 
-async function remoteNodeRequest(nodeId, pathText, form) {
+async function remoteNodeRequest(nodeId, pathText, method, form) {
   const node = resolveKnownNode(nodeId);
   let token;
   let response;
   let data;
+  /* Backward compat: old calls pass (nodeId, path, form) with 3 args */
+  if (typeof method !== 'string' || (method !== 'GET' && method !== 'POST' && method !== 'PUT' && method !== 'PATCH' && method !== 'DELETE')) {
+    form = method;
+    method = 'POST';
+  }
+  if (!form) form = "";
 
   if (!node || !node.ip) {
     throw new Error("node_offline");
@@ -732,7 +779,7 @@ async function remoteNodeRequest(nodeId, pathText, form) {
 
   token = await remoteNodeLogin(node);
   response = await fetch(`http://${node.ip}${pathText}`, {
-    method: "POST",
+    method: method,
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       "X-Auth-Token": String(token),
@@ -748,7 +795,7 @@ async function remoteNodeRequest(nodeId, pathText, form) {
     remoteSessionCache.delete(String(Number(node.nodeId || 0)));
     token = await remoteNodeLogin(node);
     response = await fetch(`http://${node.ip}${pathText}`, {
-      method: "POST",
+      method: method,
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
         "X-Auth-Token": String(token),
@@ -1171,15 +1218,13 @@ function cloudClusterSummary(record) {
 }
 
 function buildSummarySnapshot() {
-  const clientList = Array.from(clients.values());
   return {
     ok: true,
     httpHost: HTTP_HOST,
     httpPort: HTTP_PORT,
-    tcpPort: TCP_PORT,
+    mqttPort: CLOUD_BROKER_PORT,
+    mqttControlPort: MQTT_CONTROL_PORT,
     keyCount: keyStore.length,
-    activeClients: clientList.filter((item) => !isClientStale(item)).length,
-    rawClients: clientList.length,
     knownNodes: knownNodes.size,
     cloudDevices: cloudDevices.size,
     cloudClusters: cloudClusters.size,
@@ -1257,6 +1302,72 @@ function broadcastState() {
       sseClients.delete(res);
     }
   }
+}
+
+/* ── Sync knownNodes from MQTT broker clients ── */
+let brokerNodesSynced = false;
+async function syncKnownNodesFromBroker() {
+  try {
+    const response = await fetch(`${BROKER_CONTROL_URL}/api/clients`);
+    const data = await response.json();
+    if (!data.ok || !Array.isArray(data.clients)) return;
+    for (const client of data.clients) {
+      if (!client.connected || !client.deviceId) continue;
+      const registryKey = `${String(client.clusterId || "default")}|${String(client.deviceId)}`;
+      const deviceRecord = cloudDevices.get(registryKey);
+      const clusterRecord = cloudClusters.get(String(client.clusterId || ""));
+      const knownKey = knownNodeKey(
+        clusterRecord?.backendKey || "",
+        clusterRecord?.clusterName || String(client.clusterId || "default"),
+        deviceRecord?.nodeId || 0
+      );
+      let node = knownNodes.get(knownKey);
+      if (!node) {
+        /* Find by deviceId across knownNodes */
+        for (const [k, n] of knownNodes) {
+          if (n.cloudDeviceId === client.deviceId) { node = n; break; }
+        }
+      }
+      /* Extract nodeId from deviceId if possible (format: node-NNNNNNNNN-NNNNNNNNN) */
+      let extractedNodeId = deviceRecord?.nodeId || 0;
+      if (!extractedNodeId && client.deviceId) {
+        const m = String(client.deviceId).match(/node-(\d+)-(\d+)/);
+        if (m) extractedNodeId = Number(m[2]);
+      }
+      if (!node) {
+        /* Create new knownNode from broker client info */
+        node = {
+          backendKey: clusterRecord?.backendKey || "",
+          cluster: clusterRecord?.clusterName || String(client.clusterId || "default"),
+          nodeId: extractedNodeId,
+          cloudClusterId: String(client.clusterId || ""),
+          cloudDeviceId: String(client.deviceId),
+          cloudKeyId: deviceRecord?.keyId || "",
+          online: true,
+          device: deviceRecord?.deviceName || client.clientId || "",
+          role: 0,
+          deviceState: 1,
+          deviceStateText: "運行中",
+          relayMask: 0,
+          lastSeen: new Date().toISOString(),
+          lastSeenMs: Date.now(),
+          via: "mqtt-broker",
+        };
+        const key = node.nodeId > 0
+          ? knownNodeKey(node.backendKey, node.cluster, node.nodeId)
+          : knownNodeKey(node.backendKey, node.cluster, `dev-${client.deviceId}`);
+        knownNodes.set(key, node);
+      } else {
+        node.online = true;
+        node.lastSeen = new Date().toISOString();
+        node.lastSeenMs = Date.now();
+        if (!node.cloudDeviceId) node.cloudDeviceId = String(client.deviceId);
+        if (!node.cloudClusterId) node.cloudClusterId = String(client.clusterId || "");
+        if (deviceRecord && deviceRecord.nodeId) node.nodeId = deviceRecord.nodeId;
+      }
+    }
+    brokerNodesSynced = true;
+  } catch (_) { /* broker not running yet */ }
 }
 
 function scheduleStateBroadcast() {
@@ -1503,7 +1614,10 @@ function scanStaleKnownNodes() {
   }
 }
 
-const tcpServer = net.createServer((socket) => {
+/* Raw TCP server (:42001) has been retired — MQTT is now the only control transport.
+   The TCP server code block below is preserved for reference but is dead code.
+const _retiredTcpServer = { listen() {} };
+if (false) { const tcpServer = net.createServer((socket) => {
   const id = `${socket.remoteAddress}:${socket.remotePort}`;
   const client = {
       id,
@@ -1750,7 +1864,7 @@ const tcpServer = net.createServer((socket) => {
     markKnownNodeOfflineForClient(client);
     pushEvent("tcp-error", { id, error: error.message });
   });
-});
+}); } /* end of retired TCP server block */
 
 function renderHtml() {
   return `<!doctype html>
@@ -1803,13 +1917,13 @@ function renderHtml() {
     </section>
     <section class="card">
       <div class="row" style="justify-content:space-between">
-        <h2 style="margin:0">目前 TCP 鏈路</h2>
+        <h2 style="margin:0">MQTT 裝置狀態</h2>
         <button class="secondary" onclick="refresh()">重新整理</button>
       </div>
       <table id="clientTable"></table>
     </section>
       <section class="card">
-        <h2>已知裝置</h2>
+        <h2>所有已知裝置</h2>
         <table id="knownNodeTable"></table>
       </section>
       <section class="card">
@@ -1848,6 +1962,14 @@ function renderHtml() {
       <div id="relayConfigPanels" class="muted">沒有可用裝置</div>
     </section>
     <section class="card">
+      <h2>排程器與 Auto Hold</h2>
+      <div class="row"><input id="schNodeId" placeholder="節點 nodeId"><input id="schChannel" placeholder="channel (1-16)"><button onclick="loadScheduler()">載入排程</button></div>
+      <div id="schStatus" class="muted" style="margin-top:6px"></div>
+      <div id="schDay" class="muted" style="margin-top:6px"></div>
+      <div class="row" style="margin-top:8px"><button onclick="schEnable()">啟用排程</button><button onclick="schDisable()">停用排程</button><button onclick="schPause()">暫停1hr</button><button onclick="schResume()">恢復</button></div>
+      <div class="row" style="margin-top:8px"><input id="ahDuration" placeholder="duration_seconds" value="600"><input id="ahSession" placeholder="session" value="1"><input id="ahReason" placeholder="reason" value="auto-hold"><select id="ahTarget"><option value="1">ON</option><option value="0">OFF</option></select><button onclick="sendAutoHold()">送 Auto Hold</button><button onclick="sendAutoHoldClear()">清除 Auto Hold</button></div>
+    </section>
+    <section class="card">
       <h2>手動命令</h2>
       <div class="row">
         <input id="commandNodeId" placeholder="來源節點 nodeId">
@@ -1856,6 +1978,7 @@ function renderHtml() {
           <option value="relay">單路控制</option>
           <option value="mask">遮罩控制</option>
           <option value="all">全部開關</option>
+          <option value="auto-hold">Auto Hold</option>
         </select>
         <input id="commandChannel" placeholder="channel">
         <input id="commandValue" placeholder="value / mask">
@@ -2278,20 +2401,14 @@ function renderHtml() {
         ' 筆 / 雲端叢集身份 ' + (summary.cloudClusters || 0) + ' 筆';
 
       document.getElementById('clientTable').innerHTML =
-        '<tr><th>nodeId</th><th>裝置</th><th>叢集</th><th>Cloud Cluster</th><th>Cloud Device</th><th>Cloud Key</th><th>角色</th><th>鏈路狀態</th><th>relayMask</th><th>ADC</th><th>session</th><th>最後更新</th></tr>' +
+        '<tr><th>clientId</th><th>deviceId</th><th>clusterId</th><th>狀態</th><th>遠端 IP</th><th>subscriptions</th></tr>' +
         currentClients.map((item) => '<tr>' +
-          '<td>' + esc(item.nodeId) + '</td>' +
-          '<td>' + esc(item.device) + '</td>' +
-          '<td>' + esc(item.cluster) + '</td>' +
-          '<td>' + esc(item.cloudClusterId) + '</td>' +
-          '<td>' + esc(item.cloudDeviceId) + '</td>' +
-          '<td>' + esc(item.cloudKeyId) + '</td>' +
-          '<td>' + esc(item.role) + '</td>' +
-          '<td>' + (item.stale ? pill('stale', false) : pill('active', true)) + '</td>' +
-          '<td>' + esc(item.relayMask) + '</td>' +
-          '<td>' + adcText(item) + '</td>' +
-          '<td>' + esc(item.session) + '</td>' +
-          '<td>' + esc(item.lastMessageAt) + '</td>' +
+          '<td>' + esc(item.clientId) + '</td>' +
+          '<td>' + esc(item.deviceId) + '</td>' +
+          '<td>' + esc(item.clusterId) + '</td>' +
+          '<td>' + (item.connected ? pill('已連線', true) : pill('離線', false)) + '</td>' +
+          '<td>' + esc(item.remote) + '</td>' +
+          '<td>' + esc((item.subscriptions || []).join(', ')) + '</td>' +
         '</tr>').join('');
 
       renderDeviceNamePanels(currentKnownNodes);
@@ -2413,14 +2530,13 @@ function renderHtml() {
         ]);
 
         document.getElementById('summary').innerHTML =
-          'HTTP ' + summary.httpPort +
-          ' / TCP ' + summary.tcpPort +
+          'HTTP :' + summary.httpPort +
+          ' / MQTT broker :' + summary.mqttPort +
+          ' / Control :' + summary.mqttControlPort +
           ' / 金鑰 ' + summary.keyCount +
-          ' 把 / 活躍鏈路 ' + summary.activeClients +
-          ' 條 / 原始 socket ' + summary.rawClients +
-          ' 條 / 已知裝置 ' + summary.knownNodes +
-          ' 台 / 雲端裝置身份 ' + (summary.cloudDevices || 0) +
-          ' 筆 / 雲端叢集身份 ' + (summary.cloudClusters || 0) + ' 筆';
+          ' 把 / 已知裝置 ' + summary.knownNodes +
+          ' 台 / 雲端裝置 ' + (summary.cloudDevices || 0) +
+          ' 筆 / 雲端叢集 ' + (summary.cloudClusters || 0) + ' 筆';
 
         document.getElementById('keyTable').innerHTML =
           '<tr><th>標籤</th><th>金鑰</th><th>狀態</th><th>最近使用</th><th>操作</th></tr>' +
@@ -2578,8 +2694,15 @@ function renderHtml() {
       const commandType = document.getElementById('commandType').value;
       const channel = document.getElementById('commandChannel').value.trim();
       const value = document.getElementById('commandValue').value.trim();
-      const body = {};
 
+      if (commandType === 'auto-hold') {
+        var ts=Math.floor(Date.now()/1000);
+        var r=await api('/send/'+nodeId+'/auto-hold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(channel),target:1,duration_seconds:Number(value||600),session:1,command_ts:ts,reason:'manual'})});
+        document.getElementById('commandResult').textContent=JSON.stringify(r);
+        refreshBurst();return;
+      }
+
+      const body = {};
       if (targetNodeId) body.targetNodeId = Number(targetNodeId);
       if (commandType === 'relay') {
         body.channel = Number(channel);
@@ -2681,6 +2804,14 @@ function renderHtml() {
       }
       refresh();
     }
+    // ── Scheduler functions ──
+    async function loadScheduler(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;var s=await remoteNodeGetJson(nid,'/api/relay/channels/'+ch+'/scheduler/status');var w=await remoteNodeGetJson(nid,'/api/relay/channels/'+ch+'/schedule-week');var st=document.getElementById('schStatus');var sd=document.getElementById('schDay');if(!s.ok){st.textContent='Failed: '+s.error;return}st.innerHTML='<b>Enabled:</b> '+(s.schedule_enabled?'Yes':'No')+' <b>Pause:</b> '+(s.pause_active?'Active (until '+s.schedule_pause_until+')':'None')+' <b>AutoHold:</b> '+(s.auto_hold_active?('target='+(s.auto_hold_target?'ON':'OFF')+' remain='+s.auto_hold_remaining_seconds+'s session='+s.auto_hold_session):'None');if(w.ok&&w.days){var days=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];var h='';for(var d=0;d<7;d++){var day=w.days[d];h+='<b>'+days[d]+':</b> ';if(!day.intervals||!day.intervals.length)h+='OFF';else for(var i=0;i<day.intervals.length;i++){var iv=day.intervals[i];h+=Math.floor(iv.start_minute/60)+':'+String(iv.start_minute%60).padStart(2,'0')+'-'+Math.floor(iv.end_minute/60)+':'+String(iv.end_minute%60).padStart(2,'0')+' '}h+='<br>'}sd.innerHTML=h}}
+    async function schEnable(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await api('/send/'+nid+'/scheduler/enabled',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch),enabled:1})});loadScheduler()}
+    async function schDisable(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await api('/send/'+nid+'/scheduler/enabled',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch),enabled:0})});loadScheduler()}
+    async function schPause(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await api('/send/'+nid+'/scheduler/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch),mode:1,duration_seconds:3600,pause_blocks_auto_trigger:0})});loadScheduler()}
+    async function schResume(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await api('/send/'+nid+'/scheduler/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch)})});loadScheduler()}
+    async function sendAutoHold(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();var dur=document.getElementById('ahDuration').value;var ses=document.getElementById('ahSession').value;var tgt=document.getElementById('ahTarget').value;var rsn=document.getElementById('ahReason').value;if(!nid||!ch)return;var ts=Math.floor(Date.now()/1000);var r=await api('/send/'+nid+'/auto-hold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch),target:Number(tgt),duration_seconds:Number(dur),session:Number(ses),command_ts:ts,reason:rsn})});document.getElementById('commandResult').textContent=JSON.stringify(r);loadScheduler()}
+    async function sendAutoHoldClear(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();var ses=document.getElementById('ahSession').value;var tgt=document.getElementById('ahTarget').value;if(!nid||!ch)return;var ts=Math.floor(Date.now()/1000);var r=await api('/send/'+nid+'/auto-hold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch),target:Number(tgt),duration_seconds:0,session:Number(ses),command_ts:ts,reason:'clear'})});document.getElementById('commandResult').textContent=JSON.stringify(r);loadScheduler()}
     renderDeviceNamePanels([]);
     renderRelayConfigPanels([], {});
     connectStream();
@@ -2954,7 +3085,13 @@ app.post("/api/cloud/devices", (req, res) => {
     return res.status(404).json({ ok: false, error: "cloud_cluster_not_found" });
   }
   if (cloudDevices.has(registryKey)) {
-    return res.status(409).json({ ok: false, error: "cloud_device_exists" });
+    /* Device exists — update keyId and/or nodeId (e.g. MCU UID
+       produces a different self_node_id than the deviceId suffix). */
+    const existing = cloudDevices.get(registryKey);
+    if (keyId) existing.keyId = keyId;
+    if (req.body.nodeId) existing.nodeId = Number(req.body.nodeId);
+    saveCloudRegistry();
+    return res.json({ ok: true, updated: true, keyId: existing.keyId, nodeId: existing.nodeId });
   }
 
   deviceBundle = buildDeviceCredentialBundle(clusterRecord, deviceId, deviceName, keyId);
@@ -3237,18 +3374,24 @@ app.patch("/api/cloud/clusters/:clusterId", (req, res) => {
   return res.json({ ok: true, cluster: cloudClusterSummary(record) });
 });
 
-app.get("/clients", (_req, res) => {
-  res.json({
-    ok: true,
-    clients: Array.from(clients.values()).map(clientSummary),
-  });
+app.get("/clients", async (_req, res) => {
+  try {
+    const response = await fetch(`${BROKER_CONTROL_URL}/api/clients`);
+    const data = await response.json();
+    res.json(data);
+  } catch (_) {
+    res.json({ ok: true, clients: [] });
+  }
 });
 
-app.get("/api/clients", (_req, res) => {
-  res.json({
-    ok: true,
-    clients: Array.from(clients.values()).map(clientSummary),
-  });
+app.get("/api/clients", async (_req, res) => {
+  try {
+    const response = await fetch(`${BROKER_CONTROL_URL}/api/clients`);
+    const data = await response.json();
+    res.json(data);
+  } catch (_) {
+    res.json({ ok: true, clients: [] });
+  }
 });
 
 app.get("/events", (_req, res) => {
@@ -3264,7 +3407,7 @@ app.get("/api/config/:nodeId/relays", async (req, res) => {
   let data;
 
   if (!node || !node.ip || !node.online) {
-    return res.status(404).json({ ok: false, error: "node_offline" });
+    return res.json({ ok: true, relays: [] });
   }
 
   try {
@@ -3374,81 +3517,229 @@ app.post("/send/:nodeId/relay", (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const channel = Number(req.body.channel);
   const value = Number(req.body.value);
-  const client = findClientByNodeId(nodeId);
 
-  if (!client) {
-    return res.status(404).json({ ok: false, error: "node_not_found" });
-  }
   if (!Number.isInteger(channel) || channel < 1 || channel > 16 || ![0, 1].includes(value)) {
     return res.status(400).json({ ok: false, error: "bad_relay_request" });
   }
 
-  const message = buildTargetedMessage({ type: "set_relay", channel, value }, req);
-  const effectiveNodeId = Number(message.node_id || nodeId);
-  if (!sendJson(client, message)) {
-    return res.status(409).json({ ok: false, error: "stale_client" });
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) {
+    return res.status(404).json({ ok: false, error: "node_not_found" });
   }
-  if (resolveKnownNode(effectiveNodeId)) {
-    queueRelayStateConfirm(effectiveNodeId);
+  const payload = {
+    channel, value,
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  if (!mqttPublishCommand(nodeInfo.cluster, "relay", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
   }
-  pushEvent("send-relay", { nodeId, channel, value, targetNodeId: message.node_id || 0 });
+  queueRelayStateConfirm(Number(payload.node_id));
+  pushEvent("send-relay", { nodeId, channel, value, targetNodeId: payload.node_id });
   return res.json({ ok: true });
 });
 
 app.post("/send/:nodeId/mask", (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const mask = Number(req.body.mask);
-  const client = findClientByNodeId(nodeId);
-
-  if (!client) {
-    return res.status(404).json({ ok: false, error: "node_not_found" });
-  }
   if (!Number.isInteger(mask) || mask < 0 || mask > 0xffff) {
     return res.status(400).json({ ok: false, error: "bad_mask" });
   }
-
-  const message = buildTargetedMessage({ type: "set_mask", mask }, req);
-  const effectiveNodeId = Number(message.node_id || nodeId);
-  if (!sendJson(client, message)) {
-    return res.status(409).json({ ok: false, error: "stale_client" });
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) {
+    return res.status(404).json({ ok: false, error: "node_not_found" });
   }
-  if (resolveKnownNode(effectiveNodeId)) {
-    queueRelayStateConfirm(effectiveNodeId);
+  const payload = {
+    mask,
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  if (!mqttPublishCommand(nodeInfo.cluster, "mask", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
   }
-  pushEvent("send-mask", { nodeId, mask, targetNodeId: message.node_id || 0 });
+  queueRelayStateConfirm(Number(payload.node_id));
+  pushEvent("send-mask", { nodeId, mask, targetNodeId: payload.node_id });
   return res.json({ ok: true });
 });
 
 app.post("/send/:nodeId/all", (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const value = Number(req.body.value);
-  const client = findClientByNodeId(nodeId);
-
-  if (!client) {
-    return res.status(404).json({ ok: false, error: "node_not_found" });
-  }
   if (![0, 1].includes(value)) {
     return res.status(400).json({ ok: false, error: "bad_value" });
   }
-
-  const message = buildTargetedMessage({ type: "set_all", value }, req);
-  const effectiveNodeId = Number(message.node_id || nodeId);
-  if (!sendJson(client, message)) {
-    return res.status(409).json({ ok: false, error: "stale_client" });
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) {
+    return res.status(404).json({ ok: false, error: "node_not_found" });
   }
-  if (resolveKnownNode(effectiveNodeId)) {
-    queueRelayStateConfirm(effectiveNodeId);
+  const payload = {
+    mask: (value === 1) ? 0xffff : 0,
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  if (!mqttPublishCommand(nodeInfo.cluster, "mask", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
   }
-  pushEvent("send-all", { nodeId, value, targetNodeId: message.node_id || 0 });
+  queueRelayStateConfirm(Number(payload.node_id));
+  pushEvent("send-all", { nodeId, value, targetNodeId: payload.node_id });
   return res.json({ ok: true });
 });
 
-app.post("/broadcast/ping", (_req, res) => {
-  for (const client of clients.values()) {
-    sendJson(client, { type: "ping" });
+/* ── New MQTT-based command routes ── */
+app.post("/send/:nodeId/auto-hold", (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  const payload = {
+    channel: Number(req.body.channel || 1),
+    target: Number(req.body.target || 0),
+    duration_seconds: Number(req.body.duration_seconds || 0),
+    session: Number(req.body.session || 0),
+    command_ts: Number(req.body.command_ts || Math.floor(Date.now() / 1000)),
+    reason: String(req.body.reason || "").slice(0, 63),
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  if (!mqttPublishCommand(nodeInfo.cluster, "auto-hold", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
   }
-  pushEvent("broadcast-ping", { count: clients.size });
-  res.json({ ok: true, count: clients.size });
+  return res.json({ ok: true });
+});
+
+app.post("/send/:nodeId/control", (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  const payload = {
+    channel: Number(req.body.channel || 1),
+    target: Number(req.body.target || 0),
+    pause_mode: Number(req.body.pause_mode || 0),
+    pause_duration_seconds: Number(req.body.pause_duration_seconds || 0),
+    pause_until: Number(req.body.pause_until || 0),
+    pause_blocks_auto_trigger: Number(req.body.pause_blocks_auto_trigger || 0),
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  if (!mqttPublishCommand(nodeInfo.cluster, "control", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  }
+  return res.json({ ok: true });
+});
+
+app.post("/send/:nodeId/scheduler/set", (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  const payload = {
+    channel: Number(req.body.channel || 1),
+    weekday: Number(req.body.weekday || 0),
+    count: Number(req.body.count || 0),
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  for (let i = 0; i < 8; i++) {
+    payload[`s${i}`] = Number(req.body[`s${i}`] || 0);
+    payload[`e${i}`] = Number(req.body[`e${i}`] || 0);
+  }
+  if (!mqttPublishCommand(nodeInfo.cluster, "scheduler/set", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  }
+  return res.json({ ok: true });
+});
+
+app.post("/send/:nodeId/scheduler/enabled", (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  const payload = {
+    channel: Number(req.body.channel || 1),
+    enabled: Number(req.body.enabled || 0),
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  if (!mqttPublishCommand(nodeInfo.cluster, "scheduler/enabled", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  }
+  return res.json({ ok: true });
+});
+
+app.post("/send/:nodeId/scheduler/pause", (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  const payload = {
+    channel: Number(req.body.channel || 1),
+    mode: Number(req.body.mode || 0),
+    duration_seconds: Number(req.body.duration_seconds || 0),
+    until: Number(req.body.until || 0),
+    pause_blocks_auto_trigger: Number(req.body.pause_blocks_auto_trigger || 0),
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  if (!mqttPublishCommand(nodeInfo.cluster, "scheduler/pause", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  }
+  return res.json({ ok: true });
+});
+
+app.post("/send/:nodeId/scheduler/resume", (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  const payload = {
+    channel: Number(req.body.channel || 1),
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  if (!mqttPublishCommand(nodeInfo.cluster, "scheduler/resume", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  }
+  return res.json({ ok: true });
+});
+
+app.post("/send/:nodeId/protection/force-stop", (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  const payload = {
+    channel: Number(req.body.channel || 1),
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  if (!mqttPublishCommand(nodeInfo.cluster, "protection/force-stop", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  }
+  return res.json({ ok: true });
+});
+
+app.post("/send/:nodeId/protection/unlock", (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  const payload = {
+    channel: Number(req.body.channel || 1),
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  if (!mqttPublishCommand(nodeInfo.cluster, "protection/unlock", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  }
+  return res.json({ ok: true });
+});
+
+app.post("/send/:nodeId/protection/clear-learning", (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  const payload = {
+    channel: Number(req.body.channel || 1),
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+  if (!mqttPublishCommand(nodeInfo.cluster, "protection/clear-learning", payload)) {
+    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  }
+  return res.json({ ok: true });
 });
 
 // ── MCU Provisioning API ──────────────────────────────────────────
@@ -3589,14 +3880,213 @@ app.post("/api/cloud/clusters/:clusterId/rotate-psk", (req, res) => {
 loadKeyStore();
 loadCloudRegistry();
 
-tcpServer.listen(TCP_PORT, () => {
-  console.log(`[backend-test] tcp listening on ${TCP_PORT}`);
+/* Commands are published to the MQTT broker via its control API on port 4301 */
+
+/* ═══════════════════════════════════════════════════════════════
+   Sensor Auto Hold API — Grafana/backend sensor alerts → MCU
+   ═══════════════════════════════════════════════════════════════ */
+
+// activeSensors: key = "cluster|device|channel"
+const activeSensors = new Map();
+
+function makeSensorKey(clusterId, deviceId, channel) {
+  return `${String(clusterId || "default")}|${String(deviceId || "")}|${Number(channel)}`;
+}
+
+// POST /api/sensor/alert
+// Body: { cluster_id?, device_id?, channel, target, duration_seconds, reason }
+// Creates or renews an Auto Hold session.  Only sends MQTT if this is
+// a new session OR ≥5 minutes have passed since the last MQTT renew.
+app.post("/api/sensor/alert", (req, res) => {
+  const channel        = Number(req.body.channel);
+  const target         = Number(req.body.target ?? 1);
+  const durationSec    = Number(req.body.duration_seconds ?? 600);
+  const reason         = String(req.body.reason || "sensor alert").slice(0, 63);
+  const clusterId      = String(req.body.cluster_id || "default");
+  const deviceId       = String(req.body.device_id || "");
+  const nowMs          = Date.now();
+  let   nowUnix        = Math.floor(nowMs / 1000);
+
+  if (!channel || channel < 1 || channel > 16) {
+    return res.status(400).json({ ok: false, error: "invalid_channel" });
+  }
+  if (target !== 0 && target !== 1) {
+    return res.status(400).json({ ok: false, error: "invalid_target" });
+  }
+  if (durationSec < 1 || durationSec > 1800) {
+    return res.status(400).json({ ok: false, error: "invalid_duration", max: 1800 });
+  }
+
+  // Resolve which device to target
+  if (!cloudClusters.has(clusterId)) {
+    return res.status(404).json({ ok: false, error: "cluster_not_found" });
+  }
+
+  // Try explicit node_id, then cloudDevices, then knownNodes
+  let targetNodeId = Number(req.body.node_id) || 0;
+  if (!targetNodeId && deviceId) {
+    const registryKey = `${clusterId}|${deviceId}`;
+    if (cloudDevices.has(registryKey)) {
+      const dev = cloudDevices.get(registryKey);
+      if (dev && dev.nodeId) targetNodeId = dev.nodeId;
+    }
+  }
+  if (!targetNodeId) {
+    // Pick any device in this cluster with a known nodeId
+    for (const [, dev] of cloudDevices) {
+      if (String(dev.clusterId || "default") === clusterId && dev.nodeId) {
+        targetNodeId = dev.nodeId;
+        break;
+      }
+    }
+  }
+  // Fallback: try knownNodes
+  if (!targetNodeId) {
+    for (const [nid, node] of knownNodes) {
+      targetNodeId = Number(nid);
+      break;
+    }
+  }
+  if (!targetNodeId) {
+    return res.status(503).json({ ok: false, error: "no_online_device", hint: "pass node_id explicitly" });
+  }
+
+  const key = makeSensorKey(clusterId, deviceId, channel);
+  let sensor = activeSensors.get(key);
+  const isNewSession = !sensor || sensor.session === 0;
+
+  // Ensure command_ts is always increasing (MCU rejects older ts)
+  if (sensor && sensor.lastCommandTs && nowUnix <= sensor.lastCommandTs) {
+    nowUnix = sensor.lastCommandTs + 1;
+  }
+  if (sensor) sensor.lastCommandTs = nowUnix;
+
+  if (isNewSession) {
+    // First alert — create new session
+    sensor = {
+      session:     crypto.randomBytes(4).readUInt32BE(0) >>> 0,  // positive uint32
+      channel,
+      target,
+      durationSec,
+      reason,
+      clusterId,
+      deviceId,
+      targetNodeId,
+      lastMqttRenewMs: 0,        // force immediate send
+      lastAlertMs: nowMs,
+      createdAtMs: nowMs,
+    };
+    activeSensors.set(key, sensor);
+  } else {
+    // Existing session — update tracking, maybe renew
+    sensor.lastAlertMs = nowMs;
+    sensor.reason = reason;
+    activeSensors.set(key, sensor);
+  }
+
+  // Decide whether to send MQTT now
+  const elapsedSinceRenew = (nowMs - sensor.lastMqttRenewMs);
+  const shouldSendMqtt = isNewSession || (elapsedSinceRenew >= 5 * 60 * 1000);
+
+  let mqttResult = null;
+  if (shouldSendMqtt) {
+    const nodeInfo = resolveKnownNode(targetNodeId);
+    const clusterName = nodeInfo?.cluster || clusterId;
+    const payload = {
+      channel,
+      target,
+      duration_seconds: durationSec,
+      session: sensor.session,
+      command_ts: nowUnix,
+      reason,
+      node_id: targetNodeId,
+      request_id: crypto.randomBytes(8).toString("hex"),
+    };
+    const mqttOk = mqttPublishCommand(clusterName, "auto-hold", payload);
+    mqttResult = mqttOk ? "sent" : "mqtt_unavailable";
+    if (mqttOk) {
+      sensor.lastMqttRenewMs = nowMs;
+      sensor.targetNodeId = targetNodeId;
+    }
+  } else {
+    mqttResult = "deferred";  // <5min since last MQTT, skip
+  }
+
+  return res.json({
+    ok: true,
+    session: sensor.session,
+    channel,
+    mqtt: mqttResult,
+    is_new_session: isNewSession,
+    next_renew_available_ms: sensor.lastMqttRenewMs + 5 * 60 * 1000,
+  });
+});
+
+// POST /api/sensor/recover
+// Body: { cluster_id?, device_id?, channel }
+// Ends the active sensor Auto Hold for this channel.
+app.post("/api/sensor/recover", (req, res) => {
+  const channel   = Number(req.body.channel);
+  const clusterId = String(req.body.cluster_id || "default");
+  const deviceId  = String(req.body.device_id || "");
+  const key       = makeSensorKey(clusterId, deviceId, channel);
+  const sensor    = activeSensors.get(key);
+
+  if (!sensor || sensor.session === 0) {
+    return res.json({ ok: true, cleared: false, reason: "no_active_session" });
+  }
+
+  const nowUnix = Math.floor(Date.now() / 1000);
+  const nodeInfo = resolveKnownNode(sensor.targetNodeId);
+  const clusterName = nodeInfo?.cluster || clusterId;
+  const payload = {
+    channel,
+    target: sensor.target,       // must match creation target
+    duration_seconds: 0,         // clear
+    session: sensor.session,
+    command_ts: nowUnix,
+    reason: "感測器恢復正常",
+    node_id: sensor.targetNodeId,
+    request_id: crypto.randomBytes(8).toString("hex"),
+  };
+
+  const mqttOk = mqttPublishCommand(clusterName, "auto-hold", payload);
+  activeSensors.delete(key);
+
+  return res.json({
+    ok: true,
+    cleared: true,
+    session: sensor.session,
+    channel,
+    mqtt: mqttOk ? "sent" : "mqtt_unavailable",
+  });
+});
+
+// GET /api/sensor/status — list all active sensor sessions
+app.get("/api/sensor/status", (_req, res) => {
+  const list = [];
+  for (const [key, s] of activeSensors) {
+    list.push({
+      key,
+      channel: s.channel,
+      target: s.target,
+      session: s.session,
+      duration_sec: s.durationSec,
+      reason: s.reason,
+      last_alert_ms: s.lastAlertMs,
+      last_mqtt_renew_ms: s.lastMqttRenewMs,
+      created_ms: s.createdAtMs,
+    });
+  }
+  return res.json({ ok: true, active: list.length, sensors: list });
 });
 
 app.listen(HTTP_PORT, HTTP_HOST, () => {
   console.log(`[backend-test] http listening on ${HTTP_HOST}:${HTTP_PORT}`);
 });
 
+setInterval(syncKnownNodesFromBroker, 5000);
+syncKnownNodesFromBroker();
+
 setInterval(scanDuplicateMasters, DUPLICATE_MASTER_SCAN_MS);
-setInterval(scanStaleClients, DUPLICATE_MASTER_SCAN_MS);
 setInterval(scanStaleKnownNodes, DUPLICATE_MASTER_SCAN_MS);

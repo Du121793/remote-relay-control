@@ -31,11 +31,11 @@
 #include "../../App/Config/device_config.h"
 #include "http_service.h"
 #include "control_service.h"
-#include "backend_link_service.h"
 #include "mqtt_link_service.h"
 #include "discovery_service.h"
 #include "adc_service.h"
 #include "relay_protection.h"
+#include "scheduler.h"
 #include "time_sync_service.h"
 #include "https_client_service.h"
 #include "lwip/stats.h"
@@ -397,6 +397,7 @@ int main(void)
   MX_MBEDTLS_Init();
   /* USER CODE BEGIN 2 */
   relay_protection_init();  /* force all relays OFF before config applies startup mask */
+  scheduler_init();
   device_config_init();
   /* Startup relay mask is now managed by relay_protection:
      boot_default_on / remember_state become pending requests
@@ -865,18 +866,35 @@ void StartDefaultTask(void const * argument)
     adc_service_poll();
     relay_protection_poll();
 
-    if ((last_stack_log_ms == 0U) || ((int32_t)(now - last_stack_log_ms) >= 5000))
+    /* Scheduler + Auto Hold tick */
     {
-      char stack_msg[64];
-      (void)snprintf(stack_msg, sizeof(stack_msg), "[rtos] default hw=%lu\r\n",
-                     (unsigned long)uxTaskGetStackHighWaterMark(NULL));
+      uint8_t time_valid;
+      uint32_t unix_time = cluster_service_get_unix_time(&time_valid);
+      scheduler_tick(HAL_GetTick(), unix_time, time_valid);
+    }
+
+    if ((last_stack_log_ms == 0U) || ((int32_t)(now - last_stack_log_ms) >= 30000))
+    {
+      char stack_msg[160];
+      extern UBaseType_t device_config_stack_high_water(void);
+      extern UBaseType_t control_queue_stack_high_water(void);
+      extern UBaseType_t discovery_service_stack_high_water(void);
+      TaskHandle_t tcpip = xTaskGetHandle("tcpip_thread");
+      (void)snprintf(stack_msg, sizeof(stack_msg),
+                     "[rtos] stacks: def=%lu cfg=%lu ctl=%lu disc=%lu tcpip=%lu heap_min=%lu\r\n",
+                     (unsigned long)uxTaskGetStackHighWaterMark(NULL),
+                     (unsigned long)device_config_stack_high_water(),
+                     (unsigned long)control_queue_stack_high_water(),
+                     (unsigned long)discovery_service_stack_high_water(),
+                     (unsigned long)(tcpip ? uxTaskGetStackHighWaterMark(tcpip) : 0UL),
+                     (unsigned long)xPortGetMinimumEverFreeHeapSize());
       uart3_write(stack_msg);
       last_stack_log_ms = now;
     }
 
     control_service_poll();
     discovery_service_poll();
-    backend_link_service_poll();
+    /* backend TCP (:42001) has been retired — commands now flow via MQTT */
     mqtt_link_service_poll();
     https_client_service_poll();
     time_sync_service_poll();
@@ -947,6 +965,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   */
 void Error_Handler(void)
 {
+	
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();

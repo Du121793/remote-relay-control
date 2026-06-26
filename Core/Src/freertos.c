@@ -76,14 +76,36 @@ extern UART_HandleTypeDef huart3;
 
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 {
-  static const char prefix[] = "\r\n[rtos] stack overflow: ";
+  static const char prefix[] = "\r\n[rtos] stack overflow: task=0x";
+  static const char delim[] = " name=";
   static const char suffix[] = "\r\n";
-  (void)xTask;
+  char hex_buf[9];
+  uint16_t i;
+  uint32_t handle_val = (uint32_t)xTask;
+
+  /* Convert task handle to hex (8 nibbles, bounded) */
+  for (i = 0U; i < 8U; i++)
+  {
+    uint8_t nibble = (uint8_t)((handle_val >> (28U - i * 4U)) & 0x0FU);
+    hex_buf[i] = (char)((nibble < 10U) ? ('0' + nibble) : ('A' + nibble - 10U));
+  }
+  hex_buf[8] = '\0';
 
   HAL_UART_Transmit(&huart3, (uint8_t *)prefix, sizeof(prefix) - 1U, 100U);
+  HAL_UART_Transmit(&huart3, (uint8_t *)hex_buf, 8U, 100U);
+  HAL_UART_Transmit(&huart3, (uint8_t *)delim, sizeof(delim) - 1U, 100U);
+
   if (pcTaskName != NULL)
   {
-    HAL_UART_Transmit(&huart3, (uint8_t *)pcTaskName, (uint16_t)strlen(pcTaskName), 100U);
+    /* Bounded output — max 16 chars to avoid strlen on corrupted memory */
+    uint16_t len = 0U;
+    while (len < 16U && pcTaskName[len] != '\0') { len++; }
+    HAL_UART_Transmit(&huart3, (uint8_t *)pcTaskName, len, 100U);
+  }
+  else
+  {
+    static const char null_name[] = "(null)";
+    HAL_UART_Transmit(&huart3, (uint8_t *)null_name, sizeof(null_name) - 1U, 100U);
   }
   HAL_UART_Transmit(&huart3, (uint8_t *)suffix, sizeof(suffix) - 1U, 100U);
 
