@@ -88,6 +88,8 @@ static StaticTask_t g_device_config_task_buffer;
 static StackType_t g_device_config_task_stack[4096]; /* 16 KB — provisioning path needs >8 KB */
 static StaticSemaphore_t g_device_config_save_mutex_buffer;
 static SemaphoreHandle_t g_device_config_save_mutex = NULL;
+static StaticSemaphore_t g_flash_storage_mutex_buffer;
+static SemaphoreHandle_t g_flash_storage_mutex = NULL;
 static uint8_t g_device_config_sync_result = 0U;
 
 typedef struct
@@ -1205,7 +1207,8 @@ static void device_config_worker_init(void)
     g_device_config_save_mutex =
       xSemaphoreCreateMutexStatic(&g_device_config_save_mutex_buffer);
   }
-  flash_storage_init();
+  if (g_flash_storage_mutex == NULL)
+    g_flash_storage_mutex = xSemaphoreCreateMutexStatic(&g_flash_storage_mutex_buffer);
   if ((g_device_config_queue != NULL) &&
       (g_device_config_save_mutex != NULL) &&
       (g_device_config_task_handle == NULL))
@@ -1374,3 +1377,20 @@ void device_config_poll(void)
 UBaseType_t device_config_stack_high_water(void) { if (g_device_config_task_handle == NULL) return 0; return uxTaskGetStackHighWaterMark(g_device_config_task_handle); }
 
 
+
+void flash_storage_lock(void)
+{
+  if (g_flash_storage_mutex == NULL) {
+    g_flash_storage_mutex = xSemaphoreCreateMutexStatic(&g_flash_storage_mutex_buffer);
+  }
+  if (g_flash_storage_mutex != NULL && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+    (void)xSemaphoreTake(g_flash_storage_mutex, portMAX_DELAY);
+  }
+}
+
+void flash_storage_unlock(void)
+{
+  if (g_flash_storage_mutex != NULL && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+    (void)xSemaphoreGive(g_flash_storage_mutex);
+  }
+}

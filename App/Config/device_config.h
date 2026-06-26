@@ -99,7 +99,8 @@ uint8_t device_config_persist_runtime_relay_mask(uint32_t relay_mask);
 void device_config_runtime_relay_mask_set(uint32_t relay_mask);
 void device_config_poll(void);
 
-#include "../Service/flash_storage.h"
+void flash_storage_lock(void);
+void flash_storage_unlock(void);
 unsigned long device_config_stack_high_water(void);
 
 #ifdef __cplusplus
