@@ -1,0 +1,99 @@
+=== autoControl Full API Test ===
+Started: Fri Jun 26 14:00:13     2026
+
+=== 1. Health Check ===
+  [PASS] HEALTH-245 role=2 connected=1 dhcp=1
+  [PASS] HEALTH-157 role=1 connected=0 dhcp=1
+  Token245=289245105 Token157=1276364727
+  Master: 245 (579948958)
+
+=== 2. MCU Auth API ===
+  [PASS] AUTH-001 login token=2224616933
+  [PASS] AUTH-002 bad-password 
+  [FAIL] AUTH-003 session {"ok":true,"auth_required":true,"authenticated":0,"active_session":1,"ttl_ms":900000}
+  [FAIL] AUTH-004 logout {"ok":true,"logged_out":true}
+
+=== 3. MCU Relay API ===
+  [PASS] RELAY-001 GET 
+  [PASS] RELAY-002 ON 
+  [PASS] RELAY-003 OFF 
+  [PASS] RELAY-004 mask 
+
+=== 4. MCU Cluster API ===
+  [PASS] CLUST-001 nodes count=1
+  [PASS] CLUST-002 invalid 
+
+=== 5. MCU Config API ===
+  [PASS] CFG-001 cluster 
+  [PASS] CFG-002 relays 
+  [PASS] CFG-003 relay-update 
+
+=== 6. MCU Protection API ===
+  [PASS] PROT-001 GET 
+  [PASS] PROT-002 cfg 
+  [PASS] PROT-003 unlock 
+
+=== 7. MCU Scheduler API ===
+  [PASS] SCH-001 GET week 
+  [PASS] SCH-002 PUT day 
+  [PASS] SCH-003 copy 
+  [PASS] SCH-004 enable 
+  [PASS] SCH-005 pause 
+  [PASS] SCH-006 resume 
+  [PASS] SCH-007 status 
+
+=== 8. MCU Auto Hold API ===
+  [PASS] AH-001 create 
+  [PASS] AH-002 session=0 (manual: internal check rejects, session stays 77701)
+  [PASS] AH-003 dur>1800 (manual: internal check rejects, session=77701)
+  [PASS] AH-004 clear 
+
+=== 9. MCU Manual Control ===
+  [PASS] CTRL-001 manual 
+
+=== 10. MCU Web UI ===
+  [PASS] WEB-001 HTML 68632 bytes
+
+=== 11. MCU Status JSON ===
+  [PASS] STAT-001 sections 
+
+=== 12. Backend Core API ===
+  [FAIL] BACK-SUMMARY 
+  [FAIL] BACK-KEYS 
+  [FAIL] BACK-KNOWN 
+  [FAIL] BACK-DEVICES 
+  [FAIL] BACK-CLUSTERS 
+  [FAIL] BACK-CLIENTS 
+
+=== 13. Backend /send API (MQTT) ===
+  [FAIL] SEND-001 relay 9→9 
+  [FAIL] SEND-002 pause 9→9 
+  [FAIL] SEND-003 resume 9→9
+  [FAIL] SEND-004 unlock 9→9 
+
+=== 14. Sensor API E2E ===
+
+  [FAIL] SENSOR-001 alert→MCU cmd=9→9 ah=0
+  [FAIL] SENSOR-002 recover cleared=0
+  [FAIL] SENSOR-003 status 
+  [FAIL] PROV-001 
+
+=== 15. Manual Code Verification ===
+(Tests requiring internal state inspection — verified by source code trace)
+  [PASS] MANUAL-001 session=0 internal scheduler.c:392: if(cmd->session==0) return
+  [PASS] MANUAL-002 dur>1800 internal scheduler.c:410-411 + MAX=1800
+  [PASS] MANUAL-003 target mismatch scheduler.c:428-429: hold->target_state != cmd->target
+  [PASS] MANUAL-004 CHANNEL_BUSY scheduler.c:423-424: hold->session!=0 && !=cmd->session
+  [PASS] MANUAL-005 old command_ts scheduler.c:398: cmd->command_ts < st->last_auto_hold_command_ts
+  [PASS] MANUAL-006 pause blocks AH scheduler.c:415-420: pause_until!=0 && pause_blocks && unix_time < pause_until
+  [PASS] MANUAL-007 schedule_enabled=0 still blocks scheduler.c:415-420 independent of schedule_enabled
+  [PASS] MANUAL-008 CTL scheduler ON interval scheduler.c:560-568: interval match → request_relay ON
+  [PASS] MANUAL-009 CTL no redundant send scheduler.c:566: relay_actual_state!=desired check
+  [PASS] MANUAL-010 AH expiry restore scheduler.c:536-538 + auto_hold_finish restore start_state
+  [PASS] MANUAL-011 GPIO only via worker all paths → request_relay → control_queue → worker
+  [PASS] MANUAL-012 reboot clears AH scheduler_init memset + no AH persistence
+
+======================================
+  TEST COMPLETE
+  PASS=42  FAIL=16  SKIP=0  TOTAL=58
+======================================
