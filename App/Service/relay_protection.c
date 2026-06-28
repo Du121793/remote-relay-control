@@ -8,6 +8,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#define RELAY_PROTECTION_NORMAL_LOW_MARGIN_PERCENT   8U
+#define RELAY_PROTECTION_NORMAL_HIGH_MARGIN_PERCENT 10U
+#define RELAY_PROTECTION_NORMAL_MIN_MARGIN_MA      300U
+
 extern RTC_HandleTypeDef hrtc;
 extern UART_HandleTypeDef huart3;
 
@@ -26,6 +30,7 @@ typedef struct
   uint8_t  fault_reason;
   uint8_t  learning_complete;
   uint8_t  protection_enabled;
+  uint8_t  ct_valid;
   uint8_t  device_strategy;
   uint8_t  ct_degraded;
   uint8_t  adc_saturated;
@@ -33,7 +38,6 @@ typedef struct
   uint8_t  fault_locked;
   uint8_t  learning_samples_collected;
   uint8_t  rms_stable_index;
-  uint8_t  pad[1];
 
   /* Timing */
   uint32_t relay_on_since_ms;
@@ -70,6 +74,8 @@ typedef struct
 
   /* Established baseline (never overwritten after learning) */
   uint32_t initial_health_baseline_ma;
+  uint32_t initial_run_min_ma;
+  uint32_t initial_run_max_ma;
   uint32_t initial_normal_low_ma;
   uint32_t initial_normal_high_ma;
   uint32_t initial_startup_peak_ma;
@@ -102,6 +108,8 @@ static relay_protection_user_config_t g_ucfg = {
   .learning_samples = RELAY_PROTECTION_DEFAULT_LEARNING_SAMPLES,
   .aging_update_hours = RELAY_PROTECTION_DEFAULT_AGING_HOURS,
   .aging_cap_percent = RELAY_PROTECTION_DEFAULT_AGING_CAP_PERCENT,
+  .relay_on_spacing_ms = RELAY_PROTECTION_DEFAULT_RELAY_ON_SPACING_MS,
+  .same_relay_on_spacing_ms = RELAY_PROTECTION_DEFAULT_SAME_RELAY_ON_SPACING_MS,
   .stall_timeout_multiplier_x10 = RELAY_PROTECTION_DEFAULT_STALL_MULTIPLIER,
 };
 
@@ -126,6 +134,9 @@ static void rp_assess_running(rp_ch_t *c, uint32_t now);
 static void rp_trip(rp_ch_t *c, uint8_t channel, uint8_t fault_level, uint8_t fault_reason, uint32_t now);
 static uint8_t rp_is_stable(const rp_ch_t *c);
 static void rp_update_reference(rp_ch_t *c);
+static void rp_compute_normal_range(rp_ch_t *c);
+static void rp_restore_learning_from_config(rp_ch_t *c, const device_config_current_t *current);
+static void rp_persist_learning_to_config(uint8_t channel, const rp_ch_t *c);
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 static uint32_t rp_abs_diff(uint32_t a, uint32_t b)
@@ -139,12 +150,165 @@ static uint8_t rp_is_lethal_fault(uint8_t fault_level)
 }
 
 /* ── Init (Phase B: boot safety) ─────────────────────────────────── */
+static uint32_t rp_margin_from_ref(uint32_t ref, uint32_t percent)
+{
+  uint32_t margin = (ref * percent) / 100U;
+  return (margin > RELAY_PROTECTION_NORMAL_MIN_MARGIN_MA) ?
+    margin : RELAY_PROTECTION_NORMAL_MIN_MARGIN_MA;
+}
+
+static void rp_compute_normal_range(rp_ch_t *c)
+{
+  uint32_t ref;
+  uint32_t low_margin;
+  uint32_t high_margin;
+  uint32_t run_min;
+  uint32_t run_max;
+
+  if ((c == NULL) || (c->initial_health_baseline_ma == 0U))
+  {
+    return;
+  }
+
+  ref = c->initial_health_baseline_ma + c->aging_offset_ma;
+  run_min = (c->initial_run_min_ma != 0U) ?
+    c->initial_run_min_ma : c->initial_health_baseline_ma;
+  run_max = (c->initial_run_max_ma != 0U) ?
+    c->initial_run_max_ma : c->initial_health_baseline_ma;
+  low_margin = rp_margin_from_ref(ref, RELAY_PROTECTION_NORMAL_LOW_MARGIN_PERCENT);
+  high_margin = rp_margin_from_ref(ref, RELAY_PROTECTION_NORMAL_HIGH_MARGIN_PERCENT);
+
+  run_min += c->aging_offset_ma;
+  run_max += c->aging_offset_ma;
+
+  c->normal_low_ma = (run_min > low_margin) ? (run_min - low_margin) : 0U;
+  c->normal_high_ma = run_max + high_margin;
+}
+
+static void rp_restore_learning_from_config(rp_ch_t *c, const device_config_current_t *current)
+{
+  if ((c == NULL) || (current == NULL))
+  {
+    return;
+  }
+
+  if ((current->learning_complete == 0U) || (current->learned_baseline_ma == 0U))
+  {
+    return;
+  }
+
+  c->learning_complete = 1U;
+  c->learning_samples_collected =
+    (current->learning_samples_collected > 5U) ? 5U : current->learning_samples_collected;
+  if (c->learning_samples_collected == 0U)
+  {
+    c->learning_samples_collected = 1U;
+  }
+
+  c->initial_health_baseline_ma = current->learned_baseline_ma;
+  c->initial_run_min_ma = current->learned_run_min_ma;
+  c->initial_run_max_ma = current->learned_run_max_ma;
+  c->initial_startup_peak_ma = current->learned_startup_peak_ma;
+  c->initial_startup_duration_ms = current->learned_startup_duration_ms;
+  c->initial_normal_low_ma = current->learned_initial_normal_low_ma;
+  c->initial_normal_high_ma = current->learned_initial_normal_high_ma;
+  c->aging_offset_ma = current->learned_aging_offset_ma;
+
+  c->normal_low_ma = current->learned_normal_low_ma;
+  c->normal_high_ma = current->learned_normal_high_ma;
+  if ((c->initial_run_min_ma == 0U) || (c->initial_run_max_ma == 0U))
+  {
+    c->initial_run_min_ma = c->initial_health_baseline_ma;
+    c->initial_run_max_ma = c->initial_health_baseline_ma;
+  }
+  if ((c->initial_normal_low_ma == 0U) ||
+      (c->initial_normal_high_ma == 0U) ||
+      (c->normal_low_ma == 0U) ||
+      (c->normal_high_ma == 0U))
+  {
+    rp_compute_normal_range(c);
+    if (c->initial_normal_low_ma == 0U)
+    {
+      c->initial_normal_low_ma = c->normal_low_ma;
+    }
+    if (c->initial_normal_high_ma == 0U)
+    {
+      c->initial_normal_high_ma = c->normal_high_ma;
+    }
+    return;
+  }
+  if (c->normal_low_ma == 0U)
+  {
+    c->normal_low_ma = c->initial_normal_low_ma;
+  }
+  if (c->normal_high_ma == 0U)
+  {
+    c->normal_high_ma = c->initial_normal_high_ma;
+  }
+}
+
+static void rp_persist_learning_to_config(uint8_t channel, const rp_ch_t *c)
+{
+  device_config_t config;
+  device_config_current_t *current;
+
+  if ((channel == 0U) || (channel > RELAY_PROTECTION_CHANNEL_COUNT) || (c == NULL))
+  {
+    return;
+  }
+
+  device_config_copy(&config);
+  current = &config.current[channel - 1U];
+  current->learning_complete = c->learning_complete;
+  current->learning_samples_collected = c->learning_samples_collected;
+  current->learned_baseline_ma = c->initial_health_baseline_ma;
+  current->learned_run_min_ma = c->initial_run_min_ma;
+  current->learned_run_max_ma = c->initial_run_max_ma;
+  current->learned_startup_peak_ma = c->initial_startup_peak_ma;
+  current->learned_startup_duration_ms = c->initial_startup_duration_ms;
+  current->learned_initial_normal_low_ma = c->initial_normal_low_ma;
+  current->learned_initial_normal_high_ma = c->initial_normal_high_ma;
+  current->learned_normal_low_ma = c->normal_low_ma;
+  current->learned_normal_high_ma = c->normal_high_ma;
+  current->learned_aging_offset_ma = c->aging_offset_ma;
+
+  if (c->learning_complete == 0U)
+  {
+    current->learning_samples_collected = 0U;
+    current->learned_baseline_ma = 0U;
+    current->learned_run_min_ma = 0U;
+    current->learned_run_max_ma = 0U;
+    current->learned_startup_peak_ma = 0U;
+    current->learned_startup_duration_ms = 0U;
+    current->learned_initial_normal_low_ma = 0U;
+    current->learned_initial_normal_high_ma = 0U;
+    current->learned_normal_low_ma = 0U;
+    current->learned_normal_high_ma = 0U;
+    current->learned_aging_offset_ma = 0U;
+  }
+
+  (void)device_config_update_and_save(&config);
+}
+
 void relay_protection_init(void)
 {
   const device_config_t *cfg = device_config_get();
   uint32_t now = HAL_GetTick();
 
   if (g_rp.init_done) return;
+  g_ucfg.cooldown_seconds = cfg->protection_global.cooldown_seconds;
+  g_ucfg.retry_delay_seconds = cfg->protection_global.retry_delay_seconds;
+  g_ucfg.max_retry_count = cfg->protection_global.max_retry_count;
+  g_ucfg.boot_delay_seconds = cfg->protection_global.boot_delay_seconds;
+  g_ucfg.learning_samples = cfg->protection_global.learning_samples;
+  g_ucfg.aging_update_hours = cfg->protection_global.aging_update_hours;
+  g_ucfg.aging_cap_percent = cfg->protection_global.aging_cap_percent;
+  g_ucfg.stall_timeout_multiplier_x10 =
+    cfg->protection_global.stall_timeout_multiplier_x10;
+  g_ucfg.relay_on_spacing_ms = cfg->protection_global.relay_on_spacing_ms;
+  g_ucfg.same_relay_on_spacing_ms =
+    cfg->protection_global.same_relay_on_spacing_ms;
+  relay_protection_set_user_config(&g_ucfg);
   memset(&g_rp, 0, sizeof(g_rp));
   memset(g_ch, 0, sizeof(g_ch));
 
@@ -194,7 +358,10 @@ void relay_protection_init(void)
   for (uint8_t i = 0U; i < RELAY_PROTECTION_CHANNEL_COUNT; i++)
   {
     g_ch[i].protection_enabled = cfg->current[i].protection_enabled;
-    g_ch[i].device_strategy = RELAY_PROTECTION_STRATEGY_SAFETY;
+    g_ch[i].device_strategy =
+      (cfg->current[i].device_strategy <= RELAY_PROTECTION_STRATEGY_MANUAL) ?
+      cfg->current[i].device_strategy : RELAY_PROTECTION_STRATEGY_SAFETY;
+    rp_restore_learning_from_config(&g_ch[i], &cfg->current[i]);
     g_ch[i].phase = RELAY_PROTECTION_PHASE_OFF;
   }
 
@@ -349,16 +516,7 @@ static uint8_t rp_is_stable(const rp_ch_t *c)
 static void rp_update_reference(rp_ch_t *c)
 {
   if (!c->learning_complete) return;
-  c->normal_low_ma = (c->initial_normal_low_ma * 9U + c->normal_low_ma) / 10U;
-  c->normal_high_ma = (c->initial_normal_high_ma * 9U + c->normal_high_ma) / 10U;
-
-  /* Clamp normal_low: not below initial × 0.7 */
-  uint32_t low_floor = (c->initial_normal_low_ma * 7U) / 10U;
-  if (c->normal_low_ma < low_floor) c->normal_low_ma = low_floor;
-
-  /* Clamp normal_high: not above initial × 1.5 */
-  uint32_t high_ceil = c->initial_normal_high_ma + (c->initial_normal_high_ma / 2U);
-  if (c->normal_high_ma > high_ceil) c->normal_high_ma = high_ceil;
+  rp_compute_normal_range(c);
 }
 
 /* ── Trip relay ──────────────────────────────────────────────────── */
@@ -453,6 +611,38 @@ static uint8_t rp_check_saturation(rp_ch_t *c, uint8_t channel, uint32_t now)
   return 0U;
 }
 
+static uint8_t rp_check_user_overcurrent(rp_ch_t *c,
+                                         uint8_t channel,
+                                         uint32_t now)
+{
+  const device_config_t *cfg = device_config_get();
+  uint8_t idx = (uint8_t)(channel - 1U);
+  uint32_t threshold = cfg->current[idx].overcurrent_milliamps;
+  uint32_t delay = cfg->current[idx].trip_delay_ms;
+
+  if (threshold == 0U) threshold = RELAY_PROTECTION_DEFAULT_OVERCURRENT_MA;
+  if (delay == 0U) delay = RELAY_PROTECTION_DEFAULT_TRIP_DELAY_MS;
+
+  if (c->current_milliamps > threshold)
+  {
+    if (c->above_slow_since_ms == 0U) c->above_slow_since_ms = now;
+    if ((now - c->above_slow_since_ms) >= delay)
+    {
+      rp_trip(c, channel,
+              RELAY_PROTECTION_FAULT_MANUAL_RESET,
+              RELAY_PROTECTION_REASON_OVERCURRENT,
+              now);
+      return 1U;
+    }
+  }
+  else
+  {
+    c->above_slow_since_ms = 0U;
+  }
+
+  return 0U;
+}
+
 static void rp_assess_startup(rp_ch_t *c, uint32_t now)
 {
   if (c->relay_on_since_ms == 0U) return;
@@ -462,9 +652,19 @@ static void rp_assess_startup(rp_ch_t *c, uint32_t now)
     c->startup_peak_ma = c->current_milliamps;
 
   c->startup_duration_ms = now - c->relay_on_since_ms;
+  if (c->protection_enabled != 0U &&
+      c->learning_complete == 0U)
+  {
+    if (rp_check_user_overcurrent(c,
+          (uint8_t)((uint8_t)(c - g_ch) + 1U), now))
+    {
+      return;
+    }
+  }
 
   /* ── Startup peak anomaly check (immediate, don't wait for stability) ── */
-  if (c->learning_complete)
+  if ((c->learning_complete != 0U) &&
+      (c->device_strategy != RELAY_PROTECTION_STRATEGY_MANUAL))
   {
     /* Peak anomaly: > history × 1.5 */
     if (c->initial_startup_peak_ma > 0U &&
@@ -522,7 +722,9 @@ static void rp_assess_startup(rp_ch_t *c, uint32_t now)
       c->startup_duration_ms = now - c->relay_on_since_ms;
 
       /* Learning: collect sample if valid */
-      if (!c->learning_complete && c->protection_enabled)
+      if (!c->learning_complete &&
+          c->protection_enabled &&
+          (c->device_strategy != RELAY_PROTECTION_STRATEGY_MANUAL))
       {
         if (c->current_milliamps > 0U && c->tripped == 0U && !c->ct_degraded)
         {
@@ -542,8 +744,10 @@ static void rp_assess_startup(rp_ch_t *c, uint32_t now)
               uint32_t p_min = 0xFFFFFFFFUL, p_max = 0U, p_sum = 0U;
               uint32_t d_max = 0U, d_sum = 0U;
               uint8_t valid = 1U;
+              uint8_t sample_count = (uint8_t)g_ucfg.learning_samples;
               uint8_t i;
-              for (i = 0U; i < 5U; i++)
+              if (sample_count == 0U || sample_count > 5U) sample_count = 5U;
+              for (i = 0U; i < sample_count; i++)
               {
                 if (c->learning_baselines[i] < b_min) b_min = c->learning_baselines[i];
                 if (c->learning_baselines[i] > b_max) b_max = c->learning_baselines[i];
@@ -560,21 +764,23 @@ static void rp_assess_startup(rp_ch_t *c, uint32_t now)
               if (valid)
               {
                 /* Phase E: Establish baseline (never overwritten) */
-                c->initial_health_baseline_ma = b_sum / 5U;
-                c->initial_startup_peak_ma = p_sum / 5U;
+                c->initial_health_baseline_ma = b_sum / sample_count;
+                c->initial_run_min_ma = b_min;
+                c->initial_run_max_ma = b_max;
+                c->initial_startup_peak_ma = p_sum / sample_count;
                 c->initial_startup_duration_ms = (d_max * 12U) / 10U; /* max × 1.2 */
 
                 /* normal_low/normal_high: P5/P95 from baseline samples */
                 /* Simplified: use ±20% of baseline */
-                c->initial_normal_low_ma = (c->initial_health_baseline_ma * 80U) / 100U;
-                c->initial_normal_high_ma = (c->initial_health_baseline_ma * 120U) / 100U;
-                c->normal_low_ma = c->initial_normal_low_ma;
-                c->normal_high_ma = c->initial_normal_high_ma;
                 c->aging_offset_ma = 0U;
+                rp_compute_normal_range(c);
+                c->initial_normal_low_ma = c->normal_low_ma;
+                c->initial_normal_high_ma = c->normal_high_ma;
 
                 c->learning_complete = 1U;
 
-                /* TODO: mark flash dirty for persistence */
+                rp_persist_learning_to_config(
+                  (uint8_t)((uint8_t)(c - g_ch) + 1U), c);
               }
               else
               {
@@ -611,9 +817,12 @@ static void rp_assess_running(rp_ch_t *c, uint32_t now)
   uint32_t ref;
   const device_config_t *cfg = device_config_get();
   uint8_t idx = (uint8_t)(c - g_ch);
+  uint8_t learned_dynamic =
+    ((c->learning_complete != 0U) &&
+     (c->device_strategy != RELAY_PROTECTION_STRATEGY_MANUAL)) ? 1U : 0U;
 
   /* Determine reference current */
-  if (c->learning_complete)
+  if (learned_dynamic != 0U)
   {
     ref = c->initial_health_baseline_ma + c->aging_offset_ma;
   }
@@ -631,6 +840,11 @@ static void rp_assess_running(rp_ch_t *c, uint32_t now)
     c->above_fast_since_ms = 0U;
     c->above_slow_since_ms = 0U;
     c->above_warning_since_ms = 0U;
+    if (c->device_strategy == RELAY_PROTECTION_STRATEGY_MANUAL)
+    {
+      c->below_undercurrent_since_ms = 0U;
+      return;
+    }
 
     /* Startup failure: 0mA for 5s → auto-recover */
     if (c->below_undercurrent_since_ms == 0U) c->below_undercurrent_since_ms = now;
@@ -661,25 +875,27 @@ static void rp_assess_running(rp_ch_t *c, uint32_t now)
   }
   else { c->above_fast_since_ms = 0U; }
 
-  if (c->learning_complete)
+  if (learned_dynamic != 0U)
   {
     /* ── OC Slow: > ref × 1.5 ──────────────────────────────── */
-    if (c->current_milliamps > (ref + ref / 2U))
+    if (c->normal_high_ma != 0U &&
+        c->current_milliamps > c->normal_high_ma)
     {
       if (c->above_slow_since_ms == 0U) c->above_slow_since_ms = now;
     }
     else { c->above_slow_since_ms = 0U; }
 
     /* ── OC Warning: > ref × 1.25 ──────────────────────────── */
-    if (c->current_milliamps > (ref + ref / 4U))
+    if (c->normal_high_ma != 0U &&
+        c->current_milliamps > c->normal_high_ma)
     {
       if (c->above_warning_since_ms == 0U) c->above_warning_since_ms = now;
     }
     else { c->above_warning_since_ms = 0U; }
 
     /* ── UC Undercurrent: < normal_low AND < ref/2 ──────────── */
-    if (c->current_milliamps < c->normal_low_ma &&
-        c->current_milliamps < (ref / 2U))
+    if (c->normal_low_ma != 0U &&
+        c->current_milliamps < c->normal_low_ma)
     {
       if (c->below_undercurrent_since_ms == 0U) c->below_undercurrent_since_ms = now;
     }
@@ -718,7 +934,7 @@ static void rp_assess_running(rp_ch_t *c, uint32_t now)
   /* Priority 2: Slow OC */
   if (c->above_slow_since_ms > 0U)
   {
-    uint32_t oc_delay = c->learning_complete ? 3000U :
+    uint32_t oc_delay = (learned_dynamic != 0U) ? 3000U :
       (cfg->current[idx].trip_delay_ms ? cfg->current[idx].trip_delay_ms
                                        : RELAY_PROTECTION_DEFAULT_TRIP_DELAY_MS);
     if ((now - c->above_slow_since_ms) >= oc_delay)
@@ -856,6 +1072,24 @@ void relay_protection_assess(uint8_t channel,
 
   /* Sync runtime config from device_config (may have changed via HTTP API) */
   c->protection_enabled = cfg->current[idx].protection_enabled;
+  c->device_strategy =
+    (cfg->current[idx].device_strategy <= RELAY_PROTECTION_STRATEGY_MANUAL) ?
+    cfg->current[idx].device_strategy : RELAY_PROTECTION_STRATEGY_SAFETY;
+  c->ct_valid = (ct_valid != 0U) ? 1U : 0U;
+
+  if (c->ct_valid == 0U)
+  {
+    c->current_milliamps = 0U;
+    c->adc_saturated = 0U;
+    c->above_fast_since_ms = 0U;
+    c->above_slow_since_ms = 0U;
+    c->above_warning_since_ms = 0U;
+    c->below_undercurrent_since_ms = 0U;
+    c->adc_saturation_since_ms = 0U;
+    c->stuck_check_pending = 0U;
+    c->stuck_above_count = 0U;
+    return;
+  }
 
   /* Update current snapshot */
   c->current_milliamps = current_milliamps;
@@ -864,7 +1098,6 @@ void relay_protection_assess(uint8_t channel,
   c->adc_saturated = adc_saturated &&
     (bias_millivolts >= CT_MEASUREMENT_BIAS_MIN_MV) &&
     (bias_millivolts <= CT_MEASUREMENT_BIAS_MAX_MV);
-  (void)ct_valid;
 
   /* Update RMS ring buffer for stability detection */
   c->rms_history[c->rms_stable_index] = current_milliamps;
@@ -920,7 +1153,8 @@ void relay_protection_assess(uint8_t channel,
     case RELAY_PROTECTION_PHASE_STARTUP:
       /* Basic safety (hard 30A, saturation) already checked above.
          Startup failure / stall detection requires protection_enabled. */
-      if (c->protection_enabled)
+      if (c->protection_enabled &&
+          (c->device_strategy != RELAY_PROTECTION_STRATEGY_MANUAL))
         rp_assess_startup(c, now_ms);
       else
       {
@@ -940,19 +1174,10 @@ void relay_protection_assess(uint8_t channel,
         rp_assess_running(c, now_ms);
       else
       {
-        /* Even without smart protection, check user threshold */
-        const device_config_t *cfg = device_config_get();
-        uint32_t threshold = cfg->current[idx].overcurrent_milliamps;
-        if (threshold == 0U) threshold = RELAY_PROTECTION_DEFAULT_OVERCURRENT_MA;
-        if (c->current_milliamps > threshold)
-        {
-          uint32_t delay = cfg->current[idx].trip_delay_ms;
-          if (delay == 0U) delay = RELAY_PROTECTION_DEFAULT_TRIP_DELAY_MS;
-          if (c->above_slow_since_ms == 0U) c->above_slow_since_ms = now_ms;
-          if ((now_ms - c->above_slow_since_ms) >= delay)
-            rp_trip(c, channel, RELAY_PROTECTION_FAULT_MANUAL_RESET, RELAY_PROTECTION_REASON_OVERCURRENT, now_ms);
-        }
-        else { c->above_slow_since_ms = 0U; }
+        c->above_fast_since_ms = 0U;
+        c->above_slow_since_ms = 0U;
+        c->above_warning_since_ms = 0U;
+        c->below_undercurrent_since_ms = 0U;
       }
       break;
 
@@ -1021,6 +1246,7 @@ uint8_t relay_protection_get_summary(uint8_t channel,
   out->fault_reason = c->fault_reason;
   out->learning_complete = c->learning_complete;
   out->protection_enabled = c->protection_enabled;
+  out->ct_valid = c->ct_valid;
   out->ct_degraded = c->ct_degraded;
   out->adc_saturated = c->adc_saturated;
   out->tripped = c->tripped;
@@ -1032,8 +1258,12 @@ uint8_t relay_protection_get_summary(uint8_t channel,
   out->aging_offset_ma = c->aging_offset_ma;
   out->normal_low_ma = c->normal_low_ma;
   out->normal_high_ma = c->normal_high_ma;
-  out->startup_peak_ma = c->startup_peak_ma;
-  out->startup_duration_ms = c->startup_duration_ms;
+  out->startup_peak_ma =
+    ((c->learning_complete != 0U) && (c->initial_startup_peak_ma != 0U)) ?
+    c->initial_startup_peak_ma : c->startup_peak_ma;
+  out->startup_duration_ms =
+    ((c->learning_complete != 0U) && (c->initial_startup_duration_ms != 0U)) ?
+    c->initial_startup_duration_ms : c->startup_duration_ms;
   out->trip_count = c->trip_count;
   out->cooldown_until_ms = c->cooldown_until_ms;
   out->learning_samples_collected = c->learning_samples_collected;
@@ -1059,10 +1289,20 @@ void relay_protection_clear_learning(uint8_t channel)
   rp_ch_t *c = &g_ch[channel - 1U];
   c->learning_complete = 0U;
   c->learning_samples_collected = 0U;
+  c->initial_health_baseline_ma = 0U;
+  c->initial_run_min_ma = 0U;
+  c->initial_run_max_ma = 0U;
+  c->initial_normal_low_ma = 0U;
+  c->initial_normal_high_ma = 0U;
+  c->initial_startup_peak_ma = 0U;
+  c->initial_startup_duration_ms = 0U;
+  c->normal_low_ma = 0U;
+  c->normal_high_ma = 0U;
   c->aging_offset_ma = 0U;
   memset(c->learning_baselines, 0, sizeof(c->learning_baselines));
   memset(c->learning_peaks, 0, sizeof(c->learning_peaks));
   memset(c->learning_durations, 0, sizeof(c->learning_durations));
+  rp_persist_learning_to_config(channel, c);
 }
 
 void relay_protection_unlock(uint8_t channel)
@@ -1092,6 +1332,7 @@ void relay_protection_unlock(uint8_t channel)
 void relay_protection_set_strategy(uint8_t channel, uint8_t strategy)
 {
   if (channel == 0U || channel > 16U) return;
+  if (strategy > RELAY_PROTECTION_STRATEGY_MANUAL) return;
   g_ch[channel - 1U].device_strategy = strategy;
 }
 
@@ -1122,6 +1363,13 @@ void relay_protection_get_user_config(relay_protection_user_config_t *out)
 
 void relay_protection_set_user_config(const relay_protection_user_config_t *cfg)
 {
-  if (cfg != NULL) g_ucfg = *cfg;
+  if (cfg != NULL)
+  {
+    g_ucfg = *cfg;
+    if (g_ucfg.learning_samples == 0U) g_ucfg.learning_samples = 1U;
+    if (g_ucfg.learning_samples > 5U) g_ucfg.learning_samples = 5U;
+    if (g_ucfg.relay_on_spacing_ms > 60000U) g_ucfg.relay_on_spacing_ms = 60000U;
+    if (g_ucfg.same_relay_on_spacing_ms > 600000U) g_ucfg.same_relay_on_spacing_ms = 600000U;
+  }
 }
 

@@ -17,7 +17,7 @@ extern "C" {
 
 /* ── Time interval for one ON period ── */
 typedef struct {
-    uint16_t start_minute;   /* 0..1439 */
+    uint16_t start_minute;   /* 0..1439, local wall-clock minute */
     uint16_t end_minute;     /* 1..1440, half-open [start, end) */
 } schedule_interval_t;
 
@@ -91,6 +91,7 @@ typedef struct {
 } auto_hold_cmd_t;
 
 void scheduler_handle_auto_hold(const auto_hold_cmd_t *cmd, uint32_t monotonic_ms, uint32_t unix_time);
+uint32_t scheduler_compute_current_segment_pause_until(uint8_t channel, uint32_t unix_time);
 
 /* User manual control (atomic: clear Auto Hold + set pause + send relay cmd) */
 void scheduler_user_control(uint8_t channel, uint8_t target,

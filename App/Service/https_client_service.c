@@ -47,6 +47,7 @@ typedef struct
   uint8_t state;
   volatile uint8_t callback_pending;
   volatile uint8_t restart_requested;
+  volatile uint8_t force_provision_once;
   uint32_t deadline_ms;
   uint32_t next_attempt_ms;
   char rx_buffer[HTTPS_CLIENT_RX_BUFFER_SIZE];
@@ -296,6 +297,7 @@ static void https_client_parse_and_apply(const char *body, size_t body_len)
     (void)device_config_update_and_save(&updated);
     mqtt_link_service_mark_status_dirty();
   }
+  g_https_client_context.force_provision_once = 0U;
 }
 
 static err_t https_client_recv(void *arg, struct altcp_pcb *pcb,
@@ -496,10 +498,12 @@ static void https_client_tcpip_step(void *argument)
       return;
     }
 
-    /* Provisioning only runs once after config is populated.
-       It re-runs every RETRY_INTERVAL_MS if the binding secret
-       is still empty. */
-    if (config->cloud_cluster_binding_secret[0] != '\0')
+    /* Normal boot provisioning runs only when binding_secret is empty.
+       MQTT TLS/PSK failures call https_client_service_trigger(), which
+       sets force_provision_once so a stale non-empty secret can be
+       replaced by the backend's current secret. */
+    if ((config->cloud_cluster_binding_secret[0] != '\0') &&
+        (g_https_client_context.force_provision_once == 0U))
     {
       return;
     }
@@ -566,5 +570,6 @@ void https_client_service_trigger(void)
   /* Only set flags — tcpip_step handles actual close/restart in lwIP context.
      This avoids racing on PCB ownership from non-tcpip callers. */
   g_https_client_context.restart_requested = 1U;
+  g_https_client_context.force_provision_once = 1U;
   g_https_client_context.next_attempt_ms = 0U;
 }

@@ -1,336 +1,222 @@
-# backend-test
+# autoControl 後端測試服務
 
-`backend-test` 目前同時扮演三個角色：
+`tools/backend-test` 是目前的後端參考實作。它不是最終 React 版本，但必須提供足夠完整的功能，讓未來搬遷時可以照這份行為重做。
 
-1. 現有韌體的 backend 長連線對接端
-2. 未來 cloud / registry / control plane 的本地模擬器
-3. 給瀏覽器操作的管理與控制 UI
-
-目前通訊分成兩層：
-
-- `browser -> backend-test`
-  - `HTTP + SSE`
-- `master device -> backend-test`
-  - 目前是 `plain TCP long link`
-  - 未來預計升級成 `MQTT over TLS`
-
-## 啟動
+## 1. 啟動
 
 ```powershell
-cd tools/backend-test
-npm install
-npm start
+cd C:\Users\Public\Code\stm32\f767\autoControl
+npm install --prefix tools\backend-test
+npm start --prefix tools\backend-test
 ```
 
-預設：
+預設服務：
 
-- UI / HTTP API: `http://127.0.0.1:4300/`
-- TCP backend link: `42001`
+- 後端網頁與 REST API：`http://127.0.0.1:4300/`
+- MQTT TLS-PSK broker：`:8883`
+- Broker HTTP 控制 API：`http://127.0.0.1:4301`
 
-安全預設：
+## 2. 後端登入
 
-- 管理 HTTP 只監聽 `127.0.0.1`
-- provisioning API 不回傳 device private key
-- 僅限本機隔離測試時，才能用 `ALLOW_PRIVATE_KEY_EXPORT=1` 明確開啟 private key 匯出
+目前是測試用固定帳號：
 
-相關環境變數：
+- 帳號：`admin123`
+- 密碼：`admin123`
 
-- `HTTP_HOST`
-- `HTTP_PORT`
-- `TCP_PORT`
-- `BACKEND_KEY`
-- `ALLOW_PRIVATE_KEY_EXPORT`
+登入 API：
 
-## 已有功能
+- `POST /api/auth/login`
+- `POST /api/auth/logout`
+- `GET /api/auth/session`
 
-### 1. TCP 長連線接入
+除了下列 API，其餘 `/api/*`、`/send/*` 都需要登入 session：
 
-接受來自韌體 master 的：
+- `/api/auth/login`
+- `/api/auth/logout`
+- `/api/auth/session`
+- `/api/provision`
 
-- `hello`
-- `heartbeat`
-- `status`
-- `fault_report`
+`/api/provision` 是 MCU 開機向後端取得 MQTT PSK 與 broker 設定用，不能要求使用者登入 cookie。
 
-並可下發：
+## 3. 多叢集與裝置認領
 
-- `set_relay`
-- `set_mask`
-- `set_all`
+後端支援多個雲端叢集。Dashboard 可用「叢集」下拉選單篩選節點。
 
-### 2. 金鑰管理
+### 3.1 認領節點
 
-金鑰資料持久化於：
+Dashboard 的「雲端/叢集」頁面提供認領表單：
 
-- `tools/backend-test/data/keys.json`
+- 叢集 ID
+- Node ID
+- Device ID
+- 顯示名稱
 
-`keys.json` 是本機 runtime 資料，不納入 Git。版本庫只保留：
+對應 API：
 
-- `tools/backend-test/data/keys.example.json`
+```http
+POST /api/cloud/claim-node
+Content-Type: application/json
 
-請使用 `BACKEND_KEY` 環境變數提供本機 bootstrap key，不要把真實 key 寫入範例檔或提交。
+{
+  "clusterId": "default",
+  "nodeId": 579948958,
+  "deviceId": "node-579948958",
+  "deviceName": "測試節點"
+}
+```
 
-UI 與 API 支援：
+行為：
 
-- 新增金鑰
-- 啟用 / 停用金鑰
-- 刪除金鑰
+- 如果叢集不存在，後端會建立該叢集。
+- 如果裝置不存在，後端會建立 cloud device 紀錄。
+- 如果裝置已存在，會更新 `nodeId`、`deviceName`、`owner`。
+- 認領完成後，MCU 仍需要透過 `/api/provision` 取得雲端連線設定。
 
-若資料檔不存在，會自動建立一把 bootstrap key：
+目前認領是測試版信任後端輸入的 `nodeId`。正式版建議改為簽章認領流程：
 
-- `label = bootstrap`
-- `key = BACKEND_KEY` 環境變數
-- 若未設定 `BACKEND_KEY`，預設為 `dev-key`
+1. 使用者在後端輸入 `node_id`。
+2. 後端產生一次性 challenge。
+3. 使用者把 challenge 放回 MCU。
+4. MCU 用本機裝置私鑰或叢集金鑰簽章回傳。
+5. 後端驗證簽章後才把該 device 綁定到使用者帳號。
 
-### 3. 已知裝置與 relay 控制
+這樣可避免任意使用者只知道 `node_id` 就搶先認領別人的設備。
 
-backend 會維護：
+## 4. MCU provisioning 流程
 
-- 目前 TCP 鏈路
-- 已知裝置
-- relay 設定快取
+目前 MCU provisioning 使用：
 
-UI 可直接操作：
+```http
+POST /api/provision
+Content-Type: application/json
 
-- master 本機 relay
-- backend -> master -> member relay
-- relay 名稱
-- relay enabled
-- relay remember_state
-- relay boot_default_on
-- 裝置名稱
+{
+  "cluster_id": "default",
+  "device_id": "node-579948958",
+  "device_fingerprint": "..."
+}
+```
 
-### 4. cloud identity registry
+成功回應包含：
 
-backend 會從 master 上報的 payload 裡整理出兩份 registry：
-
-- `cloud cluster identity`
-- `cloud device identity`
-
-資料持久化於：
-
-- `tools/backend-test/data/cloud-clusters.json`
-- `tools/backend-test/data/cloud-devices.json`
-
-這兩份檔案是本機 runtime registry，可能包含 CA private key、device private key 與 binding secret，因此不納入 Git，也不可作為正式環境的安全儲存方案。
-
-目前 registry 會記錄：
-
-- `cloud_cluster_id`
-- `cloud_device_id`
 - `cloud_key_id`
 - `cloud_transport`
-- 對應 `nodeId`
-- 對應裝置名稱 / 叢集名稱
-- `online`
-- `role`
-- `relayMask`
-- `lastSeenAt`
+- `cloud_broker_host`
+- `cloud_broker_port`
+- `cloud_cluster_ca_fingerprint`
+- `cloud_cluster_ca_cert_pem`
+- `cloud_cluster_binding_secret`
+- `provisioning_revision`
+- `ca_revocation_tag`
 
-並支援：
+MCU 取得後寫入本機 ROM config，之後由 Master 連線 MQTT broker。
 
-- 預建 cluster identity
-- 預建 device identity
-- 啟用 / 停用 cluster identity
-- 啟用 / 停用 device identity
+## 5. Dashboard 功能基準
 
-當 cluster/device 被停用時：
+目前後端 Dashboard 必須至少提供：
 
-- 現有 TCP client 會立即斷線
-- 後續 `hello` 也會被拒絕
+1. 簡單登入。
+2. 多叢集選擇。
+3. 以 `node_id` 認領設備。
+4. 進入叢集後平鋪顯示所有節點。
+5. 每個節點平鋪 16 路 relay。
+6. 可對每台節點控制：
+   - 單路 relay 開關
+   - 全開 / 全關
+   - 強制停止
+   - 解除鎖定
+   - 清除學習
+   - scheduler enable / pause / resume
+7. 可檢視：
+   - 節點在線狀態
+   - role：Master / Member
+   - relay mask
+   - CT 是否就緒
+   - 目前電流
+   - cloud device / cloud cluster registry
 
-### 5. fault / crash 接收
+注意：後端只轉發命令給 broker 或 MCU HTTP proxy，實際 GPIO、排程器、保護判斷都在 MCU。
 
-韌體發生 fault 後會：
+## 6. 重要 API
 
-1. 將 fault 詳細資訊存到 RTC backup registers
-2. 自動 reset
-3. 開機重連 backend 後送出 `fault_report`
-
-backend 目前會：
-
-- 在 UI `事件紀錄` 顯示
-- 在 console 直接 `console.error(...)`
-
-## MQTT over TLS-PSK 測試服務
-
-- MQTT broker：`0.0.0.0:8883`
-- 本機控制 API：`http://127.0.0.1:4301`
-- TLS：固定使用 TLS 1.2 PSK。
-- PSK identity：device 的 `cloud_device_id`。
-- PSK：cluster 的 `cloud_cluster_binding_secret` 經 base64url 解碼後的 32 bytes。
-- MQTT username/password 仍會比對 `cloud_key_id` 與原始 binding secret。
-
-啟動與桌面 smoke test：
-
-```powershell
-npm run mqtt
-npm run mqtt:smoke
-```
-
-控制 API：
+### 6.1 基本資料
 
 - `GET /api/summary`
-- `GET /api/clients`
-- `GET /api/events`
-- `POST /api/publish`
-
-裝置訂閱 `cluster/<clusterId>/command/time` 後，測試 broker 會自動下發：
-
-```json
-{
-  "request_id": "broker-time-...",
-  "unix_time": 1781367600
-}
-```
-
-master 寫入 LSE RTC，並透過 discovery announce 將時間同步給 member。
-
-`POST /api/publish` 範例：
-
-```json
-{
-  "topic": "cluster/default/command/relay",
-  "payload": {
-    "request_id": "test-1",
-    "node_id": 1165657530,
-    "channel": 3,
-    "value": 1
-  }
-}
-```
-
-relay queue 滿載時，裝置會在 ack 回覆：
-
-```json
-{
-  "ok": false,
-  "queued": 0,
-  "completed": 0,
-  "error": "queue_full"
-}
-```
-
-繼電器設定使用獨立 topic：
-
-```json
-{
-  "topic": "cluster/default/command/config/relay",
-  "payload": {
-    "request_id": "config-test-1",
-    "node_id": 1165657530,
-    "channel": 16,
-    "name": "MqttMember16",
-    "enabled": 1,
-    "remember_state": 0,
-    "boot_default_on": 0,
-    "adc_channel": 255,
-    "protection_enabled": 0,
-    "overcurrent_milliamps": 4500,
-    "trip_delay_ms": 1000,
-    "reset_hysteresis_milliamps": 500
-  }
-}
-```
-
-`node_id=0` 或省略時設定目前 master；指定 member node ID 時，由 master 透過
-member HTTP 設定介面保存。設定命令只有在 Flash 保存完成後才回覆完成 ACK：
-
-```json
-{
-  "ok": true,
-  "queued": 1,
-  "completed": 1,
-  "request_id": "config-test-1",
-  "target_node_id": 1165657530,
-  "error": ""
-}
-```
-
-一般 relay/mask 命令的 ACK 表示已接受進入 control queue，會是
-`queued=1, completed=0`；設定與時間命令則以 `completed=1` 表示持久化或時間套用已完成。
-
-## HTTP API
-
-### UI 與狀態
-
-- `GET /`
-- `GET /api/stream`
-- `GET /api/summary`
-- `GET /clients`
 - `GET /api/clients`
 - `GET /api/known-nodes`
-- `GET /events`
+- `GET /api/events`
+- `GET /api/stream`
 
-### 金鑰
+### 6.2 雲端叢集與裝置
 
-- `GET /api/keys`
-- `POST /api/keys`
-- `PATCH /api/keys/:id`
-- `DELETE /api/keys/:id`
-
-### cloud registry
-
-- `GET /api/cloud/devices`
 - `GET /api/cloud/clusters`
 - `POST /api/cloud/clusters`
+- `PATCH /api/cloud/clusters/:clusterId`
+- `POST /api/cloud/clusters/:clusterId/rotate-ca`
+- `POST /api/cloud/clusters/:clusterId/rotate-psk`
+- `GET /api/cloud/devices`
 - `POST /api/cloud/devices`
 - `PATCH /api/cloud/devices/:clusterId/:deviceId`
-- `PATCH /api/cloud/clusters/:clusterId`
+- `POST /api/cloud/claim-node`
+- `POST /api/cloud/devices/:clusterId/:deviceId/reset-fingerprint`
+- `POST /api/cloud/devices/:clusterId/:deviceId/rotate-credential`
+- `POST /api/provision`
 
-### 裝置設定 / relay 設定
-
-- `POST /api/config/:nodeId/device-name`
-- `GET /api/config/:nodeId/relays`
-- `POST /api/config/:nodeId/relay`
-
-### 控制命令
+### 6.3 Relay / 設定
 
 - `POST /send/:nodeId/relay`
 - `POST /send/:nodeId/mask`
 - `POST /send/:nodeId/all`
-- `POST /broadcast/ping`
+- `GET /api/config/:nodeId/relays`
+- `POST /api/config/:nodeId/relay`
 
-## relay 控制策略
+### 6.4 排程與保護
 
-目前 backend UI 為了減少 request 洪水，策略是：
+- `POST /send/:nodeId/scheduler/enabled`
+- `POST /send/:nodeId/scheduler/pause`
+- `POST /send/:nodeId/scheduler/resume`
+- `POST /send/:nodeId/protection/force-stop`
+- `POST /send/:nodeId/protection/unlock`
+- `POST /send/:nodeId/protection/clear-learning`
 
-1. 按下按鈕先進入 pending
-2. 同一台節點 `500ms` 內的多次切換合併成一個 `mask`
-3. 命令送出後，不再先假改 server 狀態
-4. 由 backend 背景做狀態確認
-5. 真實狀態一致後才解凍
+## 7. 目前測試結論
 
-另外：
+燒錄後測試結果：
 
-- 同一台節點只保留一個 in-flight confirm
-- remote login token 會快取 `60s`
-- stale client 不再假裝 `200 OK`
+- 兩台 MCU HTTP API 都可回應。
+- 破壞性 ROM v1 更新後，雲端設定被清空是預期行為。
+- 本地叢集正常選主：目前 `192.168.0.57` 為 Master，`192.168.0.209` 為 Member。
+- proxy pending queue 可連續收 4 筆遠端 proxy request。
+- `control_queue.busy_rejected=0`。
+- heap low watermark 維持約 `25504` bytes。
 
-## stale / offline 規則
+限制：
 
-預設：
+- MCU HTTP pool 目前只有 2 條連線。若瀏覽器同時開 4 條 TCP 連線打 MCU，仍可能有 connection reset。這不是 proxy queue 的問題。
+- 不建議直接把 MCU HTTP pool 提高到 4，因為每條 connection 有約 `12KB response + 1.5KB request` buffer，RAM 會明顯增加。
 
-- `CLIENT_STALE_MS = 12000`
-- `DUPLICATE_MASTER_SCAN_MS = 2000`
+## 8. Member 是否應該控制整個叢集
 
-backend 會在下列情況把裝置標成離線：
+目前建議仍維持「Master 對外連後端、後端命令先到 Master，再由 Master 代理 Member」。
 
-- TCP socket `close`
-- TCP socket `error`
-- 超過 stale 時間沒有新訊息
+不建議現在解除成「任意 Member 都可以控制任意叢集成員」，原因：
 
-## 未來方向
+- 權限面：每個 Member 都變成控制入口，攻擊面變大。
+- 一致性面：多個節點同時代理控制，容易出現狀態競爭。
+- 佇列面：relay control、scheduler、protection 都要保證單一排序來源，否則 UI 看到的 pending/confirmed 順序會亂。
+- 叢集面：Master 已經是選主結果，也是雲端唯一連線點；讓 Member 全都具備控制代理會破壞目前簡單模型。
 
-這個 backend-test 已開始承擔未來 cloud 的資料模型，但目前真正的 cloud transport 還沒切到 MQTT/TLS。
+可以考慮的折衷：
 
-後續規劃：
+- Member 可以控制自己本機 relay。
+- Member 的 UI 若要控制其他節點，仍轉交目前 Master。
+- 如果 Master 不可用，等叢集重新選主後再控制。
 
-1. `master -> cloud` 從 raw TCP 過渡到 `MQTT over TLS`
-2. 保留：
-   - 每台裝置獨立 `device identity`
-   - 每個叢集獨立 `cluster identity`
-3. backend-test 從目前 TCP emulator 逐步演進成：
-   - MQTT broker bridge
-   - cloud registry UI
-   - control plane simulator
+這樣比「所有 Member 都可互控」穩定，也比較容易驗證。
+
+## 9. 線上狀態同步
+
+- `GET /api/cloud/devices` 與 `GET /api/cloud/clusters` 會先查詢 broker control API `/api/clients`，再回傳雲端裝置與叢集摘要。
+- 這是為了避免 MQTT broker 已看到 MCU 連線，但後端 registry 尚未收到 MCU 狀態訊息時，管理頁仍顯示離線。
+- 若部署端 API 全部回 `401`，先確認後端登入帳密或環境變數是否與測試版預設 `admin123 / admin123` 一致。
+- Broker `/api/clients` 會回傳每個 MQTT client 最近一次 status 中的 `nodes` 陣列；後端會用它建立 Member known-node，讓管理頁可以控制不直接連後端的 Member。

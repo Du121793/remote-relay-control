@@ -13,6 +13,7 @@
 
 extern RTC_HandleTypeDef hrtc;
 extern struct netif gnetif;
+extern UART_HandleTypeDef huart3;
 
 #define CLUSTER_SERVICE_STALE_TIMEOUT_MS   6000UL
 #define CLUSTER_SERVICE_BAN_CAPACITY       16U
@@ -57,6 +58,14 @@ static void cluster_service_health_task(void *argument);
 static void cluster_service_ensure_health_task(void);
 static uint32_t cluster_service_health_score_from_lateness(uint32_t lateness_ms);
 static uint8_t cluster_service_rtc_poll_ready(void);
+
+static void cluster_service_boot_log(const char *text)
+{
+  if (text != NULL)
+  {
+    (void)HAL_UART_Transmit(&huart3, (uint8_t *)text, (uint16_t)strlen(text), 100U);
+  }
+}
 
 static uint32_t cluster_service_build_gateway_epoch(uint32_t unix_time)
 {
@@ -231,64 +240,17 @@ static uint8_t cluster_service_rtc_write(uint32_t unix_time)
 
 static void cluster_service_rtc_init(void)
 {
-  uint32_t fault_backup[26];
-  uint32_t index;
-  uint32_t start;
-  uint8_t reset_backup_domain = 0U;
-
   __HAL_RCC_PWR_CLK_ENABLE();
   HAL_PWR_EnableBkUpAccess();
-  if ((RCC->BDCR & RCC_BDCR_RTCSEL) != RCC_BDCR_RTCSEL_0)
-  {
-    for (index = 0U; index < 26U; ++index)
-    {
-      fault_backup[index] = (&RTC->BKP0R)[index];
-    }
-    __HAL_RCC_BACKUPRESET_FORCE();
-    __HAL_RCC_BACKUPRESET_RELEASE();
-    reset_backup_domain = 1U;
-  }
 
-  if ((RCC->BDCR & RCC_BDCR_LSEBYP) != 0U)
+  if ((RCC->BDCR & RCC_BDCR_LSERDY) == 0U)
   {
-    RCC->BDCR &= ~RCC_BDCR_LSEON;
-    start = HAL_GetTick();
-    while ((RCC->BDCR & RCC_BDCR_LSERDY) != 0U)
-    {
-      if ((HAL_GetTick() - start) >= 100U)
-      {
-        return;
-      }
-    }
-    RCC->BDCR &= ~RCC_BDCR_LSEBYP;
-  }
-
-  RCC->BDCR |= RCC_BDCR_LSEON;
-  start = HAL_GetTick();
-  while ((RCC->BDCR & RCC_BDCR_LSERDY) == 0U)
-  {
-    if ((HAL_GetTick() - start) >= CLUSTER_SERVICE_RTC_LSE_TIMEOUT_MS)
-    {
-      if (reset_backup_domain != 0U)
-      {
-        for (index = 0U; index < 26U; ++index)
-        {
-          (&RTC->BKP0R)[index] = fault_backup[index];
-        }
-      }
-      return;
-    }
+    RCC->BDCR |= RCC_BDCR_LSEON;
+    return;
   }
 
   RCC->BDCR = (RCC->BDCR & ~RCC_BDCR_RTCSEL) |
               RCC_BDCR_RTCSEL_0 | RCC_BDCR_RTCEN;
-  if (reset_backup_domain != 0U)
-  {
-    for (index = 0U; index < 26U; ++index)
-    {
-      (&RTC->BKP0R)[index] = fault_backup[index];
-    }
-  }
   g_cluster_context.state.rtc_lse_ready = 1U;
 }
 
@@ -887,11 +849,17 @@ void cluster_service_init(void)
     return;
   }
 
+  cluster_service_boot_log("[cluster] pre config init\r\n");
   device_config_init();
+  cluster_service_boot_log("[cluster] post config init\r\n");
   config = device_config_get();
+  cluster_service_boot_log("[cluster] pre clear ctx\r\n");
   memset(&g_cluster_context, 0, sizeof(g_cluster_context));
+  cluster_service_boot_log("[cluster] pre rtc init\r\n");
   cluster_service_rtc_init();
+  cluster_service_boot_log("[cluster] post rtc init\r\n");
   g_cluster_context.state.cluster_enabled = config->cluster_enabled;
+  cluster_service_boot_log("[cluster] post basic config\r\n");
   g_cluster_context.state.join_mode = (config->cluster_enabled != 0U)
                                       ? ((config->auto_join_cluster != 0U) ? CLUSTER_JOIN_AUTO : CLUSTER_JOIN_MANUAL)
                                       : CLUSTER_JOIN_DISABLED;
@@ -915,6 +883,7 @@ void cluster_service_init(void)
   g_cluster_context.health_good_since_ms = 0U;
   if (cluster_service_rtc_read(&restored_unix_time) != 0U)
   {
+    cluster_service_boot_log("[cluster] rtc read ok\r\n");
     g_cluster_context.state.time_valid = 1U;
     g_cluster_context.state.time_source = CLUSTER_TIME_SOURCE_RTC;
     g_cluster_context.state.time_quality = CLUSTER_TIME_QUALITY_RTC_HOLDOVER;
@@ -927,8 +896,10 @@ void cluster_service_init(void)
     g_cluster_context.software_time_base_unix = restored_unix_time;
     g_cluster_context.software_time_base_tick = HAL_GetTick();
   }
+  cluster_service_boot_log("[cluster] pre banned clear\r\n");
   memset(g_cluster_context.banned_node_ids, 0, sizeof(g_cluster_context.banned_node_ids));
   g_cluster_context.initialized = 1U;
+  cluster_service_boot_log("[cluster] init done\r\n");
 }
 
 static void cluster_service_ensure_health_task(void)

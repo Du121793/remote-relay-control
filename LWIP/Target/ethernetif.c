@@ -31,6 +31,7 @@
 #include <string.h>
 #include "cmsis_os.h"
 #include "lwip/tcpip.h"
+#include <stdint.h>
 
 /* Within 'USER CODE' section, code will be kept by default at each generation */
 /* USER CODE BEGIN 0 */
@@ -44,6 +45,8 @@ static void ethernetif_uart_write(const char *text);
 static void ethernetif_netif_up_callback(void *ctx);
 static void ethernetif_netif_down_callback(void *ctx);
 static void ethernetif_tx_reclaim_callback(void *ctx);
+static void ethernetif_invalidate_rx_payload(const void *addr, uint32_t len);
+static uint8_t ethernetif_rx_pbuf_chain_is_valid(const struct pbuf *p);
 
 extern UART_HandleTypeDef huart3;
 
@@ -176,7 +179,7 @@ typedef enum
 typedef struct
 {
   struct pbuf_custom pbuf_custom;
-  uint8_t buff[(ETH_RX_BUF_SIZE + 31) & ~31] __ALIGNED(32);
+  uint8_t buff[(ETH_RX_BUF_SIZE + ETH_PAD_SIZE + 31) & ~31] __ALIGNED(32);
 } RxBuff_t;
 
 /* Memory Pool Declaration */
@@ -193,6 +196,9 @@ typedef struct
   u8_t variable_name[size] __attribute__((section(".RxPoolSection"), aligned(32)))
 #endif
 LWIP_MEMPOOL_DECLARE(RX_POOL, ETH_RX_BUFFER_CNT, sizeof(RxBuff_t), "Zero-copy RX PBUF pool");
+
+typedef char ethernetif_rx_payload_align_check[(offsetof(RxBuff_t, buff) % 32U) == 0U ? 1 : -1];
+typedef char ethernetif_rx_element_align_check[(sizeof(RxBuff_t) % 32U) == 0U ? 1 : -1];
 
 /* Variable Definitions */
 static volatile uint8_t RxAllocStatus;
@@ -267,6 +273,7 @@ volatile uint32_t g_eth_tx_reclaim_calls = 0U;
 volatile uint32_t g_eth_tx_reclaim_schedule_errors = 0U;
 volatile uint32_t g_eth_irq_count = 0U;
 volatile uint32_t g_eth_rx_cplt_count = 0U;
+volatile uint32_t g_eth_rx_invalid_pbuf = 0U;
 volatile uint32_t g_eth_link_thread_started = 0U;
 volatile uint32_t g_eth_link_thread_loops = 0U;
 volatile int32_t g_eth_last_phy_link_state = 0;
@@ -312,6 +319,74 @@ lan8742_IOCtx_t  LAN8742_IOCtx = {ETH_PHY_IO_Init,
 
 /* Private functions ---------------------------------------------------------*/
 void pbuf_free_custom(struct pbuf *p);
+
+static void ethernetif_invalidate_rx_payload(const void *addr, uint32_t len)
+{
+  uintptr_t start;
+  uintptr_t end;
+
+  if ((addr == NULL) || (len == 0U))
+  {
+    return;
+  }
+
+  start = ((uintptr_t)addr) & ~(uintptr_t)31U;
+  end = (((uintptr_t)addr) + (uintptr_t)len + 31U) & ~(uintptr_t)31U;
+  SCB_InvalidateDCache_by_Addr((uint32_t *)start, (int32_t)(end - start));
+}
+
+static uint8_t ethernetif_rx_pbuf_ptr_is_pool_head(const struct pbuf *p)
+{
+  uintptr_t addr = (uintptr_t)p;
+  uintptr_t base = (uintptr_t)memp_memory_RX_POOL_base;
+  uintptr_t end = base + (uintptr_t)sizeof(memp_memory_RX_POOL_base);
+
+  if (((addr & 3U) != 0U) || (addr < base) || (addr >= end))
+  {
+    return 0U;
+  }
+
+  return ((((addr - base) % (uintptr_t)sizeof(RxBuff_t)) == 0U) ? 1U : 0U);
+}
+
+static uint8_t ethernetif_rx_pbuf_chain_is_valid(const struct pbuf *p)
+{
+  uint32_t guard = 0U;
+
+  while (p != NULL)
+  {
+    uintptr_t payload;
+    uintptr_t buff_start;
+    uintptr_t buff_end;
+
+    if ((guard++ >= ETH_RX_BUFFER_CNT) ||
+        (ethernetif_rx_pbuf_ptr_is_pool_head(p) == 0U))
+    {
+      g_eth_rx_invalid_pbuf++;
+      ethernetif_uart_write("[eth_rx] invalid pbuf ptr\r\n");
+      return 0U;
+    }
+
+    payload = (uintptr_t)p->payload;
+    buff_start = ((uintptr_t)p) + (uintptr_t)offsetof(RxBuff_t, buff);
+    buff_end = buff_start + (uintptr_t)sizeof(((RxBuff_t *)0)->buff);
+
+    if ((payload < buff_start) ||
+        (payload >= buff_end) ||
+        (((payload + (uintptr_t)p->len) > buff_end)) ||
+        (p->len > (ETH_RX_BUF_SIZE + ETH_PAD_SIZE)) ||
+        (p->tot_len < p->len))
+    {
+      g_eth_rx_invalid_pbuf++;
+      ethernetif_uart_write("[eth_rx] invalid pbuf fields\r\n");
+      return 0U;
+    }
+
+    p = p->next;
+  }
+
+  return 1U;
+}
 
 /**
   * @brief  Ethernet Rx Transfer completed callback
@@ -685,6 +760,9 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
   HAL_StatusTypeDef tx_status;
   ETH_BufferTypeDef Txbuffer[ETH_TX_DESC_CNT] = {0};
   uint8_t *tx_dma_buffer = TxDmaBuff[tx_slot];
+#if ETH_PAD_SIZE
+  uint32_t tx_skip = ETH_PAD_SIZE;
+#endif
 
   LWIP_UNUSED_ARG(netif);
   memset(Txbuffer, 0, sizeof(Txbuffer));
@@ -697,7 +775,8 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
   (void)HAL_ETH_ReleaseTxPacket(&heth);
   g_eth_tx_reclaim_calls++;
 
-  if (p->tot_len > ETH_TX_DMA_BUFFER_SIZE)
+  if ((p->tot_len < ETH_PAD_SIZE) ||
+      ((p->tot_len - ETH_PAD_SIZE) > ETH_TX_DMA_BUFFER_SIZE))
   {
     g_eth_tx_errors++;
     return ERR_IF;
@@ -705,18 +784,33 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
 
   for (q = p; q != NULL; q = q->next)
   {
-    ethernetif_copy_bytes_safe(&tx_dma_buffer[copy_offset], q->payload, q->len);
-    copy_offset += q->len;
+    const uint8_t *src = (const uint8_t *)q->payload;
+    uint32_t len = q->len;
+
+#if ETH_PAD_SIZE
+    if (tx_skip != 0U)
+    {
+      uint32_t drop = (len > tx_skip) ? tx_skip : len;
+      src += drop;
+      len -= drop;
+      tx_skip -= drop;
+    }
+#endif
+    if (len != 0U)
+    {
+      ethernetif_copy_bytes_safe(&tx_dma_buffer[copy_offset], src, len);
+      copy_offset += len;
+    }
   }
 
   /* Ensure CPU-written TX data is visible to the ETH DMA on Cortex-M7 D-Cache. */
-  SCB_CleanDCache_by_Addr((uint32_t *)tx_dma_buffer, (int32_t)((p->tot_len + 31U) & ~31U));
+  SCB_CleanDCache_by_Addr((uint32_t *)tx_dma_buffer, (int32_t)((copy_offset + 31U) & ~31U));
 
   Txbuffer[0].buffer = tx_dma_buffer;
-  Txbuffer[0].len = p->tot_len;
+  Txbuffer[0].len = copy_offset;
   Txbuffer[0].next = NULL;
 
-  TxConfig.Length = p->tot_len;
+  TxConfig.Length = copy_offset;
   TxConfig.TxBuffer = Txbuffer;
   TxConfig.pData = p;
 
@@ -791,8 +885,16 @@ static struct pbuf * low_level_input(struct netif *netif)
 
   if (p != NULL)
   {
-    g_eth_rx_packets++;
-    g_eth_last_rx_ms = HAL_GetTick();
+    if (ethernetif_rx_pbuf_chain_is_valid(p) != 0U)
+    {
+      g_eth_rx_packets++;
+      g_eth_last_rx_ms = HAL_GetTick();
+    }
+    else
+    {
+      p = NULL;
+      g_eth_rx_null_reads++;
+    }
   }
   else
   {
@@ -1287,12 +1389,12 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
       RxAllocStatus = RX_ALLOC_OK;
       g_eth_rx_alloc_stalled = 0U;
       /* Get the buff from the struct pbuf address. */
-      *buff = (uint8_t *)p + offsetof(RxBuff_t, buff);
+      *buff = (uint8_t *)p + offsetof(RxBuff_t, buff) + ETH_PAD_SIZE;
       p->custom_free_function = pbuf_free_custom;
       /* Initialize the struct pbuf.
       * This must be performed whenever a buffer's allocated because it may be
       * changed by lwIP or the app, e.g., pbuf_free decrements ref. */
-      ethernetif_init_custom_pbuf_safe(p, *buff, 0U);
+      ethernetif_init_custom_pbuf_safe(p, *buff - ETH_PAD_SIZE, 0U);
     }
     else
     {
@@ -1314,12 +1416,43 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
   struct pbuf **ppStart = (struct pbuf **)pStart;
   struct pbuf **ppEnd = (struct pbuf **)pEnd;
   struct pbuf *p = NULL;
+  u16_t link_len;
 
-  /* Get the struct pbuf from the buff address. */
-  p = (struct pbuf *)(buff - offsetof(RxBuff_t, buff));
+  if ((ppStart == NULL) || (ppEnd == NULL) || (buff == NULL) || (Length == 0U))
+  {
+    return;
+  }
+
+  /*
+   * Invalidate DMA-written payload before touching pbuf metadata.  The RX
+   * payload is cache-line aligned by RxBuff_t; the helper still rounds the
+   * range defensively for future D-Cache enablement.
+   */
+  ethernetif_invalidate_rx_payload(buff, Length);
+
+  /* Get the struct pbuf from the DMA buffer address.  DMA starts after
+   * ETH_PAD_SIZE bytes so lwIP can keep IP/TCP headers word-aligned. */
+  p = (struct pbuf *)(buff - ETH_PAD_SIZE - offsetof(RxBuff_t, buff));
+  if (ethernetif_rx_pbuf_ptr_is_pool_head(p) == 0U)
+  {
+    g_eth_rx_invalid_pbuf++;
+    ethernetif_uart_write("[eth_rx] invalid link buff\r\n");
+    return;
+  }
+
   p->next = NULL;
   p->tot_len = 0;
-  p->len = Length;
+  if (*ppStart == NULL)
+  {
+    p->payload = buff - ETH_PAD_SIZE;
+    link_len = (u16_t)(Length + ETH_PAD_SIZE);
+  }
+  else
+  {
+    p->payload = buff;
+    link_len = Length;
+  }
+  p->len = link_len;
 
   /* Chain the buffer. */
   if (!*ppStart)
@@ -1338,11 +1471,8 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
    * set to its own length, plus the length of all the following pbufs in the chain. */
   for (p = *ppStart; p != NULL; p = p->next)
   {
-    p->tot_len += Length;
+    p->tot_len += link_len;
   }
-
-  /* Invalidate data cache because Rx DMA's writing to physical memory makes it stale. */
-  SCB_InvalidateDCache_by_Addr((uint32_t *)buff, Length);
 
 /* USER CODE END HAL ETH RxLinkCallback */
 }

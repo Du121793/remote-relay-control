@@ -121,8 +121,11 @@ static uint32_t http_service_active_control_session_count(void);
 static void http_service_format_session_json(char *buffer, size_t buffer_size, uint8_t authenticated);
 static void http_service_format_login_json(char *buffer, size_t buffer_size, uint32_t token);
 static void http_service_format_logout_json(char *buffer, size_t buffer_size);
+static uint8_t http_service_local_password_matches(const device_config_t *config, const char *password);
+static uint8_t http_service_service_auth_matches(const device_config_t *config, const char *body);
 static void http_service_format_cluster_config_json(char *buffer, size_t buffer_size);
 static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_size);
+static void http_service_format_dashboard_live_json(char *buffer, size_t buffer_size);
 static void http_service_format_relay_config_json(char *buffer, size_t buffer_size);
 static err_t http_service_handle_status_request(http_service_connection_t *connection);
 static uint8_t http_service_get_master_ip_text(char *buffer, size_t buffer_size, uint8_t *is_local_master);
@@ -1282,6 +1285,59 @@ static void http_service_format_logout_json(char *buffer, size_t buffer_size)
                  "{\"ok\":true,\"logged_out\":true}");
 }
 
+static uint8_t http_service_local_password_matches(const device_config_t *config, const char *password)
+{
+  uint8_t hash[DEVICE_CONFIG_PASSWORD_HASH_LEN];
+
+  if ((config == NULL) || (password == NULL))
+  {
+    return 0U;
+  }
+
+  if (device_config_hash_is_zero(config->local_admin_password_hash) != 0U)
+  {
+    return (strcmp(password, HTTP_AUTH_PASSWORD) == 0) ? 1U : 0U;
+  }
+
+  device_config_hash_password_text(password, hash);
+  return (memcmp(hash, config->local_admin_password_hash, sizeof(hash)) == 0) ? 1U : 0U;
+}
+
+static uint8_t http_service_service_auth_matches(const device_config_t *config, const char *body)
+{
+  static char node_text[16];
+  static char unix_text[16];
+  static char tag_text[16];
+  uint32_t node_id;
+  uint32_t unix_time;
+  uint32_t auth_tag;
+  uint32_t expected_tag;
+
+  if ((config == NULL) || (body == NULL))
+  {
+    return 0U;
+  }
+
+  if ((device_config_hash_is_zero(config->cluster_password_hash) != 0U) ||
+      !http_service_extract_form_text(body, "node_id", node_text, sizeof(node_text)) ||
+      !http_service_extract_form_text(body, "unix_time", unix_text, sizeof(unix_text)) ||
+      !http_service_extract_form_text(body, "auth_tag", tag_text, sizeof(tag_text)) ||
+      !http_service_parse_u32_value(node_text, &node_id) ||
+      !http_service_parse_u32_value(unix_text, &unix_time) ||
+      !http_service_parse_u32_value(tag_text, &auth_tag) ||
+      (node_id == 0U) ||
+      (unix_time == 0U))
+  {
+    return 0U;
+  }
+
+  expected_tag = device_config_compute_auth_tag(config->cluster_password_hash,
+                                                unix_time,
+                                                node_id,
+                                                config->cluster_name);
+  return (auth_tag == expected_tag) ? 1U : 0U;
+}
+
 static uint8_t http_service_get_master_ip_text(char *buffer, size_t buffer_size, uint8_t *is_local_master)
 {
   cluster_service_state_t cluster_state;
@@ -1372,8 +1428,7 @@ static void http_service_sync_backend_config_to_cluster_async(void)
   uint32_t index;
   cluster_service_get_state(&cluster_state);
   if ((cluster_state.role != CLUSTER_ROLE_MASTER) ||
-      (config->cluster_enabled == 0U) ||
-      (config->backend_key[0] == '\0'))
+      (config->cluster_enabled == 0U))
   {
     g_http_backend_sync_active = 0U;
     g_http_backend_sync_cursor = 0U;
@@ -1516,6 +1571,9 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                  "\"auto_join_cluster\":%u,"
                  "\"cluster_name\":\"%s\","
                  "\"password_configured\":%u,"
+                 "\"local_admin_password_configured\":%u,"
+                 "\"cluster_password_configured\":%u,"
+                 "\"cluster_password_default\":%u,"
                  "\"role\":%u,"
                  "\"join_mode\":%u,"
                  "\"self_node_id\":%lu,"
@@ -1525,7 +1583,6 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                  "\"is_local_master\":%u,"
                  "\"backend_host\":\"%s\","
                  "\"backend_port\":%u,"
-                 "\"backend_key_configured\":%u,"
                  "\"cloud_enabled\":%u,"
                  "\"cloud_transport\":%u,"
                  "\"cloud_broker_host\":\"%s\","
@@ -1541,7 +1598,10 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                  (unsigned int)config->cluster_enabled,
                  (unsigned int)config->auto_join_cluster,
                  cluster_name_json,
-                 (unsigned int)(config->cluster_password_hash[0] != 0U ? 1U : 0U),
+                 (unsigned int)(device_config_hash_is_zero(config->cluster_password_hash) == 0U ? 1U : 0U),
+                 (unsigned int)(device_config_hash_is_zero(config->local_admin_password_hash) == 0U ? 1U : 0U),
+                 (unsigned int)(device_config_hash_is_zero(config->cluster_password_hash) == 0U ? 1U : 0U),
+                 (unsigned int)device_config_hash_matches_default_cluster_password(config->cluster_password_hash),
                  (unsigned int)cluster_state.role,
                  (unsigned int)cluster_state.join_mode,
                  (unsigned long)cluster_state.self_node_id,
@@ -1551,7 +1611,6 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
                  (unsigned int)is_local_master,
                  backend_host_json,
                  (unsigned int)config->backend_port,
-                 (unsigned int)(config->backend_key[0] != '\0' ? 1U : 0U),
                  (unsigned int)config->cloud_enabled,
                  (unsigned int)config->cloud_transport,
                  cloud_broker_host_json,
@@ -1672,6 +1731,94 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
   }
 }
 
+static void http_service_format_dashboard_live_json(char *buffer, size_t buffer_size)
+{
+  const cluster_node_t *nodes;
+  uint32_t count = 0U;
+  uint32_t index;
+  uint32_t relay_mask = board_relay_snapshot();
+  size_t used;
+  int written;
+
+  used = (size_t)snprintf(buffer,
+                          buffer_size,
+                          "{\"ok\":true,\"relay_mask\":%lu,\"protection\":[",
+                          (unsigned long)relay_mask);
+  if (used >= buffer_size)
+  {
+    return;
+  }
+
+  for (index = 0U; index < DEVICE_CONFIG_RELAY_COUNT; ++index)
+  {
+    relay_protection_summary_t ps;
+    (void)relay_protection_get_summary((uint8_t)(index + 1U), &ps);
+    written = snprintf(buffer + used,
+                       buffer_size - used,
+                       "%s{\"ch\":%lu,\"fault_locked\":%u,\"tripped\":%u,"
+                       "\"fault_reason\":%u,\"fault_level\":%u,"
+                       "\"current_ma\":%lu,\"protection_enabled\":%u,"
+                       "\"adc_saturated\":%u}",
+                       (index == 0U) ? "" : ",",
+                       (unsigned long)(index + 1U),
+                       (unsigned int)ps.fault_locked,
+                       (unsigned int)ps.tripped,
+                       (unsigned int)ps.fault_reason,
+                       (unsigned int)ps.fault_level,
+                       (unsigned long)ps.current_milliamps,
+                       (unsigned int)ps.protection_enabled,
+                       (unsigned int)ps.adc_saturated);
+    if ((written < 0) || ((size_t)written >= (buffer_size - used)))
+    {
+      return;
+    }
+    used += (size_t)written;
+  }
+
+  written = snprintf(buffer + used, buffer_size - used, "],\"nodes\":[");
+  if ((written < 0) || ((size_t)written >= (buffer_size - used)))
+  {
+    return;
+  }
+  used += (size_t)written;
+
+  nodes = cluster_service_get_nodes(&count);
+  (void)count;
+  for (index = 0U; index < CLUSTER_SERVICE_NODE_CAPACITY; ++index)
+  {
+    if (nodes[index].valid == 0U)
+    {
+      continue;
+    }
+
+    written = snprintf(buffer + used,
+                       buffer_size - used,
+                       "%s{\"node_id\":%lu,\"role\":%u,\"online\":%u,"
+                       "\"relay_mask\":%lu,\"adc_current_milliamps\":%lu,"
+                       "\"adc_valid\":%u,\"adc_ct_valid\":%u,"
+                       "\"adc_signal_present\":%u}",
+                       (used > (size_t)0U && buffer[used - 1U] != '[') ? "," : "",
+                       (unsigned long)nodes[index].node_id,
+                       (unsigned int)nodes[index].role,
+                       (unsigned int)nodes[index].online,
+                       (unsigned long)nodes[index].relay_mask,
+                       (unsigned long)nodes[index].adc_current_milliamps,
+                       (unsigned int)nodes[index].adc_valid,
+                       (unsigned int)nodes[index].adc_ct_valid,
+                       (unsigned int)nodes[index].adc_signal_present);
+    if ((written < 0) || ((size_t)written >= (buffer_size - used)))
+    {
+      return;
+    }
+    used += (size_t)written;
+  }
+
+  if (used < buffer_size)
+  {
+    (void)snprintf(buffer + used, buffer_size - used, "]}");
+  }
+}
+
 static void http_service_format_relay_config_json(char *buffer, size_t buffer_size)
 {
   const device_config_t *config = device_config_get();
@@ -1697,7 +1844,7 @@ static void http_service_format_relay_config_json(char *buffer, size_t buffer_si
                                   config->relay[index].name, sizeof(config->relay[index].name));
     int written = snprintf(buffer + used,
                            buffer_size - used,
-                           "%s{\"channel\":%lu,\"name\":\"%s\",\"enabled\":%u,\"remember_state\":%u,\"boot_default_on\":%u,\"adc_channel\":%u,\"protection_enabled\":%u,\"overcurrent_milliamps\":%lu,\"trip_delay_ms\":%lu,\"reset_hysteresis_milliamps\":%lu,\"protection_above_threshold\":%u,\"protection_tripped\":%u,\"protection_trip_count\":%lu,\"protection_last_trip_ms\":%lu}",
+                           "%s{\"channel\":%lu,\"name\":\"%s\",\"enabled\":%u,\"remember_state\":%u,\"boot_default_on\":%u,\"adc_channel\":%u,\"protection_enabled\":%u,\"device_strategy\":%u,\"overcurrent_milliamps\":%lu,\"trip_delay_ms\":%lu,\"reset_hysteresis_milliamps\":%lu,\"protection_above_threshold\":%u,\"protection_tripped\":%u,\"protection_trip_count\":%lu,\"protection_last_trip_ms\":%lu}",
                            (index > 0U) ? "," : "",
                            (unsigned long)(index + 1U),
                            relay_name_json,
@@ -1706,6 +1853,7 @@ static void http_service_format_relay_config_json(char *buffer, size_t buffer_si
                            (unsigned int)config->relay[index].boot_default_on,
                            (unsigned int)config->current[index].adc_channel,
                            (unsigned int)config->current[index].protection_enabled,
+                           (unsigned int)config->current[index].device_strategy,
                            (unsigned long)config->current[index].overcurrent_milliamps,
                            (unsigned long)config->current[index].trip_delay_ms,
                            (unsigned long)config->current[index].reset_hysteresis_milliamps,
@@ -1767,11 +1915,126 @@ static void http_service_apply_remote_command(const cluster_node_t *node,
   (void)snprintf(buffer, buffer_size, "{\"ok\":true,\"queued\":1}");
 }
 
+static uint8_t http_service_build_cluster_node_proxy_path(const char *suffix,
+                                                          const char *method,
+                                                          char *remote_path,
+                                                          size_t remote_path_size,
+                                                          char *remote_method,
+                                                          size_t remote_method_size)
+{
+  if ((suffix == NULL) || (method == NULL) || (remote_path == NULL) ||
+      (remote_method == NULL) || (remote_path_size == 0U) ||
+      (remote_method_size == 0U))
+  {
+    return 0U;
+  }
+
+  (void)snprintf(remote_method, remote_method_size, "%s", method);
+
+  if (strcmp(suffix, "/config/relays") == 0)
+  {
+    (void)snprintf(remote_path, remote_path_size, "/api/config/relays");
+    return (strcmp(method, "GET") == 0) ? 1U : 0U;
+  }
+  if (strcmp(suffix, "/config/relay") == 0)
+  {
+    (void)snprintf(remote_path, remote_path_size, "/api/config/relay");
+    return (strcmp(method, "POST") == 0) ? 1U : 0U;
+  }
+  if (strcmp(suffix, "/protection") == 0)
+  {
+    (void)snprintf(remote_path, remote_path_size, "/api/protection");
+    return (strcmp(method, "GET") == 0) ? 1U : 0U;
+  }
+  if (strcmp(suffix, "/config/protection") == 0)
+  {
+    (void)snprintf(remote_path, remote_path_size, "/api/config/protection");
+    return ((strcmp(method, "GET") == 0) || (strcmp(method, "POST") == 0)) ? 1U : 0U;
+  }
+  if (strcmp(suffix, "/scheduler/summary") == 0)
+  {
+    (void)snprintf(remote_path, remote_path_size, "/api/scheduler/summary");
+    return (strcmp(method, "GET") == 0) ? 1U : 0U;
+  }
+  if ((strcmp(suffix, "/protection/unlock") == 0) ||
+      (strcmp(suffix, "/protection/force-stop") == 0) ||
+      (strcmp(suffix, "/protection/clear-learning") == 0) ||
+      (strcmp(suffix, "/protection/strategy") == 0))
+  {
+    (void)snprintf(remote_path, remote_path_size, "/api%s", suffix);
+    return (strcmp(method, "POST") == 0) ? 1U : 0U;
+  }
+  if (strncmp(suffix, "/relay/channels/", 16) == 0)
+  {
+    const char *channel_text = suffix + 16;
+    char *rest_ptr = NULL;
+    unsigned long channel_value;
+
+    channel_value = strtoul(channel_text, &rest_ptr, 10);
+    if ((rest_ptr == channel_text) || (channel_value == 0UL) ||
+        (channel_value > 16UL) || (rest_ptr == NULL) || (*rest_ptr != '/'))
+    {
+      return 0U;
+    }
+
+    (void)snprintf(remote_path, remote_path_size, "/api%s", suffix);
+    if (strcmp(rest_ptr, "/scheduler/enabled") == 0)
+    {
+      if (strcmp(method, "POST") == 0)
+      {
+        (void)snprintf(remote_method, remote_method_size, "PATCH");
+        return 1U;
+      }
+      return (strcmp(method, "PATCH") == 0) ? 1U : 0U;
+    }
+    if (strcmp(rest_ptr, "/scheduler/status") == 0)
+    {
+      return (strcmp(method, "GET") == 0) ? 1U : 0U;
+    }
+    if (strcmp(rest_ptr, "/schedule-week") == 0)
+    {
+      return (strcmp(method, "GET") == 0) ? 1U : 0U;
+    }
+    if (strncmp(rest_ptr, "/schedule-week/", 15) == 0)
+    {
+      const char *weekday_text = rest_ptr + 15;
+      char *weekday_end = NULL;
+      unsigned long weekday_value = strtoul(weekday_text, &weekday_end, 10);
+
+      if ((weekday_end == weekday_text) || (weekday_value > 6UL))
+      {
+        return 0U;
+      }
+      if (strcmp(weekday_end, "/copy") == 0)
+      {
+        return (strcmp(method, "POST") == 0) ? 1U : 0U;
+      }
+      if (*weekday_end == '\0')
+      {
+        return (strcmp(method, "PUT") == 0) ? 1U : 0U;
+      }
+      return 0U;
+    }
+    if ((strcmp(rest_ptr, "/scheduler/pause") == 0) ||
+        (strcmp(rest_ptr, "/scheduler/resume") == 0))
+    {
+      return (strcmp(method, "POST") == 0) ? 1U : 0U;
+    }
+    if (strcmp(rest_ptr, "/control") == 0)
+    {
+      return (strcmp(method, "POST") == 0) ? 1U : 0U;
+    }
+    return 0U;
+  }
+
+  return 0U;
+}
+
 __attribute__((noinline)) static err_t http_service_handle_request(http_service_connection_t *connection,
                                                                    const char *request)
 {
   static char method[8];
-  static char path[64];
+  static char path[160];
   char *response_body = connection->response_buffer;
   const size_t response_body_size = HTTP_BODY_BUFFER_SIZE;
   const char *body;
@@ -1780,9 +2043,14 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   uint8_t authenticated = http_service_get_session_scope(request, &session_scope);
   uint8_t control_authenticated =
     (authenticated != 0U) && (session_scope == HTTP_AUTH_SCOPE_CONTROL);
+  uint8_t service_authenticated =
+    (authenticated != 0U) && (session_scope == HTTP_AUTH_SCOPE_SERVICE);
+  uint8_t write_authenticated =
+    (control_authenticated != 0U) || (service_authenticated != 0U);
   static control_proto_command_t command;
   static char password_text[32];
-  static char service_key_text[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
+  static char new_password_text[32];
+  static char scope_text[16];
   static char device_name[DEVICE_CONFIG_NAME_MAX_LEN];
   static char cluster_name[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN];
   static char relay_name[DEVICE_CONFIG_NAME_MAX_LEN];
@@ -1797,7 +2065,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     return ERR_ARG;
   }
 
-  if (sscanf(request, "%7s %63s", method, path) != 2)
+  if (sscanf(request, "%7s %159s", method, path) != 2)
   {
     http_service_format_error_json(response_body, response_body_size, "bad_request");
     return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
@@ -1839,6 +2107,16 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
 
+  if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/dashboard/live") == 0))
+  {
+    http_service_format_dashboard_live_json(response_body, response_body_size);
+    return http_service_send_payload_streaming(connection,
+                                               "200 OK",
+                                               "application/json",
+                                               (const unsigned char *)response_body,
+                                               strlen(response_body));
+  }
+
   if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/config/cluster") == 0))
   {
     static char cfg_log[96];
@@ -1866,6 +2144,48 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       strlen(response_body));
   }
 
+  if (strncmp(path, "/api/cluster/proxy-result?id=", 29) == 0)
+  {
+    uint32_t request_id = (uint32_t)strtoul(path + 29, NULL, 10);
+    uint8_t proxy_done = 0U;
+    uint8_t proxy_ok = 0U;
+
+    if (!control_authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if (control_queue_get_remote_http_result(request_id,
+                                             &proxy_done,
+                                             &proxy_ok,
+                                             response_body,
+                                             response_body_size) != HAL_OK)
+    {
+      http_service_format_error_json(response_body, response_body_size, "proxy_request_not_found");
+      return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+    }
+    if (proxy_done == 0U)
+    {
+      (void)snprintf(response_body, response_body_size,
+                     "{\"ok\":true,\"pending\":1,\"request_id\":%lu}",
+                     (unsigned long)request_id);
+      return http_service_send_payload(connection, "202 Accepted", "application/json", response_body);
+    }
+    if (proxy_ok == 0U)
+    {
+      if (response_body[0] == '\0')
+      {
+        http_service_format_error_json(response_body, response_body_size, "remote_proxy_failed");
+      }
+      return http_service_send_payload(connection, "502 Bad Gateway", "application/json", response_body);
+    }
+    return http_service_send_payload_streaming(connection,
+                                               "200 OK",
+                                               "application/json",
+                                               (const unsigned char *)response_body,
+                                               strlen(response_body));
+  }
+
   if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/config/relays") == 0))
   {
     if (!authenticated)
@@ -1880,6 +2200,159 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       "application/json",
       (const unsigned char *)response_body,
       strlen(response_body));
+  }
+
+  if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/scheduler/summary") == 0))
+  {
+    size_t pos;
+    uint8_t tv;
+    uint32_t now_unix;
+
+    if (!authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+
+    now_unix = cluster_service_get_unix_time(&tv);
+    pos = (size_t)snprintf(response_body,
+                           response_body_size,
+                           "{\"ok\":true,\"time_valid\":%u,\"channels\":[",
+                           (unsigned int)tv);
+    for (uint8_t ch = 1U; ch <= 16U; ++ch)
+    {
+      channel_scheduler_state_t st;
+      uint32_t remain = 0U;
+      uint8_t pause_active = 0U;
+      uint8_t auto_hold_active = 0U;
+      int written;
+
+      (void)memset(&st, 0, sizeof(st));
+      (void)scheduler_get_state_copy(ch, &st);
+      if ((st.schedule_pause_until != 0U) &&
+          ((st.schedule_pause_until == SCHEDULER_PAUSE_FOREVER) ||
+           (now_unix < st.schedule_pause_until)))
+      {
+        pause_active = 1U;
+      }
+      if (st.auto_hold.session != 0U)
+      {
+        uint32_t now_ms = HAL_GetTick();
+        auto_hold_active = 1U;
+        remain = (st.auto_hold.until_ms > now_ms) ?
+                 ((st.auto_hold.until_ms - now_ms) / 1000U) : 0U;
+      }
+
+      written = snprintf(response_body + pos,
+                         response_body_size - pos,
+                         "%s{\"channel\":%u,\"schedule_enabled\":%u,"
+                         "\"pause_active\":%u,\"schedule_pause_until\":%lu,"
+                         "\"pause_blocks_auto_trigger\":%u,"
+                         "\"auto_hold_active\":%u,\"auto_hold_target\":%u,"
+                         "\"auto_hold_remaining_seconds\":%lu,"
+                         "\"suppress_active\":%u,\"time_valid\":%u}",
+                         (ch == 1U) ? "" : ",",
+                         (unsigned int)ch,
+                         (unsigned int)st.schedule_enabled,
+                         (unsigned int)pause_active,
+                         (unsigned long)st.schedule_pause_until,
+                         (unsigned int)st.pause_blocks_auto_trigger,
+                         (unsigned int)auto_hold_active,
+                         (unsigned int)st.auto_hold.target_state,
+                         (unsigned long)remain,
+                         (unsigned int)((pause_active != 0U) &&
+                                        (st.pause_blocks_auto_trigger != 0U)),
+                         (unsigned int)tv);
+      if ((written <= 0) || ((size_t)written >= (response_body_size - pos)))
+      {
+        http_service_format_error_json(response_body, response_body_size, "response_too_large");
+        return http_service_send_payload(connection, "500 Internal Server Error", "application/json", response_body);
+      }
+      pos += (size_t)written;
+    }
+    (void)snprintf(response_body + pos, response_body_size - pos, "]}");
+    return http_service_send_payload_streaming(connection,
+                                               "200 OK",
+                                               "application/json",
+                                               (const unsigned char *)response_body,
+                                               strlen(response_body));
+  }
+
+  if (strncmp(path, "/api/cluster/node/", 18) == 0)
+  {
+    const char *node_text = path + 18;
+    char *suffix_ptr = NULL;
+    uint32_t node_id = (uint32_t)strtoul(node_text, &suffix_ptr, 10);
+    static char remote_path_text[CONTROL_QUEUE_REMOTE_HTTP_PATH_MAX_LEN];
+    static char remote_method_text[CONTROL_QUEUE_REMOTE_HTTP_METHOD_MAX_LEN];
+    uint32_t expected_tag;
+    uint32_t proxy_request_id = 0U;
+    HAL_StatusTypeDef proxy_status;
+
+    if ((node_id == 0U) || (suffix_ptr == NULL) || (*suffix_ptr != '/'))
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_node_id");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+    if (!control_authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if (node_id == cluster_state.self_node_id)
+    {
+      http_service_format_error_json(response_body, response_body_size, "use_local_api");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+    remote_node = cluster_service_find_node(node_id);
+    if ((remote_node == NULL) ||
+        (remote_node->online == 0U) ||
+        (remote_node->ip_addr == 0U) ||
+        (strcmp(remote_node->cluster_name, active_config->cluster_name) != 0))
+    {
+      http_service_format_error_json(response_body, response_body_size, "remote_node_unavailable");
+      return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+    }
+    expected_tag = device_config_compute_auth_tag(active_config->cluster_password_hash,
+                                                  remote_node->unix_time,
+                                                  remote_node->node_id,
+                                                  remote_node->cluster_name);
+    if (remote_node->auth_tag != expected_tag)
+    {
+      http_service_format_error_json(response_body, response_body_size, "remote_node_unavailable");
+      return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+    }
+    if (http_service_build_cluster_node_proxy_path(suffix_ptr,
+                                                   method,
+                                                   remote_path_text,
+                                                   sizeof(remote_path_text),
+                                                   remote_method_text,
+                                                   sizeof(remote_method_text)) == 0U)
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_proxy_path");
+      return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
+    }
+
+    proxy_status = control_queue_submit_remote_http_async(remote_node->ip_addr,
+                                                          remote_method_text,
+                                                          remote_path_text,
+                                                          body,
+                                                          &proxy_request_id);
+    if (proxy_status != HAL_OK)
+    {
+      http_service_format_error_json(response_body,
+                                     response_body_size,
+                                     (proxy_status == HAL_BUSY) ? "remote_proxy_busy" : "remote_proxy_failed");
+      return http_service_send_payload(connection,
+                                       (proxy_status == HAL_BUSY) ? "503 Service Unavailable" : "502 Bad Gateway",
+                                       "application/json",
+                                       response_body);
+    }
+    (void)snprintf(response_body,
+                   response_body_size,
+                   "{\"ok\":true,\"queued\":1,\"request_id\":%lu,\"retry_ms\":150}",
+                   (unsigned long)proxy_request_id);
+    return http_service_send_payload(connection, "202 Accepted", "application/json", response_body);
   }
 
 
@@ -1911,7 +2384,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
         "\"aging_offset_ma\":%lu,\"normal_low_ma\":%lu,\"normal_high_ma\":%lu,"
         "\"startup_peak_ma\":%lu,\"startup_duration_ms\":%lu,"
         "\"trip_count\":%lu,\"cooldown_until_ms\":%lu,"
-        "\"learning_samples\":%u,\"ct_degraded\":%u,\"adc_saturated\":%u,"
+        "\"learning_samples\":%u,\"ct_valid\":%u,\"ct_degraded\":%u,\"adc_saturated\":%u,"
         "\"device_strategy\":%u,\"off_since_ms\":%lu,\"stuck_pending\":%u}",
         (ch == 0U) ? "" : ",",
         (unsigned int)(ch + 1U),
@@ -1933,6 +2406,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
         (unsigned long)ps.trip_count,
         (unsigned long)ps.cooldown_until_ms,
         (unsigned int)ps.learning_samples_collected,
+        (unsigned int)ps.ct_valid,
         (unsigned int)ps.ct_degraded,
         (unsigned int)ps.adc_saturated,
         (unsigned int)ps.device_strategy,
@@ -1948,10 +2422,17 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/protection/force-stop") == 0))
   {
     uint32_t channel;
-    if (!control_authenticated)
+    if (write_authenticated == 0U)
     {
       http_service_format_error_json(response_body, response_body_size, "unauthorized");
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if ((cluster_state.cluster_enabled != 0U) &&
+        (cluster_state.role == CLUSTER_ROLE_MEMBER) &&
+        (service_authenticated == 0U))
+    {
+      http_service_format_error_json(response_body, response_body_size, "member_control_via_master_only");
+      return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
     }
     if (!http_service_extract_form_value(body, "channel", &channel) ||
         channel == 0U || channel > 16U)
@@ -1968,10 +2449,17 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/protection/clear-learning") == 0))
   {
     uint32_t channel;
-    if (!control_authenticated)
+    if (write_authenticated == 0U)
     {
       http_service_format_error_json(response_body, response_body_size, "unauthorized");
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if ((cluster_state.cluster_enabled != 0U) &&
+        (cluster_state.role == CLUSTER_ROLE_MEMBER) &&
+        (service_authenticated == 0U))
+    {
+      http_service_format_error_json(response_body, response_body_size, "member_control_via_master_only");
+      return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
     }
     if (!http_service_extract_form_value(body, "channel", &channel) ||
         channel == 0U || channel > 16U)
@@ -1988,10 +2476,17 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/protection/unlock") == 0))
   {
     uint32_t channel;
-    if (!control_authenticated)
+    if (write_authenticated == 0U)
     {
       http_service_format_error_json(response_body, response_body_size, "unauthorized");
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if ((cluster_state.cluster_enabled != 0U) &&
+        (cluster_state.role == CLUSTER_ROLE_MEMBER) &&
+        (service_authenticated == 0U))
+    {
+      http_service_format_error_json(response_body, response_body_size, "member_control_via_master_only");
+      return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
     }
     if (!http_service_extract_form_value(body, "channel", &channel) ||
         channel == 0U || channel > 16U)
@@ -2009,9 +2504,16 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   {
     relay_protection_user_config_t cfg;
     uint32_t val;
-    if (!control_authenticated) {
+    if (write_authenticated == 0U) {
       http_service_format_error_json(response_body, response_body_size, "unauthorized");
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if ((cluster_state.cluster_enabled != 0U) &&
+        (cluster_state.role == CLUSTER_ROLE_MEMBER) &&
+        (service_authenticated == 0U))
+    {
+      http_service_format_error_json(response_body, response_body_size, "member_control_via_master_only");
+      return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
     }
     relay_protection_get_user_config(&cfg);
     if (http_service_extract_form_value(body, "cooldown_seconds", &val)) cfg.cooldown_seconds = val;
@@ -2021,8 +2523,31 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     if (http_service_extract_form_value(body, "learning_samples", &val)) cfg.learning_samples = val;
     if (http_service_extract_form_value(body, "aging_update_hours", &val)) cfg.aging_update_hours = val;
     if (http_service_extract_form_value(body, "aging_cap_percent", &val)) cfg.aging_cap_percent = val;
+    if (http_service_extract_form_value(body, "relay_on_spacing_ms", &val)) cfg.relay_on_spacing_ms = val;
+    if (http_service_extract_form_value(body, "same_relay_on_spacing_ms", &val)) cfg.same_relay_on_spacing_ms = val;
     if (http_service_extract_form_value(body, "stall_multiplier_x10", &val)) cfg.stall_timeout_multiplier_x10 = val;
     relay_protection_set_user_config(&cfg);
+    {
+      device_config_t persisted;
+      device_config_copy(&persisted);
+      persisted.protection_global.cooldown_seconds = cfg.cooldown_seconds;
+      persisted.protection_global.retry_delay_seconds = cfg.retry_delay_seconds;
+      persisted.protection_global.max_retry_count = cfg.max_retry_count;
+      persisted.protection_global.boot_delay_seconds = cfg.boot_delay_seconds;
+      persisted.protection_global.learning_samples = cfg.learning_samples;
+      persisted.protection_global.aging_update_hours = cfg.aging_update_hours;
+      persisted.protection_global.aging_cap_percent = cfg.aging_cap_percent;
+      persisted.protection_global.stall_timeout_multiplier_x10 =
+        cfg.stall_timeout_multiplier_x10;
+      persisted.protection_global.relay_on_spacing_ms = cfg.relay_on_spacing_ms;
+      persisted.protection_global.same_relay_on_spacing_ms =
+        cfg.same_relay_on_spacing_ms;
+      if (device_config_update_and_save(&persisted) == 0U)
+      {
+        http_service_format_error_json(response_body, response_body_size, "save_failed");
+        return http_service_send_payload(connection, "500 Internal Server Error", "application/json", response_body);
+      }
+    }
     (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
@@ -2035,21 +2560,30 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       "{\"ok\":true,\"cooldown_seconds\":%lu,\"retry_delay_seconds\":%lu,"
       "\"max_retry_count\":%lu,\"boot_delay_seconds\":%lu,"
       "\"learning_samples\":%lu,\"aging_update_hours\":%lu,"
-      "\"aging_cap_percent\":%lu,\"stall_multiplier_x10\":%lu}",
+      "\"aging_cap_percent\":%lu,\"relay_on_spacing_ms\":%lu,"
+      "\"same_relay_on_spacing_ms\":%lu,\"stall_multiplier_x10\":%lu}",
       (unsigned long)cfg.cooldown_seconds, (unsigned long)cfg.retry_delay_seconds,
       (unsigned long)cfg.max_retry_count, (unsigned long)cfg.boot_delay_seconds,
       (unsigned long)cfg.learning_samples, (unsigned long)cfg.aging_update_hours,
-      (unsigned long)cfg.aging_cap_percent, (unsigned long)cfg.stall_timeout_multiplier_x10);
+      (unsigned long)cfg.aging_cap_percent, (unsigned long)cfg.relay_on_spacing_ms,
+      (unsigned long)cfg.same_relay_on_spacing_ms, (unsigned long)cfg.stall_timeout_multiplier_x10);
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/protection/strategy") == 0))
   {
     uint32_t channel, strategy;
-    if (!control_authenticated)
+    if (write_authenticated == 0U)
     {
       http_service_format_error_json(response_body, response_body_size, "unauthorized");
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if ((cluster_state.cluster_enabled != 0U) &&
+        (cluster_state.role == CLUSTER_ROLE_MEMBER) &&
+        (service_authenticated == 0U))
+    {
+      http_service_format_error_json(response_body, response_body_size, "member_control_via_master_only");
+      return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
     }
     if (!http_service_extract_form_value(body, "channel", &channel) ||
         channel == 0U || channel > 16U)
@@ -2057,10 +2591,21 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       http_service_format_error_json(response_body, response_body_size, "bad_channel");
       return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
     }
-    if (!http_service_extract_form_value(body, "strategy", &strategy) || strategy > 1U)
+    if (!http_service_extract_form_value(body, "strategy", &strategy) ||
+        strategy > RELAY_PROTECTION_STRATEGY_MANUAL)
     {
       http_service_format_error_json(response_body, response_body_size, "bad_strategy");
       return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+    {
+      device_config_t config;
+      device_config_copy(&config);
+      config.current[channel - 1U].device_strategy = (uint8_t)strategy;
+      if (!device_config_update_and_save(&config))
+      {
+        http_service_format_error_json(response_body, response_body_size, "save_failed");
+        return http_service_send_payload(connection, "500 Internal Server Error", "application/json", response_body);
+      }
     }
     relay_protection_set_strategy((uint8_t)channel, (uint8_t)strategy);
     (void)snprintf(response_body, response_body_size,
@@ -2072,30 +2617,30 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   {
     uint32_t session_token;
     uint8_t session_scope = HTTP_AUTH_SCOPE_CONTROL;
+    uint8_t service_login = 0U;
 
-    if (!http_service_extract_form_text(body, "password", password_text, sizeof(password_text)) ||
-        (strcmp(password_text, HTTP_AUTH_PASSWORD) != 0))
+    if (http_service_extract_form_text(body, "scope", scope_text, sizeof(scope_text)) &&
+        (strcmp(scope_text, "service") == 0))
+    {
+      service_login = 1U;
+    }
+
+    if (service_login != 0U)
+    {
+      if (http_service_service_auth_matches(active_config, body) == 0U)
+      {
+        g_http_auth_state.login_failures++;
+        http_service_format_error_json(response_body, response_body_size, "bad_service_auth");
+        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+      }
+      session_scope = HTTP_AUTH_SCOPE_SERVICE;
+    }
+    else if (!http_service_extract_form_text(body, "password", password_text, sizeof(password_text)) ||
+             (http_service_local_password_matches(active_config, password_text) == 0U))
     {
       g_http_auth_state.login_failures++;
       http_service_format_error_json(response_body, response_body_size, "bad_password");
       return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
-    }
-
-    if (http_service_extract_form_text(body, "scope", password_text, sizeof(password_text)) &&
-        (strcmp(password_text, "service") == 0))
-    {
-      if (!http_service_extract_form_text(body,
-                                          "service_key",
-                                          service_key_text,
-                                          sizeof(service_key_text)) ||
-          (active_config->backend_key[0] == '\0') ||
-          (strcmp(service_key_text, active_config->backend_key) != 0))
-      {
-        g_http_auth_state.login_failures++;
-        http_service_format_error_json(response_body, response_body_size, "bad_service_key");
-        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
-      }
-      session_scope = HTTP_AUTH_SCOPE_SERVICE;
     }
     session_token = http_service_create_session(session_scope);
     http_service_format_login_json(response_body, response_body_size, session_token);
@@ -2106,6 +2651,103 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
   {
     http_service_revoke_session(request);
     http_service_format_logout_json(response_body, response_body_size);
+    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+  }
+
+  if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/config/password") == 0))
+  {
+    static device_config_t config;
+
+    if (!control_authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if (!http_service_extract_form_text(body,
+                                        "current_password",
+                                        password_text,
+                                        sizeof(password_text)) ||
+        (http_service_local_password_matches(active_config, password_text) == 0U))
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_current_password");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if (!http_service_extract_form_text(body,
+                                        "new_password",
+                                        new_password_text,
+                                        sizeof(new_password_text)) ||
+        (strlen(new_password_text) < 4U))
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_new_password");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+
+    config = *device_config_get();
+    device_config_hash_password_text(new_password_text, config.local_admin_password_hash);
+
+    if (device_config_update_and_save(&config) == 0U)
+    {
+      (void)snprintf(response_body,
+                     response_body_size,
+                     "{\"ok\":false,\"error\":\"config_save_failed\",\"flash_error\":%lu}",
+                     (unsigned long)device_config_last_flash_error());
+      return http_service_send_payload(connection,
+                                       "500 Internal Server Error",
+                                       "application/json",
+                                       response_body);
+    }
+
+    (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
+    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+  }
+
+  if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/config/cluster-password") == 0))
+  {
+    static device_config_t config;
+
+    if (!control_authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if (!http_service_extract_form_text(body,
+                                        "current_password",
+                                        password_text,
+                                        sizeof(password_text)) ||
+        (http_service_local_password_matches(active_config, password_text) == 0U))
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_current_password");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    if (!http_service_extract_form_text(body,
+                                        "new_cluster_password",
+                                        new_password_text,
+                                        sizeof(new_password_text)) ||
+        (strlen(new_password_text) < 8U))
+    {
+      http_service_format_error_json(response_body, response_body_size, "bad_new_cluster_password");
+      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+    }
+
+    config = *device_config_get();
+    device_config_hash_password_text(new_password_text, config.cluster_password_hash);
+
+    if (device_config_update_and_save(&config) == 0U)
+    {
+      (void)snprintf(response_body,
+                     response_body_size,
+                     "{\"ok\":false,\"error\":\"config_save_failed\",\"flash_error\":%lu}",
+                     (unsigned long)device_config_last_flash_error());
+      return http_service_send_payload(connection,
+                                       "500 Internal Server Error",
+                                       "application/json",
+                                       response_body);
+    }
+
+    cluster_service_reload_from_config();
+    discovery_service_force_announce();
+    http_service_request_backend_sync();
+    (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
     return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
 
@@ -2236,7 +2878,6 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     const device_config_t *current_config = device_config_get();
     static char backend_host[DEVICE_CONFIG_BACKEND_HOST_MAX_LEN];
     static char backend_port_text[16];
-    static char backend_key[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
     static char cloud_broker_host[DEVICE_CONFIG_CLOUD_HOST_MAX_LEN];
     static char cloud_broker_port_text[16];
     static char cloud_cluster_id[DEVICE_CONFIG_CLOUD_ID_MAX_LEN];
@@ -2260,7 +2901,7 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     /* Decrypt config-sync body if the master encrypted it with the
        cluster password.  The body starts with _enc=1&_data=<base64>. */
     if ((strncmp(body, "_enc=1&_data=", 13) == 0) &&
-        (current_config->cluster_password_hash[0] != 0U))
+        (device_config_hash_is_zero(current_config->cluster_password_hash) == 0U))
     {
       static char enc_body[2048];
       static char plain_body[2048];
@@ -2343,7 +2984,8 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       }
       else
       {
-        memset(config.cluster_password_hash, 0, sizeof(config.cluster_password_hash));
+        device_config_hash_password_text(DEVICE_CONFIG_DEFAULT_CLUSTER_PASSWORD,
+                                         config.cluster_password_hash);
       }
     }
 
@@ -2361,12 +3003,6 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       {
         config.backend_port = (uint16_t)backend_port_value;
       }
-    }
-
-    if (http_service_extract_form_text(body, "backend_key", backend_key, sizeof(backend_key)))
-    {
-      memset(config.backend_key, 0, sizeof(config.backend_key));
-      strncpy(config.backend_key, backend_key, sizeof(config.backend_key) - 1U);
     }
 
     if (http_service_extract_form_value(body, "cloud_enabled", &value) && (value <= 1U))
@@ -2400,9 +3036,15 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       }
     }
 
-    /* cloud_cluster_id / cloud_device_id / cloud_key_id are read-only —
-       they are auto-generated from the MCU UID at factory-defaults time
-       and the cluster name.  The user cannot override them. */
+    /* cloud_cluster_id / cloud_device_id are user-facing read-only fields.
+       cloud_key_id is hidden from the UI, but provisioning must be able to
+       update it because the MQTT broker validates it as CONNECT username. */
+
+    if (http_service_extract_form_text(body, "cloud_key_id", cloud_key_id, sizeof(cloud_key_id)))
+    {
+      memset(config.cloud_key_id, 0, sizeof(config.cloud_key_id));
+      strncpy(config.cloud_key_id, cloud_key_id, sizeof(config.cloud_key_id) - 1U);
+    }
 
     if (http_service_extract_form_text(body, "cloud_cluster_ca_fingerprint", cloud_cluster_ca_fingerprint, sizeof(cloud_cluster_ca_fingerprint)))
     {
@@ -2452,11 +3094,6 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       cluster_identity_changed = 1U;
     }
 
-    if ((config.cluster_enabled == 0U) || (cluster_identity_changed != 0U))
-    {
-      memset(config.backend_key, 0, sizeof(config.backend_key));
-    }
-
     if ((config.cluster_enabled != current_config->cluster_enabled) ||
         (config.auto_join_cluster != current_config->auto_join_cluster) ||
         (strncmp(config.cluster_name,
@@ -2468,18 +3105,6 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
                  sizeof(config.cluster_password_hash)) != 0)))
     {
       cluster_runtime_changed = 1U;
-    }
-
-    if (config.backend_host[0] == '\0')
-    {
-      http_service_format_error_json(response_body, response_body_size, "bad_backend_host");
-      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
-    }
-
-    if (config.backend_port == 0U)
-    {
-      http_service_format_error_json(response_body, response_body_size, "bad_backend_port");
-      return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
     }
 
     if (config.cloud_enabled != 0U)
@@ -2587,16 +3212,9 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     }
     if (http_service_extract_form_value(body, "adc_channel", &value))
     {
-      if ((value >= ADC_SERVICE_CHANNEL_COUNT) &&
-          (value != DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED))
-      {
-        http_service_format_error_json(response_body, response_body_size,
-                                       "bad_adc_channel");
-        return http_service_send_payload(connection, "400 Bad Request",
-                                         "application/json", response_body);
-      }
-      config.current[channel - 1U].adc_channel = (uint8_t)value;
+      (void)value;
     }
+    config.current[channel - 1U].adc_channel = (uint8_t)(channel - 1U);
     if (http_service_extract_form_value(body, "protection_enabled", &value))
     {
       if (value > 1U)
@@ -2607,6 +3225,17 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
                                          "application/json", response_body);
       }
       config.current[channel - 1U].protection_enabled = (uint8_t)value;
+    }
+    if (http_service_extract_form_value(body, "device_strategy", &value))
+    {
+      if (value > RELAY_PROTECTION_STRATEGY_MANUAL)
+      {
+        http_service_format_error_json(response_body, response_body_size,
+                                       "bad_strategy");
+        return http_service_send_payload(connection, "400 Bad Request",
+                                         "application/json", response_body);
+      }
+      config.current[channel - 1U].device_strategy = (uint8_t)value;
     }
     if (http_service_extract_form_value(body, "overcurrent_milliamps", &value))
     {
@@ -2646,15 +3275,6 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     {
       http_service_format_error_json(response_body, response_body_size, "bad_relay_name");
       return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
-    }
-    if ((config.current[channel - 1U].protection_enabled != 0U) &&
-        (config.current[channel - 1U].adc_channel ==
-         DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED))
-    {
-      http_service_format_error_json(response_body, response_body_size,
-                                     "protection_requires_adc_channel");
-      return http_service_send_payload(connection, "400 Bad Request",
-                                       "application/json", response_body);
     }
     if (config.current[channel - 1U].reset_hysteresis_milliamps >=
         config.current[channel - 1U].overcurrent_milliamps)
@@ -2759,11 +3379,19 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       http_service_format_error_json(response_body, response_body_size, "bad_channel");
       return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
     }
+    uint8_t scheduler_member_write_blocked =
+      ((cluster_state.cluster_enabled != 0U) &&
+       (cluster_state.role == CLUSTER_ROLE_MEMBER) &&
+       (service_authenticated == 0U)) ? 1U : 0U;
 
     /* ── 22.1 GET /api/relay/channels/:channel/schedule-week ── */
     if ((strcmp(method, "GET") == 0) && (strcmp(rest, "/schedule-week") == 0)) {
       weekly_schedule_t ws;
       channel_scheduler_state_t st;
+      if (authenticated == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "unauthorized");
+        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+      }
       if ((scheduler_get_weekly_copy((uint8_t)channel, &ws) == 0U) ||
           (scheduler_get_state_copy((uint8_t)channel, &st) == 0U)) {
         http_service_format_error_json(response_body, response_body_size, "not_found");
@@ -2795,6 +3423,14 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     if ((strcmp(method, "PUT") == 0) && strncmp(rest, "/schedule-week/", 15) == 0) {
       uint32_t weekday = 0;
       const char *wp = rest + 15;
+      if (write_authenticated == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "unauthorized");
+        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+      }
+      if (scheduler_member_write_blocked != 0U) {
+        http_service_format_error_json(response_body, response_body_size, "member_control_via_master_only");
+        return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
+      }
       while (*wp >= '0' && *wp <= '9') { weekday = weekday * 10 + (uint32_t)(*wp - '0'); wp++; }
       if (weekday > 6) {
         http_service_format_error_json(response_body, response_body_size, "bad_weekday");
@@ -2837,6 +3473,14 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     if ((strcmp(method, "POST") == 0) && strstr(rest, "/schedule-week/") && strstr(rest, "/copy")) {
       uint32_t src_wd = 0;
       const char *wp = rest + 15;
+      if (write_authenticated == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "unauthorized");
+        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+      }
+      if (scheduler_member_write_blocked != 0U) {
+        http_service_format_error_json(response_body, response_body_size, "member_control_via_master_only");
+        return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
+      }
       while (*wp >= '0' && *wp <= '9') { src_wd = src_wd * 10 + (uint32_t)(*wp - '0'); wp++; }
       if (src_wd > 6) {
         http_service_format_error_json(response_body, response_body_size, "bad_weekday");
@@ -2873,7 +3517,19 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     /* ── 22.4 PATCH /api/relay/channels/:channel/scheduler/enabled ── */
     if ((strcmp(method, "PATCH") == 0) && (strcmp(rest, "/scheduler/enabled") == 0)) {
       uint32_t enabled = 0;
-      http_service_extract_form_value(body, "enabled", &enabled);
+      if (write_authenticated == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "unauthorized");
+        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+      }
+      if (scheduler_member_write_blocked != 0U) {
+        http_service_format_error_json(response_body, response_body_size, "member_control_via_master_only");
+        return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
+      }
+      if ((http_service_extract_form_value(body, "enabled", &enabled) == 0U) ||
+          (enabled > 1U)) {
+        http_service_format_error_json(response_body, response_body_size, "bad_enabled");
+        return http_service_send_payload(connection, "400 Bad Request", "application/json", response_body);
+      }
       if (scheduler_set_enabled((uint8_t)channel, (uint8_t)(enabled ? 1 : 0)) == 0U) {
         http_service_format_error_json(response_body, response_body_size, "not_found");
         return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);
@@ -2885,6 +3541,14 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     /* ── 22.5 POST /api/relay/channels/:channel/scheduler/pause ── */
     if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/scheduler/pause") == 0)) {
       uint32_t mode = 0, dur = 0, until = 0, blocks = 0;
+      if (write_authenticated == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "unauthorized");
+        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+      }
+      if (scheduler_member_write_blocked != 0U) {
+        http_service_format_error_json(response_body, response_body_size, "member_control_via_master_only");
+        return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
+      }
       http_service_extract_form_value(body, "mode", &mode);
       http_service_extract_form_value(body, "duration_seconds", &dur);
       http_service_extract_form_value(body, "until", &until);
@@ -2895,7 +3559,11 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       uint32_t now_unix = cluster_service_get_unix_time(&tv);
       uint32_t pause_until = now_unix + 60U;
       switch (mode) {
-        case 0: pause_until = now_unix + 60U; break;  /* current_segment_end simplified */
+        case 0:
+          pause_until = (tv != 0U)
+                        ? scheduler_compute_current_segment_pause_until((uint8_t)channel, now_unix)
+                        : (now_unix + 60U);
+          break;
         case 1: pause_until = now_unix + dur; break;
         case 2: pause_until = until; break;
         case 3: pause_until = SCHEDULER_PAUSE_FOREVER; break;
@@ -2911,6 +3579,14 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
 
     /* ── 22.6 POST /api/relay/channels/:channel/scheduler/resume ── */
     if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/scheduler/resume") == 0)) {
+      if (write_authenticated == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "unauthorized");
+        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+      }
+      if (scheduler_member_write_blocked != 0U) {
+        http_service_format_error_json(response_body, response_body_size, "member_control_via_master_only");
+        return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
+      }
       scheduler_clear_pause((uint8_t)channel);
       (void)snprintf(response_body, response_body_size, "{\"ok\":true}");
       return http_service_send_payload(connection, "200 OK", "application/json", response_body);
@@ -2919,6 +3595,20 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     /* ── 22.7 POST /api/relay/channels/:channel/control (user manual) ── */
     if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/control") == 0)) {
       uint32_t target = 0, pmode = 0, pdur = 0, puntil = 0, pblocks = 0;
+      if ((control_authenticated == 0U) && (service_authenticated == 0U))
+      {
+        http_service_format_error_json(response_body, response_body_size, "unauthorized");
+        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+      }
+      if ((cluster_state.cluster_enabled != 0U) &&
+          (cluster_state.role == CLUSTER_ROLE_MEMBER) &&
+          (service_authenticated == 0U))
+      {
+        http_service_format_error_json(response_body,
+                                       response_body_size,
+                                       "member_control_via_master_only");
+        return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
+      }
       http_service_extract_form_value(body, "target", &target);
       http_service_extract_form_value(body, "pause_mode", &pmode);
       http_service_extract_form_value(body, "pause_duration_seconds", &pdur);
@@ -2937,6 +3627,14 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     if ((strcmp(method, "POST") == 0) && (strcmp(rest, "/auto-hold") == 0)) {
       auto_hold_cmd_t cmd;
       uint32_t target = 0, dur = 0, session = 0, cts = 0;
+      if (write_authenticated == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "unauthorized");
+        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+      }
+      if (scheduler_member_write_blocked != 0U) {
+        http_service_format_error_json(response_body, response_body_size, "member_control_via_master_only");
+        return http_service_send_payload(connection, "409 Conflict", "application/json", response_body);
+      }
       memset(&cmd, 0, sizeof(cmd));
       cmd.channel = (uint8_t)channel;
       http_service_extract_form_value(body, "target", &target);   cmd.target = (uint8_t)(target ? 1 : 0);
@@ -2952,6 +3650,10 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     /* ── 22.9 GET /api/relay/channels/:channel/scheduler/status ── */
     if ((strcmp(method, "GET") == 0) && (strcmp(rest, "/scheduler/status") == 0)) {
       channel_scheduler_state_t st;
+      if (authenticated == 0U) {
+        http_service_format_error_json(response_body, response_body_size, "unauthorized");
+        return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+      }
       if (scheduler_get_state_copy((uint8_t)channel, &st) == 0U) {
         http_service_format_error_json(response_body, response_body_size, "not_found");
         return http_service_send_payload(connection, "404 Not Found", "application/json", response_body);

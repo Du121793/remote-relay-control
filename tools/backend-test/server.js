@@ -6,7 +6,7 @@ const crypto = require("crypto");
 const HTTP_PORT = Number(process.env.HTTP_PORT || 4300);
 const HTTP_HOST = String(process.env.HTTP_HOST || "127.0.0.1");
 const MQTT_CONTROL_PORT = Number(process.env.MQTT_CONTROL_PORT || 4301);
-const CLOUD_BROKER_HOST = String(process.env.CLOUD_BROKER_HOST || "broker.example.com");
+const CLOUD_BROKER_HOST = String(process.env.CLOUD_BROKER_HOST || "mqtt.autocontrol.du1217.club");
 const CLOUD_BROKER_PORT = Number(process.env.CLOUD_BROKER_PORT || 8883);
 const CLOUD_TRANSPORT = 1; /* MQTT only */
 const DUPLICATE_MASTER_GRACE_MS = Number(process.env.DUPLICATE_MASTER_GRACE_MS || 15000);
@@ -14,18 +14,21 @@ const DUPLICATE_MASTER_SCAN_MS = Number(process.env.DUPLICATE_MASTER_SCAN_MS || 
 const CLIENT_STALE_MS = Number(process.env.CLIENT_STALE_MS || 12000);
 const PROVISIONING_RESEND_COOLDOWN_MS = Number(process.env.PROVISIONING_RESEND_COOLDOWN_MS || 30000);
 const ALLOW_PRIVATE_KEY_EXPORT = process.env.ALLOW_PRIVATE_KEY_EXPORT === "1";
-const REMOTE_ADMIN_PASSWORD = process.env.REMOTE_ADMIN_PASSWORD || "admin";
+const REMOTE_CLUSTER_PASSWORD = process.env.REMOTE_CLUSTER_PASSWORD || "autoControl-cluster";
 const REMOTE_SESSION_CACHE_TTL_MS = 14 * 60 * 1000;
 const DATA_DIR = path.join(__dirname, "data");
 const KEYS_PATH = path.join(DATA_DIR, "keys.json");
 const CLOUD_DEVICES_PATH = path.join(DATA_DIR, "cloud-devices.json");
 const CLOUD_CLUSTERS_PATH = path.join(DATA_DIR, "cloud-clusters.json");
 const LEGACY_BOOTSTRAP_KEY = process.env.BACKEND_KEY || "dev-key";
+const DASHBOARD_USER = process.env.DASHBOARD_USER || "admin123";
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "admin123";
+const DASHBOARD_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
 const DEVICE_STATE_TEXT = {
-  0: "停止",
+  0: "線上",
   1: "開啟",
-  2: "凍結",
+  2: "故障",
 };
 
 const app = express();
@@ -51,13 +54,14 @@ const relayConfirmInflight = new Set();
 const relayConfirmDirty = new Set();
 const autoProvisionTimers = new Map();
 const helloProvisionTimers = new Map();
+const dashboardSessions = new Map();
 let keyStore = [];
 let stateBroadcastScheduled = false;
 let cloudRegistrySaveTimer = 0;
 
-/* ── MQTT command publishing via broker control API (:4301) ──
+/* ?? MQTT command publishing via broker control API (:4301) ??
    The mqtt-psk-broker.js exposes POST /api/publish so the backend
-   does not need its own MQTT client — just HTTP POST to the broker. */
+   does not need its own MQTT client ??just HTTP POST to the broker. */
 const BROKER_CONTROL_URL = `http://127.0.0.1:${MQTT_CONTROL_PORT}`;
 
 async function mqttPublishCommand(clusterName, topicSuffix, payload) {
@@ -84,6 +88,65 @@ function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
+}
+
+function parseCookieHeader(header) {
+  const out = {};
+  for (const part of String(header || "").split(";")) {
+    const idx = part.indexOf("=");
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (key) out[key] = decodeURIComponent(value);
+  }
+  return out;
+}
+
+function createDashboardSession() {
+  const token = crypto.randomBytes(24).toString("base64url");
+  dashboardSessions.set(token, {
+    user: DASHBOARD_USER,
+    expiresAt: Date.now() + DASHBOARD_SESSION_TTL_MS,
+  });
+  return token;
+}
+
+function getDashboardSession(req) {
+  const cookies = parseCookieHeader(req.headers.cookie || "");
+  const token = cookies.ac_backend_session || String(req.headers["x-backend-token"] || "");
+  const session = dashboardSessions.get(token);
+  if (!session || session.expiresAt < Date.now()) {
+    if (token) dashboardSessions.delete(token);
+    return null;
+  }
+  session.expiresAt = Date.now() + DASHBOARD_SESSION_TTL_MS;
+  return { token, ...session };
+}
+
+function isPublicBackendPath(req) {
+  if (req.path === "/api/auth/login" ||
+      req.path === "/api/auth/logout" ||
+      req.path === "/api/auth/session" ||
+      req.path === "/favicon.ico") {
+    return true;
+  }
+  if (req.path === "/api/provision") {
+    return true;
+  }
+  return false;
+}
+
+function requireDashboardSession(req, res, next) {
+  if (isPublicBackendPath(req)) return next();
+  if (req.path === "/" || req.path.startsWith("/api/") || req.path.startsWith("/send/")) {
+    const session = getDashboardSession(req);
+    if (!session) {
+      if (req.path === "/") return next();
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+    req.dashboardUser = session.user;
+  }
+  return next();
 }
 
 function saveKeyStore() {
@@ -343,7 +406,7 @@ function pushEvent(type, payload) {
 }
 
 function deviceStateText(value) {
-  return DEVICE_STATE_TEXT[value] || "?芰";
+  return DEVICE_STATE_TEXT[value] || "未知";
 }
 
 function normalizeIp(ipText) {
@@ -1059,6 +1122,12 @@ async function remoteNodeLogin(node) {
   const cached = remoteSessionCache.get(cacheKey);
   let loginResponse;
   let loginData;
+  const requesterNodeId = Number(effectiveMasterNodeIdForGroup(node.backendKey, node.cluster) || node.sourceMasterNodeId || node.nodeId || 1);
+  const unixTime = Math.floor(Date.now() / 1000);
+  const clusterName = String(node.cluster || "default");
+  const passwordHash = crypto.createHash("sha256").update(String(REMOTE_CLUSTER_PASSWORD), "utf8").digest();
+  const authInput = `${unixTime}|${requesterNodeId}|${clusterName}`;
+  const authTag = crypto.createHmac("sha256", passwordHash).update(authInput, "utf8").digest().readUInt32LE(0);
 
   if (cached && cached.token && cached.expiresAt > Date.now()) {
     return cached.token;
@@ -1067,8 +1136,10 @@ async function remoteNodeLogin(node) {
   loginResponse = await fetch(`http://${node.ip}/api/login`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `password=${encodeURIComponent(REMOTE_ADMIN_PASSWORD)}`
-      + `&scope=service&service_key=${encodeURIComponent(node.backendKey || "")}`,
+    body: `scope=service`
+      + `&node_id=${encodeURIComponent(String(requesterNodeId))}`
+      + `&unix_time=${encodeURIComponent(String(unixTime))}`
+      + `&auth_tag=${encodeURIComponent(String(authTag))}`,
   });
   loginData = await loginResponse.json();
   if (!loginResponse.ok || !loginData.ok || !loginData.token) {
@@ -1191,6 +1262,9 @@ function cloudDeviceSummary(record) {
     deviceStateText: deviceStateText(Number(record.deviceState || 0)),
     relayMask: Number(record.relayMask || 0) >>> 0,
     deviceFingerprint: record.deviceFingerprint || "",
+    mcuDeviceFingerprint: record.mcuDeviceFingerprint || "",
+    deviceFingerprintSource: record.deviceFingerprintSource || "",
+    fingerprintBoundAt: record.fingerprintBoundAt || "",
     lastSeenAt: record.lastSeenAt || "",
     firstSeenAt: record.firstSeenAt || "",
     sourceMasterNodeId: Number(record.sourceMasterNodeId || 0),
@@ -1304,7 +1378,7 @@ function broadcastState() {
   }
 }
 
-/* ── Sync knownNodes from MQTT broker clients ── */
+/* ?? Sync knownNodes from MQTT broker clients ?? */
 let brokerNodesSynced = false;
 async function syncKnownNodesFromBroker() {
   try {
@@ -1316,23 +1390,23 @@ async function syncKnownNodesFromBroker() {
       const registryKey = `${String(client.clusterId || "default")}|${String(client.deviceId)}`;
       const deviceRecord = cloudDevices.get(registryKey);
       const clusterRecord = cloudClusters.get(String(client.clusterId || ""));
+      /* Extract nodeId from deviceId if possible (format: node-NNNNNNNNN-NNNNNNNNN) */
+      let extractedNodeId = Number(client.nodeId || deviceRecord?.nodeId || 0);
+      if (!extractedNodeId && client.deviceId) {
+        const m = String(client.deviceId).match(/node-(\d+)-(\d+)/);
+        if (m) extractedNodeId = Number(m[2]);
+      }
       const knownKey = knownNodeKey(
         clusterRecord?.backendKey || "",
         clusterRecord?.clusterName || String(client.clusterId || "default"),
-        deviceRecord?.nodeId || 0
+        extractedNodeId || `dev-${client.deviceId}`
       );
       let node = knownNodes.get(knownKey);
       if (!node) {
         /* Find by deviceId across knownNodes */
-        for (const [k, n] of knownNodes) {
+        for (const [, n] of knownNodes) {
           if (n.cloudDeviceId === client.deviceId) { node = n; break; }
         }
-      }
-      /* Extract nodeId from deviceId if possible (format: node-NNNNNNNNN-NNNNNNNNN) */
-      let extractedNodeId = deviceRecord?.nodeId || 0;
-      if (!extractedNodeId && client.deviceId) {
-        const m = String(client.deviceId).match(/node-(\d+)-(\d+)/);
-        if (m) extractedNodeId = Number(m[2]);
       }
       if (!node) {
         /* Create new knownNode from broker client info */
@@ -1344,12 +1418,13 @@ async function syncKnownNodesFromBroker() {
           cloudDeviceId: String(client.deviceId),
           cloudKeyId: deviceRecord?.keyId || "",
           online: true,
-          device: deviceRecord?.deviceName || client.clientId || "",
-          role: 0,
-          deviceState: 1,
-          deviceStateText: "運行中",
-          relayMask: 0,
+          device: deviceRecord?.deviceName || client.device || client.clientId || "",
+          role: Number(client.role || 0),
+          deviceState: Number(client.deviceState || 1),
+          deviceStateText: deviceStateText(1),
+          relayMask: Number(client.relayMask || 0) >>> 0,
           lastSeen: new Date().toISOString(),
+          lastSeenAt: new Date().toISOString(),
           lastSeenMs: Date.now(),
           via: "mqtt-broker",
         };
@@ -1357,16 +1432,50 @@ async function syncKnownNodesFromBroker() {
           ? knownNodeKey(node.backendKey, node.cluster, node.nodeId)
           : knownNodeKey(node.backendKey, node.cluster, `dev-${client.deviceId}`);
         knownNodes.set(key, node);
+        syncCloudRegistryFromKnownNode(node);
       } else {
         node.online = true;
         node.lastSeen = new Date().toISOString();
+        node.lastSeenAt = new Date().toISOString();
         node.lastSeenMs = Date.now();
         if (!node.cloudDeviceId) node.cloudDeviceId = String(client.deviceId);
         if (!node.cloudClusterId) node.cloudClusterId = String(client.clusterId || "");
         if (deviceRecord && deviceRecord.nodeId) node.nodeId = deviceRecord.nodeId;
+        if (client.device && !node.device) node.device = String(client.device);
+        if (client.role) node.role = Number(client.role || 0);
+        if (client.term) node.term = Number(client.term || 0);
+        if (typeof client.relayMask !== "undefined") node.relayMask = Number(client.relayMask || 0) >>> 0;
+        if (client.lastStatusAt) node.lastSeenAt = String(client.lastStatusAt);
+        syncCloudRegistryFromKnownNode(node);
+      }
+      if (Array.isArray(client.nodes)) {
+        for (const remote of client.nodes) {
+          const remoteNodeId = Number(remote.node_id || remote.nodeId || 0);
+          if (!remoteNodeId) continue;
+          upsertKnownNode({
+            backendKey: clusterRecord?.backendKey || "",
+            cluster: clusterRecord?.clusterName || String(client.clusterId || "default"),
+            nodeId: remoteNodeId,
+            cloudClusterId: String(remote.cloud_cluster_id || client.clusterId || ""),
+            cloudDeviceId: String(remote.cloud_device_id || ""),
+            cloudKeyId: String(remote.cloud_key_id || ""),
+            online: Number(remote.online ? 1 : 0),
+            device: String(remote.name || remote.device || `Node ${remoteNodeId}`),
+            role: Number(remote.role || 0),
+            term: Number(remote.term || client.term || 0),
+            deviceState: Number(remote.device_state || 0),
+            relayMask: Number(remote.relay_mask || 0) >>> 0,
+            ip: normalizeIp(remote.ip_text || remote.ip || ""),
+            lastSeenAt: client.lastStatusAt || new Date().toISOString(),
+            lastSeenMs: Date.now(),
+            sourceMasterNodeId: extractedNodeId,
+            via: "mqtt-broker-status",
+          });
+        }
       }
     }
     brokerNodesSynced = true;
+    scheduleStateBroadcast();
   } catch (_) { /* broker not running yet */ }
 }
 
@@ -1614,7 +1723,7 @@ function scanStaleKnownNodes() {
   }
 }
 
-/* Raw TCP server (:42001) has been retired — MQTT is now the only control transport.
+/* Raw TCP server (:42001) has been retired ??MQTT is now the only control transport.
    The TCP server code block below is preserved for reference but is dead code.
 const _retiredTcpServer = { listen() {} };
 if (false) { const tcpServer = net.createServer((socket) => {
@@ -1866,961 +1975,53 @@ if (false) { const tcpServer = net.createServer((socket) => {
   });
 }); } /* end of retired TCP server block */
 
+const DASHBOARD_PATH = path.join(__dirname, "dashboard.html");
+let _dashboardHtml = null;
+let _dashboardMtime = 0;
+
 function renderHtml() {
-  return `<!doctype html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>backend-test 控制台</title>
-  <style>
-    :root { --c1:#41bfd9; --c2:#f15b6c; --bg:#f4f7fb; --card:#ffffff; --text:#24404a; --muted:#6f8790; --line:#d9e7ec; }
-    * { box-sizing:border-box; }
-    body { margin:0; font-family:Segoe UI, Microsoft JhengHei, sans-serif; background:var(--bg); color:var(--text); }
-    header { background:linear-gradient(90deg, var(--c1), #79d7e8); color:#fff; padding:16px 24px; font-size:22px; font-weight:700; }
-    main { max-width:1280px; margin:24px auto; padding:0 16px 32px; display:grid; gap:16px; }
-    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; box-shadow:0 8px 24px rgba(47,89,105,.08); padding:16px; }
-    h2 { margin:0 0 12px; font-size:18px; }
-    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
-    input, select, button { font:inherit; }
-    input, select { border:1px solid var(--line); border-radius:10px; padding:10px 12px; background:#fff; min-width:160px; }
-    button { border:0; border-radius:10px; padding:10px 14px; background:var(--c1); color:#fff; cursor:pointer; }
-    button[disabled] { opacity:.55; cursor:not-allowed; }
-    button.secondary { background:#eef7fa; color:var(--text); border:1px solid var(--line); }
-    button.danger { background:var(--c2); }
-    button.pending { background:#c7d1d6; color:#5f6d75; border:1px solid #b5c2c9; }
-    table { width:100%; border-collapse:collapse; }
-    th, td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
-    th { color:var(--muted); font-weight:600; }
-    code { background:#eff7fb; padding:2px 6px; border-radius:6px; }
-    .muted { color:var(--muted); }
-    .pill { display:inline-block; padding:3px 8px; border-radius:999px; background:#eef7fa; font-size:12px; }
-    .on { background:#dff7ea; color:#0d7a42; }
-    .off { background:#f2f4f6; color:#55626f; }
-    pre { margin:0; white-space:pre-wrap; word-break:break-word; background:#0f1720; color:#d6ecf1; padding:12px; border-radius:10px; max-height:360px; overflow:auto; }
-  </style>
-</head>
-<body>
-  <header>backend-test 控制台</header>
-  <main>
-    <section class="card">
-      <h2>摘要</h2>
-      <div id="summary" class="muted">讀取中...</div>
-    </section>
-    <section class="card">
-      <h2>金鑰管理</h2>
-      <div class="row">
-        <input id="keyLabel" placeholder="金鑰標籤">
-        <button onclick="createKey()">產生新金鑰</button>
-      </div>
-      <table id="keyTable"></table>
-    </section>
-    <section class="card">
-      <div class="row" style="justify-content:space-between">
-        <h2 style="margin:0">MQTT 裝置狀態</h2>
-        <button class="secondary" onclick="refresh()">重新整理</button>
-      </div>
-      <table id="clientTable"></table>
-    </section>
-      <section class="card">
-        <h2>所有已知裝置</h2>
-        <table id="knownNodeTable"></table>
-      </section>
-      <section class="card">
-        <h2>雲端叢集身份</h2>
-        <div class="row" style="margin-bottom:12px">
-          <input id="newCloudClusterName" placeholder="叢集名稱">
-          <input id="newCloudClusterId" placeholder="Cloud Cluster ID，可留空">
-          <input id="newCloudClusterKeyId" placeholder="Cloud Key ID，可留空">
-          <input id="newCloudClusterBrokerHost" placeholder="Broker Host，可留空">
-          <input id="newCloudClusterBrokerPort" placeholder="Broker Port，可留空">
-          <button onclick="createCloudCluster()">建立叢集身份</button>
-        </div>
-        <table id="cloudClusterTable"></table>
-      </section>
-      <section class="card">
-        <h2>雲端裝置身份</h2>
-        <div class="row" style="margin-bottom:12px">
-          <input id="newCloudDeviceClusterId" placeholder="Cloud Cluster ID">
-          <input id="newCloudDeviceName" placeholder="裝置名稱">
-          <input id="newCloudDeviceId" placeholder="Cloud Device ID，可留空">
-          <input id="newCloudDeviceKeyId" placeholder="Cloud Key ID，可留空">
-          <button onclick="createCloudDevice()">建立裝置身份</button>
-        </div>
-        <table id="cloudDeviceTable"></table>
-      </section>
-      <section class="card">
-        <h2>Provisioning 輸出</h2>
-        <pre id="provisionOutput">尚未選擇 cluster / device provisioning。</pre>
-      </section>
-      <section class="card">
-        <h2>裝置名稱設定</h2>
-        <div id="deviceNamePanels" class="muted">沒有可用裝置</div>
-      </section>
-    <section class="card">
-      <h2>Relay 設定</h2>
-      <div id="relayConfigPanels" class="muted">沒有可用裝置</div>
-    </section>
-    <section class="card">
-      <h2>排程器與 Auto Hold</h2>
-      <div class="row"><input id="schNodeId" placeholder="節點 nodeId"><input id="schChannel" placeholder="channel (1-16)"><button onclick="loadScheduler()">載入排程</button></div>
-      <div id="schStatus" class="muted" style="margin-top:6px"></div>
-      <div id="schDay" class="muted" style="margin-top:6px"></div>
-      <div class="row" style="margin-top:8px"><button onclick="schEnable()">啟用排程</button><button onclick="schDisable()">停用排程</button><button onclick="schPause()">暫停1hr</button><button onclick="schResume()">恢復</button></div>
-      <div class="row" style="margin-top:8px"><input id="ahDuration" placeholder="duration_seconds" value="600"><input id="ahSession" placeholder="session" value="1"><input id="ahReason" placeholder="reason" value="auto-hold"><select id="ahTarget"><option value="1">ON</option><option value="0">OFF</option></select><button onclick="sendAutoHold()">送 Auto Hold</button><button onclick="sendAutoHoldClear()">清除 Auto Hold</button></div>
-    </section>
-    <section class="card">
-      <h2>手動命令</h2>
-      <div class="row">
-        <input id="commandNodeId" placeholder="來源節點 nodeId">
-        <input id="commandTargetNodeId" placeholder="目標節點 nodeId，可留空">
-        <select id="commandType">
-          <option value="relay">單路控制</option>
-          <option value="mask">遮罩控制</option>
-          <option value="all">全部開關</option>
-          <option value="auto-hold">Auto Hold</option>
-        </select>
-        <input id="commandChannel" placeholder="channel">
-        <input id="commandValue" placeholder="value / mask">
-        <button onclick="sendCommand()">送出</button>
-      </div>
-      <div id="commandResult" class="muted" style="margin-top:10px;"></div>
-    </section>
-    <section class="card">
-      <h2>事件紀錄</h2>
-      <pre id="events">讀取中...</pre>
-    </section>
-  </main>
-  <script>
-    async function api(path, options) {
-      const response = await fetch(path, options);
-      const text = await response.text();
-      const data = text ? JSON.parse(text) : {};
-      if (!response.ok || data.ok === false) {
-        throw new Error(data.error || ('http_' + response.status));
-      }
-      return data;
+  try {
+    const stat = fs.statSync(DASHBOARD_PATH);
+    if (!_dashboardHtml || stat.mtimeMs > _dashboardMtime) {
+      _dashboardHtml = fs.readFileSync(DASHBOARD_PATH, "utf8");
+      _dashboardMtime = stat.mtimeMs;
     }
-    function esc(text) {
-      return String(text ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-    }
-    let currentSummary = null;
-    let currentClients = [];
-    let currentKnownNodes = [];
-    let currentCloudDevices = [];
-    let currentCloudClusters = [];
-    let currentEvents = [];
-    const deviceNameDirtyMap = {};
-    const deviceNameRenderSignatureMap = {};
-    const pendingRelayMap = {};
-    const pendingRelayBatchMap = {};
-    const relayConfigDirtyRows = new Set();
-    const relayConfigRenderSignatureMap = {};
-    const PENDING_RELAY_TIMEOUT_MS = 3000;
-    const RELAY_BATCH_WINDOW_MS = 500;
-    const RELAY_STATE_SYNC_INTERVAL_MS = 5000;
-    let renderTimer = 0;
-    function pendingRelayKey(nodeId, channel) {
-      return String(nodeId) + ':' + String(channel);
-    }
-    function findKnownNodeById(nodeId) {
-      return currentKnownNodes.find((item) => Number(item.nodeId) === Number(nodeId)) || null;
-    }
-    function setMaskBit(mask, channel, value) {
-      const bit = 1 << (Number(channel) - 1);
-      if (Number(value) === 0) {
-        return (Number(mask) >>> 0) & (~bit >>> 0);
-      }
-      return (Number(mask) >>> 0) | bit;
-    }
-    function effectiveRelayMask(nodeId, actualMask) {
-      let mask = Number(actualMask) >>> 0;
-      for (let ch = 1; ch <= 16; ch += 1) {
-        const pending = pendingRelayMap[pendingRelayKey(nodeId, ch)];
-        if (!pending) {
-          continue;
-        }
-        mask = setMaskBit(mask, ch, pending.value);
-      }
-      return mask >>> 0;
-    }
-    function pendingBatchKey(effectiveNodeId) {
-      return String(effectiveNodeId);
-    }
-    function hasPendingRelayWork() {
-      return Object.keys(pendingRelayBatchMap).length > 0;
-    }
-    function clearPendingBatch(batchKey) {
-      const batch = pendingRelayBatchMap[batchKey];
-      if (!batch) {
-        return;
-      }
-      if (batch.timer) {
-        clearTimeout(batch.timer);
-      }
-      for (const key of batch.pendingKeys) {
-        const pending = pendingRelayMap[key];
-        if (pending && pending.timer) {
-          clearTimeout(pending.timer);
-        }
-        delete pendingRelayMap[key];
-      }
-      delete pendingRelayBatchMap[batchKey];
-    }
-    function reconcilePendingRelays(nodes) {
-      for (const batchKey of Object.keys(pendingRelayBatchMap)) {
-        const batch = pendingRelayBatchMap[batchKey];
-        const node = nodes.find((item) => Number(item.nodeId) === Number(batch.effectiveNodeId));
-        if (!node) {
-          continue;
-        }
-        if ((Number(node.relayMask) >>> 0) === (Number(batch.desiredMask) >>> 0)) {
-          clearPendingBatch(batchKey);
-        }
-      }
-      for (const item of nodes) {
-        for (let ch = 1; ch <= 16; ch += 1) {
-          const key = pendingRelayKey(item.nodeId, ch);
-          const pending = pendingRelayMap[key];
-          if (!pending) {
-            continue;
-          }
-          if (pending.batchKey && pendingRelayBatchMap[pending.batchKey]) {
-            continue;
-          }
-          if (relayOn(item.relayMask, ch) === !!pending.value) {
-            if (pending.timer) {
-              clearTimeout(pending.timer);
-            }
-            delete pendingRelayMap[key];
-          }
-        }
-      }
-    }
-    function pill(text, online) {
-      return '<span class="pill ' + (online ? 'on' : 'off') + '">' + text + '</span>';
-    }
-    function adcText(item) {
-      if (!item.adcValid) {
-        return '尚無取樣';
-      }
-      const diagnostics = '偏壓 ' + esc(item.adcMillivolts) + ' mV / RMS ' +
-        esc(item.adcRmsMillivolts) + ' mV / ' + esc(item.adcSampleRateHz) + ' Hz';
-      if (!item.adcCtValid) {
-        return 'CT 未就緒 / ' + diagnostics;
-      }
-      return (Number(item.adcCurrentMilliamps || 0) / 1000).toFixed(3) +
-        ' A / ' + diagnostics;
-    }
-    function sourceNodeId(item) {
-      return Number(item.effectiveMasterNodeId || item.sourceMasterNodeId || item.nodeId || 0);
-    }
-    function relayOn(mask, channel) {
-      return (((Number(mask) >>> 0) >>> (channel - 1)) & 1) === 1;
-    }
-    function markRelayButtonPending(buttonEl, channel) {
-      if (!buttonEl) {
-        return;
-      }
-      buttonEl.disabled = true;
-      buttonEl.className = 'secondary pending';
-      buttonEl.textContent = 'CH' + channel + ':等待';
-    }
-    function scheduleRelayBatchSend(batchKey) {
-      const batch = pendingRelayBatchMap[batchKey];
-      if (!batch) {
-        return;
-      }
-      if (batch.timer) {
-        clearTimeout(batch.timer);
-      }
-      batch.timer = setTimeout(async () => {
-        const activeBatch = pendingRelayBatchMap[batchKey];
-        if (!activeBatch) {
-          return;
-        }
-        const body = { mask: Number(activeBatch.desiredMask) >>> 0 };
-        if (Number(activeBatch.targetNodeId) > 0) {
-          body.targetNodeId = Number(activeBatch.targetNodeId);
-        }
-        try {
-          const result = await api('/send/' + activeBatch.sourceNodeId + '/mask', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-          });
-          document.getElementById('commandResult').textContent = JSON.stringify(result);
-        } catch (error) {
-          for (const key of activeBatch.pendingKeys) {
-            const pending = pendingRelayMap[key];
-            if (pending && pending.timer) {
-              clearTimeout(pending.timer);
-            }
-            delete pendingRelayMap[key];
-          }
-          delete pendingRelayBatchMap[batchKey];
-          refreshBurst();
-          document.getElementById('commandResult').textContent = error.message;
-          return;
-        }
-        delete pendingRelayBatchMap[batchKey];
-      }, RELAY_BATCH_WINDOW_MS);
-    }
-    function renderRelayButtons(item) {
-      if (!item.online) {
-        return '<span class="muted">離線</span>';
-      }
-      const sourceId = sourceNodeId(item);
-      if (!sourceId) {
-        return '<span class="muted">找不到來源 master</span>';
-      }
-      const targetId = Number(item.nodeId);
-      const useTargetId = sourceId === targetId ? 0 : targetId;
-      const buttons = [];
-      const overlayMask = effectiveRelayMask(item.nodeId, item.relayMask);
-      for (let ch = 1; ch <= 16; ch += 1) {
-        const pending = pendingRelayMap[pendingRelayKey(item.nodeId, ch)];
-        const on = relayOn(overlayMask, ch);
-        const buttonClass = pending ? 'secondary pending' : (on ? 'danger' : 'secondary');
-        const buttonText = pending ? ('CH' + ch + ':等待') : ('CH' + ch + ':' + (on ? '關' : '開'));
-        buttons.push(
-          '<button class="' + buttonClass +
-          '" style="padding:6px 8px;margin:2px" ' + (pending ? 'disabled ' : '') + 'onclick="quickRelay(this,' +
-          sourceId + ',' + useTargetId + ',' + ch + ',' + (on ? 0 : 1) +
-          ')">' + buttonText + '</button>'
-        );
-      }
-      return '<div style="display:flex;flex-wrap:wrap;gap:4px">' + buttons.join('') + '</div>';
-    }
-    function renderKnownNodeActions(item) {
-      const actions = [renderRelayButtons(item)];
-      const hasClusterIdentity = !!String(item.cloudClusterId || '').trim();
-      const hasDeviceIdentity = !!String(item.cloudDeviceId || '').trim();
-      if (hasClusterIdentity && !hasDeviceIdentity) {
-        actions.push('<button class="secondary" ' + (item.online ? '' : 'disabled ') + 'onclick="createCloudDeviceFromNode(' + Number(item.nodeId) + ')">建立雲端身份</button>');
-      }
-      return actions.join(' ');
-    }
-    function markDeviceNameDirty(nodeId) {
-      deviceNameDirtyMap[String(nodeId)] = true;
-    }
-    function clearDeviceNameDirty(nodeId) {
-      delete deviceNameDirtyMap[String(nodeId)];
-    }
-    function deviceNameNodeSignature(item) {
-      return JSON.stringify({
-        nodeId: Number(item.nodeId || 0),
-        device: String(item.device || ''),
-        online: Number(item.online ? 1 : 0),
-        role: Number(item.role || 0),
-        cluster: String(item.cluster || '')
-      });
-    }
-    function renderDeviceNamePanels(nodes) {
-      const container = document.getElementById('deviceNamePanels');
-      const existingIds = new Set();
-      if (!container) {
-        return;
-      }
-      if (!nodes.length) {
-        container.innerHTML = '<div class="muted">沒有可用裝置</div>';
-        return;
-      }
-      for (const item of nodes) {
-        const nodeId = String(item.nodeId);
-        const panelId = 'device_name_panel_' + nodeId;
-        const signature = deviceNameNodeSignature(item);
-        let panel = document.getElementById(panelId);
-        existingIds.add(panelId);
-        if (!panel) {
-          panel = document.createElement('div');
-          panel.id = panelId;
-          container.appendChild(panel);
-        }
-        if (deviceNameDirtyMap[nodeId]) {
-          continue;
-        }
-        if (deviceNameRenderSignatureMap[nodeId] === signature) {
-          continue;
-        }
-        panel.innerHTML =
-          '<div class="row" style="margin-bottom:10px">' +
-            '<div style="min-width:240px"><b>' + esc(item.device) + '</b> (' + esc(item.nodeId) + ')</div>' +
-            '<input id="dev_name_' + item.nodeId + '" value="' + esc(item.device || '') + '" oninput="markDeviceNameDirty(' + item.nodeId + ')" ' + (item.online ? '' : 'disabled') + '>' +
-            '<button class="secondary" ' + (item.online ? '' : 'disabled ') + 'onclick="saveDeviceName(' + item.nodeId + ')">保存名稱</button>' +
-            '<span class="muted">' + (item.online ? '在線' : '離線') + '</span>' +
-          '</div>';
-        deviceNameRenderSignatureMap[nodeId] = signature;
-      }
-      Array.from(container.children).forEach((child) => {
-        if (!existingIds.has(child.id)) {
-          container.removeChild(child);
-        }
-      });
-    }
-    function relayConfigRowKey(nodeId, channel) {
-      return String(nodeId) + ':' + String(channel);
-    }
-    function markRelayConfigDirty(nodeId, channel) {
-      relayConfigDirtyRows.add(relayConfigRowKey(nodeId, channel));
-    }
-    function clearRelayConfigDirty(nodeId, channel) {
-      relayConfigDirtyRows.delete(relayConfigRowKey(nodeId, channel));
-    }
-    function relayConfigNodeSignature(relays) {
-      if (!relays || !Array.isArray(relays.relays)) {
-        return 'none';
-      }
-      return JSON.stringify(relays.relays.map((relay) => ({
-        channel: Number(relay.channel || 0),
-        name: String(relay.name || ''),
-        enabled: Number(relay.enabled ? 1 : 0),
-        remember_state: Number(relay.remember_state ? 1 : 0),
-        boot_default_on: Number(relay.boot_default_on ? 1 : 0),
-        adc_channel: Number(relay.adc_channel),
-        protection_enabled: Number(relay.protection_enabled ? 1 : 0),
-        overcurrent_milliamps: Number(relay.overcurrent_milliamps || 0),
-        trip_delay_ms: Number(relay.trip_delay_ms || 0),
-        reset_hysteresis_milliamps: Number(relay.reset_hysteresis_milliamps || 0)
-      })));
-    }
-    function buildRelayConfigPanelHtml(item, relays) {
-      if (!relays || !Array.isArray(relays.relays)) {
-        return '<div style="margin-bottom:14px"><div><b>' + esc(item.device) + '</b> (' + esc(item.nodeId) + ')</div><div class="muted">尚未載入 relay 設定</div></div>';
-      }
-      const rows = relays.relays.map((relay) =>
-        '<tr>' +
-          '<td>' + relay.channel + '</td>' +
-          '<td><input id="cfg_name_' + item.nodeId + '_' + relay.channel + '" value="' + esc(relay.name || '') + '" oninput="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
-          '<td><input id="cfg_enabled_' + item.nodeId + '_' + relay.channel + '" type="checkbox" ' + (relay.enabled ? 'checked' : '') + ' onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
-          '<td><input id="cfg_remember_' + item.nodeId + '_' + relay.channel + '" type="checkbox" ' + (relay.remember_state ? 'checked' : '') + ' onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
-          '<td><input id="cfg_boot_' + item.nodeId + '_' + relay.channel + '" type="checkbox" ' + (relay.boot_default_on ? 'checked' : '') + ' onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
-          '<td><select id="cfg_adc_' + item.nodeId + '_' + relay.channel + '" onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"><option value="-1" ' + (Number(relay.adc_channel) === 255 ? 'selected' : '') + '>未綁定</option><option value="0" ' + (Number(relay.adc_channel) === 0 ? 'selected' : '') + '>ADC0 / PA0</option></select></td>' +
-          '<td><input id="cfg_protect_' + item.nodeId + '_' + relay.channel + '" type="checkbox" ' + (relay.protection_enabled ? 'checked' : '') + ' onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
-          '<td><input id="cfg_limit_' + item.nodeId + '_' + relay.channel + '" type="number" min="1" value="' + Number(relay.overcurrent_milliamps || 0) + '" onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
-          '<td><input id="cfg_delay_' + item.nodeId + '_' + relay.channel + '" type="number" min="0" value="' + Number(relay.trip_delay_ms || 0) + '" onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
-          '<td><input id="cfg_hysteresis_' + item.nodeId + '_' + relay.channel + '" type="number" min="0" value="' + Number(relay.reset_hysteresis_milliamps || 0) + '" onchange="markRelayConfigDirty(' + item.nodeId + ',' + relay.channel + ')"></td>' +
-          '<td><button class="secondary" onclick="saveRelayConfig(' + item.nodeId + ',' + relay.channel + ')">保存</button></td>' +
-        '</tr>'
-      ).join('');
-      return '<div style="margin-bottom:18px;overflow-x:auto"><div style="font-weight:700;margin-bottom:8px">' + esc(item.device) + ' (' + esc(item.nodeId) + ')</div><table><tr><th>CH</th><th>名稱</th><th>啟用</th><th>記憶</th><th>開機預設開</th><th>ADC</th><th>過流保護</th><th>門檻(mA)</th><th>延遲(ms)</th><th>回差(mA)</th><th>操作</th></tr>' + rows + '</table></div>';
-    }
-    async function loadRelayConfig(nodeId) {
-      return api('/api/config/' + nodeId + '/relays');
-    }
-    function renderRelayConfigPanels(nodes, relayConfigMap) {
-      const container = document.getElementById('relayConfigPanels');
-      if (!container) {
-        return;
-      }
-      if (!nodes.length) {
-        container.innerHTML = '<div class="muted">沒有可用裝置</div>';
-        return;
-      }
-      const existingIds = new Set();
-      for (const item of nodes) {
-        const nodeId = String(item.nodeId);
-        const panelId = 'relay_panel_' + nodeId;
-        const relays = relayConfigMap[nodeId];
-        const signature = relayConfigNodeSignature(relays);
-        const hasDirtyRow = relays && Array.isArray(relays.relays) && relays.relays.some((relay) => relayConfigDirtyRows.has(relayConfigRowKey(item.nodeId, relay.channel)));
-        let panel = document.getElementById(panelId);
-        existingIds.add(panelId);
-        if (!panel) {
-          panel = document.createElement('div');
-          panel.id = panelId;
-          container.appendChild(panel);
-        }
-        if (hasDirtyRow) {
-          continue;
-        }
-        if (relayConfigRenderSignatureMap[nodeId] === signature) {
-          continue;
-        }
-        panel.innerHTML = buildRelayConfigPanelHtml(item, relays);
-        relayConfigRenderSignatureMap[nodeId] = signature;
-      }
-      Array.from(container.children).forEach((child) => {
-        if (!existingIds.has(child.id)) {
-          container.removeChild(child);
-        }
-      });
-    }
-    const relayConfigCache = {};
-    const relayConfigLoadedAt = {};
-    function refreshRelayConfigs(nodes, force) {
-      const relayTargets = nodes.filter((item) => item.online);
-      const pending = relayTargets.filter((item) => {
-        const key = String(item.nodeId);
-        if (force) {
-          return true;
-        }
-        if (!relayConfigCache[key]) {
-          return true;
-        }
-        return !relayConfigLoadedAt[key] || ((Date.now() - relayConfigLoadedAt[key]) >= 30000);
-      });
-
-      if (pending.length === 0) {
-        return;
-      }
-
-      Promise.allSettled(pending.map(async (item) => {
-        const key = String(item.nodeId);
-        try {
-          relayConfigCache[key] = await loadRelayConfig(item.nodeId);
-          relayConfigLoadedAt[key] = Date.now();
-        } catch (_error) {
-          relayConfigCache[key] = null;
-          relayConfigLoadedAt[key] = Date.now();
-        }
-      })).then(() => {
-        renderRelayConfigPanels(nodes, relayConfigCache);
-      });
-    }
-    function flushRenderLiveState() {
-      if (!currentSummary) {
-        return;
-      }
-
-      const summary = currentSummary;
-      reconcilePendingRelays(currentKnownNodes);
-
-      document.getElementById('summary').innerHTML =
-        'HTTP ' + summary.httpPort +
-        ' / TCP ' + summary.tcpPort +
-        ' / 金鑰 ' + summary.keyCount +
-        ' 把 / 活躍鏈路 ' + summary.activeClients +
-        ' 條 / 原始 socket ' + summary.rawClients +
-        ' 條 / 已知裝置 ' + summary.knownNodes +
-        ' 台 / 雲端裝置身份 ' + (summary.cloudDevices || 0) +
-        ' 筆 / 雲端叢集身份 ' + (summary.cloudClusters || 0) + ' 筆';
-
-      document.getElementById('clientTable').innerHTML =
-        '<tr><th>clientId</th><th>deviceId</th><th>clusterId</th><th>狀態</th><th>遠端 IP</th><th>subscriptions</th></tr>' +
-        currentClients.map((item) => '<tr>' +
-          '<td>' + esc(item.clientId) + '</td>' +
-          '<td>' + esc(item.deviceId) + '</td>' +
-          '<td>' + esc(item.clusterId) + '</td>' +
-          '<td>' + (item.connected ? pill('已連線', true) : pill('離線', false)) + '</td>' +
-          '<td>' + esc(item.remote) + '</td>' +
-          '<td>' + esc((item.subscriptions || []).join(', ')) + '</td>' +
-        '</tr>').join('');
-
-      renderDeviceNamePanels(currentKnownNodes);
-
-      if (!hasPendingRelayWork()) {
-        document.getElementById('knownNodeTable').innerHTML =
-          '<tr><th>nodeId</th><th>裝置</th><th>叢集</th><th>Cloud Cluster</th><th>Cloud Device</th><th>Cloud Key</th><th>角色</th><th>在線</th><th>狀態</th><th>relayMask</th><th>ADC</th><th>控制</th><th>最後同步</th></tr>' +
-          currentKnownNodes.map((item) => '<tr>' +
-            '<td>' + esc(item.nodeId) + '</td>' +
-            '<td>' + esc(item.device) + '</td>' +
-            '<td>' + esc(item.cluster) + '</td>' +
-            '<td>' + esc(item.cloudClusterId) + '</td>' +
-            '<td>' + esc(item.cloudDeviceId) + '</td>' +
-            '<td>' + esc(item.cloudKeyId) + '</td>' +
-            '<td>' + esc(item.role) + '</td>' +
-            '<td>' + (item.online ? pill('在線', true) : pill('離線', false)) + '</td>' +
-            '<td>' + esc(item.deviceStateText) + '</td>' +
-            '<td>' + esc(item.relayMask) + '</td>' +
-            '<td>' + adcText(item) + '</td>' +
-            '<td>' + renderKnownNodeActions(item) + '</td>' +
-            '<td>' + esc(item.lastSeenAt) + '</td>' +
-          '</tr>').join('');
-      }
-
-      document.getElementById('cloudClusterTable').innerHTML =
-        '<tr><th>Cloud Cluster</th><th>Cloud Key</th><th>CA 指紋</th><th>狀態</th><th>Transport</th><th>Broker</th><th>叢集名稱</th><th>最後 master device</th><th>最後 master node</th><th>在線裝置</th><th>已知裝置</th><th>最後更新</th><th>操作</th></tr>' +
-        currentCloudClusters.map((item) => '<tr>' +
-          '<td>' + esc(item.clusterId) + '</td>' +
-          '<td>' + esc(item.keyId) + '</td>' +
-          '<td><code>' + esc(item.caFingerprint) + '</code></td>' +
-          '<td>' + (item.enabled ? pill('啟用', true) : pill('停用', false)) + '</td>' +
-          '<td>' + esc(item.transport) + '</td>' +
-          '<td>' + esc(item.brokerHost) + ':' + esc(item.brokerPort) + '</td>' +
-          '<td>' + esc(item.clusterName) + '</td>' +
-          '<td>' + esc(item.lastMasterDeviceId) + '</td>' +
-          '<td>' + esc(item.lastMasterNodeId) + '</td>' +
-          '<td>' + esc(item.onlineDevices) + '</td>' +
-          '<td>' + esc(item.knownDevices) + '</td>' +
-          '<td>' + esc(item.lastSeenAt) + '</td>' +
-          '<td class="row"><button class="secondary" onclick="showClusterProvision(\\'' + esc(item.clusterId) + '\\')">輸出</button><button class="secondary" onclick="applyCloudClusterOnline(\\'' + esc(item.clusterId) + '\\')">套用在線節點</button><button class="secondary" onclick="rotateClusterCa(\\'' + esc(item.clusterId) + '\\')">重發 CA</button><button class="secondary" onclick="toggleCloudCluster(\\'' + esc(item.clusterId) + '\\',' + (!item.enabled) + ')">' + (item.enabled ? '停用' : '啟用') + '</button></td>' +
-        '</tr>').join('');
-
-      document.getElementById('cloudDeviceTable').innerHTML =
-        '<tr><th>Cloud Cluster</th><th>Cloud Device</th><th>Cloud Key</th><th>Device 指紋</th><th>狀態</th><th>nodeId</th><th>裝置</th><th>叢集</th><th>角色</th><th>在線</th><th>狀態</th><th>relayMask</th><th>最後同步</th><th>操作</th></tr>' +
-        currentCloudDevices.map((item) => '<tr>' +
-          '<td>' + esc(item.clusterId) + '</td>' +
-          '<td>' + esc(item.deviceId) + '</td>' +
-          '<td>' + esc(item.keyId) + '</td>' +
-          '<td><code>' + esc(item.deviceFingerprint) + '</code></td>' +
-          '<td>' + (item.enabled ? pill('啟用', true) : pill('停用', false)) + '</td>' +
-          '<td>' + esc(item.nodeId) + '</td>' +
-          '<td>' + esc(item.device) + '</td>' +
-          '<td>' + esc(item.clusterName) + '</td>' +
-          '<td>' + esc(item.role) + '</td>' +
-          '<td>' + (item.online ? pill('在線', true) : pill('離線', false)) + '</td>' +
-          '<td>' + esc(item.deviceStateText) + '</td>' +
-          '<td>' + esc(item.relayMask) + '</td>' +
-          '<td>' + esc(item.lastSeenAt) + '</td>' +
-          '<td class="row"><button class="secondary" onclick="showDeviceProvision(\\'' + esc(item.clusterId) + '\\',\\'' + esc(item.deviceId) + '\\')">輸出</button><button class="secondary" onclick="rotateCloudDevice(\\'' + esc(item.clusterId) + '\\',\\'' + esc(item.deviceId) + '\\')">重發裝置憑證</button>' +
-          (Number(item.nodeId || 0) > 0 ? '<button class="secondary" onclick="applyCloudProvision(' + Number(item.nodeId) + ',\\'' + esc(item.clusterId) + '\\',\\'' + esc(item.deviceId) + '\\')">套用到裝置</button>' : '') +
-          '<button class="secondary" onclick="toggleCloudDevice(\\'' + esc(item.clusterId) + '\\',\\'' + esc(item.deviceId) + '\\',' + (!item.enabled) + ')">' + (item.enabled ? '停用' : '啟用') + '</button></td>' +
-        '</tr>').join('');
-
-      renderRelayConfigPanels(currentKnownNodes, relayConfigCache);
-      document.getElementById('events').textContent = JSON.stringify(currentEvents.slice(-40), null, 2);
-    }
-    function renderLiveState(summary, clients, knownNodes, cloudDevices, cloudClusters, events) {
-      currentSummary = summary;
-      currentClients = clients.clients || [];
-      currentKnownNodes = knownNodes.nodes || [];
-      currentCloudDevices = cloudDevices.devices || [];
-      currentCloudClusters = cloudClusters.clusters || [];
-      currentEvents = events.events || [];
-      reconcilePendingRelays(currentKnownNodes);
-      if (renderTimer) {
-        return;
-      }
-      renderTimer = setTimeout(() => {
-        renderTimer = 0;
-        flushRenderLiveState();
-      }, 16);
-    }
-    function refreshBurst() {
-      if (currentSummary) {
-        renderLiveState(
-          currentSummary,
-          { clients: currentClients },
-          { nodes: currentKnownNodes },
-          { devices: currentCloudDevices },
-          { clusters: currentCloudClusters },
-          { events: currentEvents }
-        );
-      }
-    }
-    function connectStream() {
-      const es = new EventSource('/api/stream');
-      es.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data);
-          renderLiveState(payload.summary, payload.clients, payload.knownNodes, payload.cloudDevices, payload.cloudClusters, payload.events);
-        } catch (_error) {
-        }
-      };
-      es.onerror = () => {
-        es.close();
-        setTimeout(connectStream, 1500);
-      };
-    }
-    async function refresh() {
-      try {
-        const [summary, keys, clients, knownNodes, cloudDevices, cloudClusters, events] = await Promise.all([
-          api('/api/summary'),
-          api('/api/keys'),
-          api('/clients'),
-          api('/api/known-nodes'),
-          api('/api/cloud/devices'),
-          api('/api/cloud/clusters'),
-          api('/events')
-        ]);
-
-        document.getElementById('summary').innerHTML =
-          'HTTP :' + summary.httpPort +
-          ' / MQTT broker :' + summary.mqttPort +
-          ' / Control :' + summary.mqttControlPort +
-          ' / 金鑰 ' + summary.keyCount +
-          ' 把 / 已知裝置 ' + summary.knownNodes +
-          ' 台 / 雲端裝置 ' + (summary.cloudDevices || 0) +
-          ' 筆 / 雲端叢集 ' + (summary.cloudClusters || 0) + ' 筆';
-
-        document.getElementById('keyTable').innerHTML =
-          '<tr><th>標籤</th><th>金鑰</th><th>狀態</th><th>最近使用</th><th>操作</th></tr>' +
-          keys.keys.map((item) => '<tr>' +
-            '<td>' + esc(item.label) + '</td>' +
-            '<td><code>' + esc(item.key) + '</code></td>' +
-            '<td>' + (item.enabled ? pill('啟用', true) : pill('停用', false)) + '</td>' +
-            '<td>' + esc(item.lastDevice || '-') + ' / ' + esc(item.lastCluster || '-') + '</td>' +
-            '<td class="row">' +
-              '<button class="secondary" onclick="toggleKey(\\'' + esc(item.id) + '\\',' + (!item.enabled) + ')">' + (item.enabled ? '停用' : '啟用') + '</button>' +
-              '<button class="danger" onclick="deleteKey(\\'' + esc(item.id) + '\\')">刪除</button>' +
-            '</td>' +
-          '</tr>').join('');
-
-        renderLiveState(summary, clients, knownNodes, cloudDevices, cloudClusters, events);
-        refreshRelayConfigs(knownNodes.nodes, false);
-        return;
-      } catch (error) {
-        document.getElementById('summary').textContent = '讀取失敗: ' + error.message;
-      }
-    }
-    async function createKey() {
-      const label = document.getElementById('keyLabel').value;
-      await api('/api/keys', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label })
-      });
-      document.getElementById('keyLabel').value = '';
-      refresh();
-    }
-    async function toggleKey(id, enabled) {
-      await api('/api/keys/' + id, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled })
-      });
-      refresh();
-    }
-    async function deleteKey(id) {
-      await api('/api/keys/' + id, { method: 'DELETE' });
-      refresh();
-    }
-    async function toggleCloudCluster(clusterId, enabled) {
-      await api('/api/cloud/clusters/' + encodeURIComponent(clusterId), {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled })
-      });
-      refresh();
-    }
-    async function createCloudCluster() {
-      const result = await api('/api/cloud/clusters', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clusterName: document.getElementById('newCloudClusterName').value.trim(),
-          clusterId: document.getElementById('newCloudClusterId').value.trim(),
-          keyId: document.getElementById('newCloudClusterKeyId').value.trim(),
-          brokerHost: document.getElementById('newCloudClusterBrokerHost').value.trim(),
-          brokerPort: document.getElementById('newCloudClusterBrokerPort').value.trim()
-        })
-      });
-      document.getElementById('newCloudClusterName').value = '';
-      document.getElementById('newCloudClusterId').value = '';
-      document.getElementById('newCloudClusterKeyId').value = '';
-      document.getElementById('newCloudClusterBrokerHost').value = '';
-      document.getElementById('newCloudClusterBrokerPort').value = '';
-      refresh();
-      if (result && result.cluster) {
-        await showClusterProvision(result.cluster.clusterId);
-      }
-    }
-    async function showClusterProvision(clusterId) {
-      const result = await api('/api/cloud/clusters/' + encodeURIComponent(clusterId) + '/provision');
-      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
-    }
-    async function rotateClusterCa(clusterId) {
-      const result = await api('/api/cloud/clusters/' + encodeURIComponent(clusterId) + '/rotate-ca', {
-        method: 'POST'
-      });
-      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
-      refresh();
-    }
-    async function applyCloudClusterOnline(clusterId) {
-      const result = await api('/api/cloud/clusters/' + encodeURIComponent(clusterId) + '/apply-online', {
-        method: 'POST'
-      });
-      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
-      refresh();
-    }
-    async function toggleCloudDevice(clusterId, deviceId, enabled) {
-      await api('/api/cloud/devices/' + encodeURIComponent(clusterId) + '/' + encodeURIComponent(deviceId), {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled })
-      });
-      refresh();
-    }
-    async function showDeviceProvision(clusterId, deviceId) {
-      const result = await api('/api/cloud/devices/' + encodeURIComponent(clusterId) + '/' + encodeURIComponent(deviceId) + '/provision');
-      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
-    }
-    async function rotateCloudDevice(clusterId, deviceId) {
-      const result = await api('/api/cloud/devices/' + encodeURIComponent(clusterId) + '/' + encodeURIComponent(deviceId) + '/rotate-credential', {
-        method: 'POST'
-      });
-      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
-      refresh();
-    }
-    async function applyCloudProvision(nodeId, clusterId, deviceId) {
-      const result = await api('/api/cloud/apply/' + encodeURIComponent(String(nodeId)), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clusterId, deviceId })
-      });
-      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
-      refresh();
-    }
-    async function createCloudDeviceFromNode(nodeId) {
-      const result = await api('/api/cloud/devices/from-node', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nodeId: Number(nodeId) })
-      });
-      document.getElementById('provisionOutput').textContent = JSON.stringify(result, null, 2);
-      refresh();
-      if (result && result.device) {
-        await showDeviceProvision(result.device.clusterId, result.device.deviceId);
-      }
-    }
-    async function createCloudDevice() {
-      const result = await api('/api/cloud/devices', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clusterId: document.getElementById('newCloudDeviceClusterId').value.trim(),
-          deviceName: document.getElementById('newCloudDeviceName').value.trim(),
-          deviceId: document.getElementById('newCloudDeviceId').value.trim(),
-          keyId: document.getElementById('newCloudDeviceKeyId').value.trim()
-        })
-      });
-      document.getElementById('newCloudDeviceClusterId').value = '';
-      document.getElementById('newCloudDeviceName').value = '';
-      document.getElementById('newCloudDeviceId').value = '';
-      document.getElementById('newCloudDeviceKeyId').value = '';
-      refresh();
-      if (result && result.device) {
-        await showDeviceProvision(result.device.clusterId, result.device.deviceId);
-      }
-    }
-    async function sendCommand() {
-      const nodeId = document.getElementById('commandNodeId').value.trim();
-      const targetNodeId = document.getElementById('commandTargetNodeId').value.trim();
-      const commandType = document.getElementById('commandType').value;
-      const channel = document.getElementById('commandChannel').value.trim();
-      const value = document.getElementById('commandValue').value.trim();
-
-      if (commandType === 'auto-hold') {
-        var ts=Math.floor(Date.now()/1000);
-        var r=await api('/send/'+nodeId+'/auto-hold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(channel),target:1,duration_seconds:Number(value||600),session:1,command_ts:ts,reason:'manual'})});
-        document.getElementById('commandResult').textContent=JSON.stringify(r);
-        refreshBurst();return;
-      }
-
-      const body = {};
-      if (targetNodeId) body.targetNodeId = Number(targetNodeId);
-      if (commandType === 'relay') {
-        body.channel = Number(channel);
-        body.value = Number(value);
-      } else if (commandType === 'mask') {
-        body.mask = Number(value);
-      } else {
-        body.value = Number(value);
-      }
-
-      const result = await api('/send/' + nodeId + '/' + commandType, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      document.getElementById('commandResult').textContent = JSON.stringify(result);
-      refreshBurst();
-    }
-    async function quickRelay(buttonEl, sourceNodeIdValue, targetNodeIdValue, channel, value) {
-      const effectiveNodeId = Number(targetNodeIdValue) > 0 ? Number(targetNodeIdValue) : Number(sourceNodeIdValue);
-      const key = pendingRelayKey(effectiveNodeId, Number(channel));
-      const pendingValue = Number(value);
-      const batchKey = pendingBatchKey(effectiveNodeId);
-      const node = findKnownNodeById(effectiveNodeId);
-      const existingBatch = pendingRelayBatchMap[batchKey];
-      const baseMask = existingBatch
-        ? Number(existingBatch.desiredMask) >>> 0
-        : effectiveRelayMask(effectiveNodeId, Number((node && node.relayMask) || 0) >>> 0);
-      const desiredMask = setMaskBit(baseMask, Number(channel), pendingValue);
-      pendingRelayMap[key] = {
-        value: pendingValue,
-        batchKey,
-        timer: setTimeout(() => {
-          const pending = pendingRelayMap[key];
-          if (!pending || pending.value !== pendingValue) {
-            return;
-          }
-          clearPendingBatch(batchKey);
-          refreshBurst();
-          document.getElementById('commandResult').textContent = 'relay_timeout';
-        }, PENDING_RELAY_TIMEOUT_MS)
-      };
-      markRelayButtonPending(buttonEl, Number(channel));
-      const nextBatch = existingBatch || {
-        sourceNodeId: Number(sourceNodeIdValue),
-        targetNodeId: Number(targetNodeIdValue) > 0 ? Number(targetNodeIdValue) : 0,
-        effectiveNodeId,
-        desiredMask: baseMask,
-        pendingKeys: new Set(),
-        timer: 0
-      };
-      nextBatch.desiredMask = desiredMask;
-      nextBatch.pendingKeys.add(key);
-      pendingRelayBatchMap[batchKey] = nextBatch;
-      scheduleRelayBatchSend(batchKey);
-    }
-    async function saveRelayConfig(nodeId, channel) {
-      const body = {
-        channel: Number(channel),
-        name: document.getElementById('cfg_name_' + nodeId + '_' + channel).value,
-        enabled: document.getElementById('cfg_enabled_' + nodeId + '_' + channel).checked ? 1 : 0,
-        remember_state: document.getElementById('cfg_remember_' + nodeId + '_' + channel).checked ? 1 : 0,
-        boot_default_on: document.getElementById('cfg_boot_' + nodeId + '_' + channel).checked ? 1 : 0,
-        adc_channel: Number(document.getElementById('cfg_adc_' + nodeId + '_' + channel).value),
-        protection_enabled: document.getElementById('cfg_protect_' + nodeId + '_' + channel).checked ? 1 : 0,
-        overcurrent_milliamps: Number(document.getElementById('cfg_limit_' + nodeId + '_' + channel).value),
-        trip_delay_ms: Number(document.getElementById('cfg_delay_' + nodeId + '_' + channel).value),
-        reset_hysteresis_milliamps: Number(document.getElementById('cfg_hysteresis_' + nodeId + '_' + channel).value)
-      };
-      const result = await api('/api/config/' + nodeId + '/relay', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      document.getElementById('commandResult').textContent = JSON.stringify(result);
-      relayConfigCache[String(nodeId)] = result;
-      relayConfigLoadedAt[String(nodeId)] = Date.now();
-      clearRelayConfigDirty(nodeId, channel);
-      relayConfigRenderSignatureMap[String(nodeId)] = relayConfigNodeSignature(result);
-      renderRelayConfigPanels(currentKnownNodes, relayConfigCache);
-    }
-    async function saveDeviceName(nodeId) {
-      const input = document.getElementById('dev_name_' + nodeId);
-      const result = await api('/api/config/' + nodeId + '/device-name', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ device_name: input ? input.value : '' })
-      });
-      document.getElementById('commandResult').textContent = JSON.stringify(result);
-      clearDeviceNameDirty(nodeId);
-      const node = findKnownNodeById(nodeId);
-      if (node) {
-        node.device = result.device_name || node.device;
-        deviceNameRenderSignatureMap[String(nodeId)] = deviceNameNodeSignature(node);
-      }
-      renderDeviceNamePanels(currentKnownNodes);
-      if (node) {
-        renderLiveState(currentSummary, { clients: currentClients }, { nodes: currentKnownNodes }, { events: currentEvents });
-      }
-      refresh();
-    }
-    // ── Scheduler functions ──
-    async function loadScheduler(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;var s=await remoteNodeGetJson(nid,'/api/relay/channels/'+ch+'/scheduler/status');var w=await remoteNodeGetJson(nid,'/api/relay/channels/'+ch+'/schedule-week');var st=document.getElementById('schStatus');var sd=document.getElementById('schDay');if(!s.ok){st.textContent='Failed: '+s.error;return}st.innerHTML='<b>Enabled:</b> '+(s.schedule_enabled?'Yes':'No')+' <b>Pause:</b> '+(s.pause_active?'Active (until '+s.schedule_pause_until+')':'None')+' <b>AutoHold:</b> '+(s.auto_hold_active?('target='+(s.auto_hold_target?'ON':'OFF')+' remain='+s.auto_hold_remaining_seconds+'s session='+s.auto_hold_session):'None');if(w.ok&&w.days){var days=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];var h='';for(var d=0;d<7;d++){var day=w.days[d];h+='<b>'+days[d]+':</b> ';if(!day.intervals||!day.intervals.length)h+='OFF';else for(var i=0;i<day.intervals.length;i++){var iv=day.intervals[i];h+=Math.floor(iv.start_minute/60)+':'+String(iv.start_minute%60).padStart(2,'0')+'-'+Math.floor(iv.end_minute/60)+':'+String(iv.end_minute%60).padStart(2,'0')+' '}h+='<br>'}sd.innerHTML=h}}
-    async function schEnable(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await api('/send/'+nid+'/scheduler/enabled',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch),enabled:1})});loadScheduler()}
-    async function schDisable(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await api('/send/'+nid+'/scheduler/enabled',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch),enabled:0})});loadScheduler()}
-    async function schPause(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await api('/send/'+nid+'/scheduler/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch),mode:1,duration_seconds:3600,pause_blocks_auto_trigger:0})});loadScheduler()}
-    async function schResume(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();if(!nid||!ch)return;await api('/send/'+nid+'/scheduler/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch)})});loadScheduler()}
-    async function sendAutoHold(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();var dur=document.getElementById('ahDuration').value;var ses=document.getElementById('ahSession').value;var tgt=document.getElementById('ahTarget').value;var rsn=document.getElementById('ahReason').value;if(!nid||!ch)return;var ts=Math.floor(Date.now()/1000);var r=await api('/send/'+nid+'/auto-hold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch),target:Number(tgt),duration_seconds:Number(dur),session:Number(ses),command_ts:ts,reason:rsn})});document.getElementById('commandResult').textContent=JSON.stringify(r);loadScheduler()}
-    async function sendAutoHoldClear(){var nid=document.getElementById('schNodeId').value.trim();var ch=document.getElementById('schChannel').value.trim();var ses=document.getElementById('ahSession').value;var tgt=document.getElementById('ahTarget').value;if(!nid||!ch)return;var ts=Math.floor(Date.now()/1000);var r=await api('/send/'+nid+'/auto-hold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:Number(ch),target:Number(tgt),duration_seconds:0,session:Number(ses),command_ts:ts,reason:'clear'})});document.getElementById('commandResult').textContent=JSON.stringify(r);loadScheduler()}
-    renderDeviceNamePanels([]);
-    renderRelayConfigPanels([], {});
-    connectStream();
-    refresh();
-    setInterval(refresh, RELAY_STATE_SYNC_INTERVAL_MS);
-  </script>
-</body>
-</html>`;
+    return _dashboardHtml;
+  } catch (_error) {
+    return "<!doctype html><html lang=zh-Hant><head><meta charset=utf-8><title>autoControl</title></head><body><h1>Dashboard not found</h1><p>Place dashboard.html in tools/backend-test/</p></body></html>";
+  }
 }
+
+app.post("/api/auth/login", (req, res) => {
+  const username = String(req.body.username || "").trim();
+  const password = String(req.body.password || "");
+  if (username !== DASHBOARD_USER || password !== DASHBOARD_PASSWORD) {
+    pushEvent("dashboard-login-failed", { username });
+    return res.status(401).json({ ok: false, error: "bad_credentials" });
+  }
+  const token = createDashboardSession();
+  res.setHeader(
+    "Set-Cookie",
+    `ac_backend_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(DASHBOARD_SESSION_TTL_MS / 1000)}`
+  );
+  pushEvent("dashboard-login", { username });
+  return res.json({ ok: true, user: username, expires_in_ms: DASHBOARD_SESSION_TTL_MS });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const session = getDashboardSession(req);
+  if (session && session.token) dashboardSessions.delete(session.token);
+  res.setHeader("Set-Cookie", "ac_backend_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+  return res.json({ ok: true });
+});
+
+app.get("/api/auth/session", (req, res) => {
+  const session = getDashboardSession(req);
+  if (!session) return res.status(401).json({ ok: false, error: "unauthorized" });
+  return res.json({ ok: true, user: session.user, expires_at: session.expiresAt });
+});
+
+app.use(requireDashboardSession);
 
 app.get("/", (_req, res) => {
   res.type("html").send(renderHtml());
@@ -2899,7 +2100,8 @@ app.delete("/api/keys/:id", (req, res) => {
   return res.json({ ok: true });
 });
 
-app.get("/api/known-nodes", (_req, res) => {
+app.get("/api/known-nodes", async (_req, res) => {
+  await syncKnownNodesFromBroker();
   const nodes = Array.from(knownNodes.values())
     .sort((a, b) => {
       if (a.cluster !== b.cluster) {
@@ -2911,11 +2113,13 @@ app.get("/api/known-nodes", (_req, res) => {
   res.json({ ok: true, nodes });
 });
 
-app.get("/api/cloud/devices", (_req, res) => {
+app.get("/api/cloud/devices", async (_req, res) => {
+  await syncKnownNodesFromBroker();
   res.json(buildCloudDevicesSnapshot());
 });
 
-app.get("/api/cloud/clusters", (_req, res) => {
+app.get("/api/cloud/clusters", async (_req, res) => {
+  await syncKnownNodesFromBroker();
   res.json(buildCloudClustersSnapshot());
 });
 
@@ -3085,7 +2289,7 @@ app.post("/api/cloud/devices", (req, res) => {
     return res.status(404).json({ ok: false, error: "cloud_cluster_not_found" });
   }
   if (cloudDevices.has(registryKey)) {
-    /* Device exists — update keyId and/or nodeId (e.g. MCU UID
+    /* Device exists ??update keyId and/or nodeId (e.g. MCU UID
        produces a different self_node_id than the deviceId suffix). */
     const existing = cloudDevices.get(registryKey);
     if (keyId) existing.keyId = keyId;
@@ -3130,6 +2334,101 @@ app.post("/api/cloud/devices", (req, res) => {
   scheduleCloudRegistrySave();
   scheduleStateBroadcast();
   return res.json({ ok: true, device: cloudDeviceSummary(cloudDevices.get(registryKey)) });
+});
+
+app.post("/api/cloud/claim-node", (req, res) => {
+  const nodeId = Number(req.body.nodeId || req.body.node_id || 0);
+  const clusterId = String(req.body.clusterId || req.body.cluster_id || "default").trim() || "default";
+  const deviceId = String(req.body.deviceId || req.body.device_id || (nodeId ? `node-${nodeId}` : "")).trim();
+  const deviceName = String(req.body.deviceName || req.body.device_name || deviceId || `Node ${nodeId}`).trim();
+  const owner = String(req.body.owner || DASHBOARD_USER).trim();
+  let clusterRecord = findCloudClusterRecord(clusterId);
+  let deviceRecord;
+
+  if (!nodeId || !deviceId) {
+    return res.status(400).json({ ok: false, error: "missing_node_id_or_device_id" });
+  }
+
+  if (!clusterRecord) {
+    const keyId = generateCloudKeyId();
+    const caBundle = buildClusterCaBundle(clusterId, keyId);
+    clusterRecord = {
+      clusterId,
+      clusterName: clusterId,
+      keyId,
+      enabled: true,
+      transport: CLOUD_TRANSPORT,
+      brokerHost: CLOUD_BROKER_HOST,
+      brokerPort: CLOUD_BROKER_PORT,
+      backendKey: "",
+      revision: 1,
+      caRevocationTag: 0,
+      ...caBundle,
+      lastMasterNodeId: 0,
+      lastMasterDeviceId: "",
+      onlineDevices: 0,
+      knownDevices: 0,
+      firstSeenAt: nowIso(),
+      lastSeenAt: nowIso(),
+      lastUpdatedAt: nowIso(),
+    };
+    cloudClusters.set(clusterId, clusterRecord);
+  }
+
+  deviceRecord = findCloudDeviceRecord(clusterId, deviceId);
+  if (!deviceRecord) {
+    const keyId = generateCloudKeyId();
+    const bundle = buildDeviceCredentialBundle(clusterRecord, deviceId, deviceName, keyId);
+    deviceRecord = {
+      registryKey: `${clusterId}|${deviceId}`,
+      clusterId,
+      deviceId,
+      keyId,
+      enabled: true,
+      transport: 1,
+      nodeId,
+      device: deviceName,
+      clusterName: clusterRecord.clusterName || clusterId,
+      ip: "",
+      role: 0,
+      online: 0,
+      deviceState: 0,
+      relayMask: 0,
+      sourceMasterNodeId: 0,
+      backendKey: "",
+      devicePublicPem: bundle.devicePublicPem,
+      devicePrivatePem: bundle.devicePrivatePem,
+      deviceFingerprint: bundle.deviceFingerprint,
+      certificatePayload: bundle.certificatePayload,
+      certificateSignature: bundle.certificateSignature,
+      firstSeenAt: nowIso(),
+      lastSeenAt: "",
+      lastUpdatedAt: nowIso(),
+    };
+  }
+
+  deviceRecord.nodeId = nodeId;
+  deviceRecord.device = deviceName;
+  deviceRecord.owner = owner;
+  deviceRecord.claimedAt = deviceRecord.claimedAt || nowIso();
+  deviceRecord.lastUpdatedAt = nowIso();
+  cloudDevices.set(deviceRecord.registryKey, deviceRecord);
+  clusterRecord.knownDevices = Array.from(cloudDevices.values()).filter((item) => item.clusterId === clusterId).length;
+  clusterRecord.lastUpdatedAt = nowIso();
+  cloudClusters.set(clusterId, clusterRecord);
+  scheduleCloudRegistrySave();
+  scheduleStateBroadcast();
+  pushEvent("cloud-node-claimed", { clusterId, deviceId, nodeId, owner });
+  return res.json({
+    ok: true,
+    cluster: cloudClusterSummary(clusterRecord),
+    device: cloudDeviceSummary(deviceRecord),
+    provisioningHint: {
+      cluster_id: clusterId,
+      device_id: deviceId,
+      note: "目前為測試認領；正式版建議改為簽章 challenge/response。",
+    },
+  });
 });
 
 app.get("/api/cloud/devices/:clusterId/:deviceId/provision", (req, res) => {
@@ -3401,6 +2700,13 @@ app.get("/events", (_req, res) => {
   });
 });
 
+app.get("/api/events", (_req, res) => {
+  res.json({
+    ok: true,
+    events,
+  });
+});
+
 app.get("/api/config/:nodeId/relays", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const node = resolveKnownNode(nodeId);
@@ -3477,14 +2783,19 @@ app.post("/api/config/:nodeId/relay", async (req, res) => {
     form.set("boot_default_on", Number(req.body.boot_default_on) ? "1" : "0");
   }
   if (typeof req.body.adc_channel !== "undefined") {
-    const adcChannel = Number(req.body.adc_channel);
-    if (!Number.isInteger(adcChannel) || (adcChannel !== -1 && adcChannel !== 0)) {
-      return res.status(400).json({ ok: false, error: "bad_adc_channel" });
-    }
-    form.set("adc_channel", adcChannel < 0 ? "255" : String(adcChannel));
+    /* Backward compatibility only.  MCU firmware now uses fixed CHn -> ADCn
+       mapping, so the backend must not persist or forward user-selected ADC
+       bindings from older UI/API clients. */
+    void req.body.adc_channel;
   }
+  form.set("adc_channel", String(channel - 1));
   if (typeof req.body.protection_enabled !== "undefined") {
     form.set("protection_enabled", Number(req.body.protection_enabled) ? "1" : "0");
+  }
+  if (typeof req.body.device_strategy !== "undefined") {
+    const strategy = Number(req.body.device_strategy);
+    if (![0, 1, 2].includes(strategy)) return res.status(400).json({ ok: false, error: "bad_strategy" });
+    form.set("device_strategy", String(strategy));
   }
   for (const field of [
     "overcurrent_milliamps",
@@ -3513,6 +2824,361 @@ app.post("/api/config/:nodeId/relay", async (req, res) => {
   }
 });
 
+function validateRemoteNodeId(nodeId) {
+  const nid = Number(nodeId);
+  const node = resolveKnownNode(nid);
+  if (!Number.isFinite(nid) || nid <= 0) return { error: "bad_node_id" };
+  if (!node || !node.ip || !node.online) return { error: "node_offline", status: 404 };
+  return { nid, node };
+}
+
+function appendProtectionConfigForm(form, body) {
+  for (const field of [
+    "cooldown_seconds",
+    "retry_delay_seconds",
+    "max_retry_count",
+    "boot_delay_seconds",
+    "learning_samples",
+    "aging_update_hours",
+    "aging_cap_percent",
+    "stall_multiplier_x10",
+  ]) {
+    if (typeof body[field] !== "undefined") {
+      const value = Number(body[field]);
+      if (!Number.isInteger(value) || value < 0) return `bad_${field}`;
+      form.set(field, String(value));
+    }
+  }
+  return "";
+}
+
+app.get("/api/cluster/node/:nodeId/config/relays", async (req, res) => {
+  const v = validateRemoteNodeId(req.params.nodeId);
+  if (v.error) return res.status(v.status || 400).json({ ok: false, error: v.error });
+  try {
+    const data = await remoteNodeGetJson(v.nid, "/api/config/relays");
+    return res.json(data);
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.post("/api/cluster/node/:nodeId/config/relay", async (req, res) => {
+  req.params.nodeId = String(req.params.nodeId);
+  req.url = `/api/config/${encodeURIComponent(req.params.nodeId)}/relay`;
+  const nodeId = Number(req.params.nodeId);
+  const channel = Number(req.body.channel);
+  const form = new URLSearchParams();
+  let data;
+
+  if (!Number.isInteger(channel) || channel < 1 || channel > 16) {
+    return res.status(400).json({ ok: false, error: "bad_channel" });
+  }
+  if (validateRemoteNodeId(nodeId).error) {
+    const v = validateRemoteNodeId(nodeId);
+    return res.status(v.status || 400).json({ ok: false, error: v.error });
+  }
+
+  form.set("channel", String(channel));
+  for (const field of ["name"]) {
+    if (typeof req.body[field] === "string") form.set(field, req.body[field]);
+  }
+  for (const field of ["enabled", "remember_state", "boot_default_on", "protection_enabled"]) {
+    if (typeof req.body[field] !== "undefined") form.set(field, Number(req.body[field]) ? "1" : "0");
+  }
+  if (typeof req.body.device_strategy !== "undefined") {
+    const strategy = Number(req.body.device_strategy);
+    if (![0, 1, 2].includes(strategy)) return res.status(400).json({ ok: false, error: "bad_strategy" });
+    form.set("device_strategy", String(strategy));
+  }
+  if (typeof req.body.adc_channel !== "undefined") {
+    /* Backward compatibility only; see /api/config/:nodeId/relay above. */
+    void req.body.adc_channel;
+  }
+  form.set("adc_channel", String(channel - 1));
+  for (const field of ["overcurrent_milliamps", "trip_delay_ms", "reset_hysteresis_milliamps"]) {
+    if (typeof req.body[field] !== "undefined") {
+      const value = Number(req.body[field]);
+      const minimum = field === "overcurrent_milliamps" ? 100 : 0;
+      const maximum = field === "trip_delay_ms" ? 600000 : 100000;
+      if (!Number.isInteger(value) || value < minimum || value > maximum) {
+        return res.status(400).json({ ok: false, error: `bad_${field}` });
+      }
+      form.set(field, String(value));
+    }
+  }
+
+  try {
+    data = await remoteNodeRequest(nodeId, "/api/config/relay", "POST", form);
+    if (!data || data.ok === false) {
+      return res.status(502).json({ ok: false, error: (data && data.error) || "remote_config_failed" });
+    }
+    return res.json(data);
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.get("/api/cluster/node/:nodeId/protection", async (req, res) => {
+  const v = validateRemoteNodeId(req.params.nodeId);
+  if (v.error) return res.status(v.status || 400).json({ ok: false, error: v.error });
+  try {
+    return res.json(await remoteNodeGetJson(v.nid, "/api/protection"));
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.get("/api/cluster/node/:nodeId/config/protection", async (req, res) => {
+  const v = validateRemoteNodeId(req.params.nodeId);
+  if (v.error) return res.status(v.status || 400).json({ ok: false, error: v.error });
+  try {
+    return res.json(await remoteNodeGetJson(v.nid, "/api/config/protection"));
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.post("/api/cluster/node/:nodeId/config/protection", async (req, res) => {
+  const v = validateRemoteNodeId(req.params.nodeId);
+  const form = new URLSearchParams();
+  let formError;
+  if (v.error) return res.status(v.status || 400).json({ ok: false, error: v.error });
+  formError = appendProtectionConfigForm(form, req.body || {});
+  if (formError) return res.status(400).json({ ok: false, error: formError });
+  try {
+    return res.json(await remoteNodeRequest(v.nid, "/api/config/protection", "POST", form));
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.post("/api/cluster/node/:nodeId/protection/:action", async (req, res) => {
+  const v = validateRemoteNodeId(req.params.nodeId);
+  const action = String(req.params.action || "");
+  const form = new URLSearchParams();
+  const channel = Number(req.body.channel);
+  if (v.error) return res.status(v.status || 400).json({ ok: false, error: v.error });
+  if (!["unlock", "force-stop", "clear-learning", "strategy"].includes(action)) {
+    return res.status(404).json({ ok: false, error: "bad_action" });
+  }
+  if (!Number.isInteger(channel) || channel < 1 || channel > 16) {
+    return res.status(400).json({ ok: false, error: "bad_channel" });
+  }
+  form.set("channel", String(channel));
+  if (action === "strategy") {
+    const strategy = Number(req.body.strategy);
+    if (![0, 1, 2].includes(strategy)) return res.status(400).json({ ok: false, error: "bad_strategy" });
+    form.set("strategy", String(strategy));
+  }
+  try {
+    return res.json(await remoteNodeRequest(v.nid, `/api/protection/${action}`, "POST", form));
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+/* ?? Scheduler proxy APIs (dashboard ??backend ??MCU HTTP) ?? */
+function validateSchedulerParams(nodeId, channel) {
+  const nid = Number(nodeId);
+  const ch = Number(channel);
+  if (!Number.isFinite(nid) || nid <= 0) return { error: "bad_node_id" };
+  if (!Number.isInteger(ch) || ch < 1 || ch > 16) return { error: "bad_channel" };
+  return { nid, ch };
+}
+function validateWeekday(wd) {
+  const w = Number(wd);
+  if (!Number.isInteger(w) || w < 0 || w > 6) return null;
+  return w;
+}
+
+app.get("/api/scheduler/:nodeId/:channel/status", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  try {
+    const data = await remoteNodeGetJson(v.nid, `/api/relay/channels/${v.ch}/scheduler/status`);
+    res.json(data);
+  } catch (error) {
+    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.get("/api/scheduler/:nodeId/:channel/week", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  try {
+    const data = await remoteNodeGetJson(v.nid, `/api/relay/channels/${v.ch}/schedule-week`);
+    res.json(data);
+  } catch (error) {
+    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.post("/api/scheduler/:nodeId/:channel/enabled", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  try {
+    const form = new URLSearchParams();
+    form.set("enabled", Number(req.body.enabled) ? "1" : "0");
+    const data = await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/enabled`, "PATCH", form);
+    res.json(data);
+  } catch (error) {
+    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.post("/api/scheduler/:nodeId/:channel/pause", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  try {
+    const form = new URLSearchParams();
+    form.set("mode", String(req.body.mode || 0));
+    if (req.body.duration_seconds) form.set("duration_seconds", String(req.body.duration_seconds));
+    if (req.body.until) form.set("until", String(req.body.until));
+    form.set("pause_blocks_auto_trigger", req.body.pause_blocks_auto_trigger ? "1" : "0");
+    const data = await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/pause`, "POST", form);
+    res.json(data);
+  } catch (error) {
+    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.post("/api/scheduler/:nodeId/:channel/resume", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  try {
+    const data = await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/resume`, "POST", new URLSearchParams());
+    res.json(data);
+  } catch (error) {
+    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.post("/api/scheduler/:nodeId/:channel/copy", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  const srcWd = validateWeekday(req.body.source_weekday);
+  if (srcWd === null) return res.status(400).json({ ok: false, error: "bad_source_weekday" });
+  try {
+    const form = new URLSearchParams();
+    form.set("target_weekdays", String(req.body.target_weekdays || ""));
+    form.set("mode", "overwrite");
+    const data = await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/schedule-week/${srcWd}/copy`, "POST", form);
+    res.json(data);
+  } catch (error) {
+    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.put("/api/scheduler/:nodeId/:channel/week/:weekday", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  const wd = validateWeekday(req.params.weekday);
+  const form = new URLSearchParams();
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  if (wd === null) return res.status(400).json({ ok: false, error: "bad_weekday" });
+  form.set("count", String(Number(req.body.count || 0)));
+  for (let i = 0; i < 8; i++) {
+    if (typeof req.body[`s${i}`] !== "undefined") form.set(`s${i}`, String(Number(req.body[`s${i}`])));
+    if (typeof req.body[`e${i}`] !== "undefined") form.set(`e${i}`, String(Number(req.body[`e${i}`])));
+  }
+  try {
+    const data = await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/schedule-week/${wd}`, "PUT", form);
+    res.json(data);
+  } catch (error) {
+    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.get("/api/cluster/node/:nodeId/relay/channels/:channel/scheduler/status", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  try {
+    return res.json(await remoteNodeGetJson(v.nid, `/api/relay/channels/${v.ch}/scheduler/status`));
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.get("/api/cluster/node/:nodeId/relay/channels/:channel/schedule-week", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  try {
+    return res.json(await remoteNodeGetJson(v.nid, `/api/relay/channels/${v.ch}/schedule-week`));
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.put("/api/cluster/node/:nodeId/relay/channels/:channel/schedule-week/:weekday", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  const wd = validateWeekday(req.params.weekday);
+  const form = new URLSearchParams();
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  if (wd === null) return res.status(400).json({ ok: false, error: "bad_weekday" });
+  form.set("count", String(Number(req.body.count || 0)));
+  for (let i = 0; i < 8; i++) {
+    if (typeof req.body[`s${i}`] !== "undefined") form.set(`s${i}`, String(Number(req.body[`s${i}`])));
+    if (typeof req.body[`e${i}`] !== "undefined") form.set(`e${i}`, String(Number(req.body[`e${i}`])));
+  }
+  try {
+    return res.json(await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/schedule-week/${wd}`, "PUT", form));
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.post("/api/cluster/node/:nodeId/relay/channels/:channel/schedule-week/:weekday/copy", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  const srcWd = validateWeekday(req.params.weekday);
+  const form = new URLSearchParams();
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  if (srcWd === null) return res.status(400).json({ ok: false, error: "bad_source_weekday" });
+  form.set("target_weekdays", String(req.body.target_weekdays || ""));
+  form.set("mode", String(req.body.mode || "overwrite"));
+  try {
+    return res.json(await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/schedule-week/${srcWd}/copy`, "POST", form));
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.post("/api/cluster/node/:nodeId/relay/channels/:channel/scheduler/enabled", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  const form = new URLSearchParams();
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  form.set("enabled", Number(req.body.enabled) ? "1" : "0");
+  try {
+    return res.json(await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/enabled`, "PATCH", form));
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.post("/api/cluster/node/:nodeId/relay/channels/:channel/scheduler/pause", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  const form = new URLSearchParams();
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  form.set("mode", String(req.body.mode || 0));
+  if (req.body.duration_seconds) form.set("duration_seconds", String(req.body.duration_seconds));
+  if (req.body.until) form.set("until", String(req.body.until));
+  form.set("pause_blocks_auto_trigger", req.body.pause_blocks_auto_trigger ? "1" : "0");
+  try {
+    return res.json(await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/pause`, "POST", form));
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
+app.post("/api/cluster/node/:nodeId/relay/channels/:channel/scheduler/resume", async (req, res) => {
+  const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+  try {
+    return res.json(await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/resume`, "POST", new URLSearchParams()));
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  }
+});
+
 app.post("/send/:nodeId/relay", (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const channel = Number(req.body.channel);
@@ -3533,6 +3199,12 @@ app.post("/send/:nodeId/relay", (req, res) => {
   };
   if (!mqttPublishCommand(nodeInfo.cluster, "relay", payload)) {
     return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  }
+  {
+    const bit = 1 << (channel - 1);
+    const oldMask = Number(nodeInfo.relayMask || 0) >>> 0;
+    const nextMask = value ? (oldMask | bit) : (oldMask & ~bit);
+    setKnownNodeRelayMask(Number(payload.node_id), nextMask);
   }
   queueRelayStateConfirm(Number(payload.node_id));
   pushEvent("send-relay", { nodeId, channel, value, targetNodeId: payload.node_id });
@@ -3557,6 +3229,7 @@ app.post("/send/:nodeId/mask", (req, res) => {
   if (!mqttPublishCommand(nodeInfo.cluster, "mask", payload)) {
     return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
   }
+  setKnownNodeRelayMask(Number(payload.node_id), mask);
   queueRelayStateConfirm(Number(payload.node_id));
   pushEvent("send-mask", { nodeId, mask, targetNodeId: payload.node_id });
   return res.json({ ok: true });
@@ -3580,12 +3253,13 @@ app.post("/send/:nodeId/all", (req, res) => {
   if (!mqttPublishCommand(nodeInfo.cluster, "mask", payload)) {
     return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
   }
+  setKnownNodeRelayMask(Number(payload.node_id), payload.mask);
   queueRelayStateConfirm(Number(payload.node_id));
   pushEvent("send-all", { nodeId, value, targetNodeId: payload.node_id });
   return res.json({ ok: true });
 });
 
-/* ── New MQTT-based command routes ── */
+/* ?? New MQTT-based command routes ?? */
 app.post("/send/:nodeId/auto-hold", (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const nodeInfo = resolveKnownNode(nodeId);
@@ -3682,33 +3356,38 @@ app.post("/send/:nodeId/scheduler/pause", (req, res) => {
   return res.json({ ok: true });
 });
 
-app.post("/send/:nodeId/scheduler/resume", (req, res) => {
-  const nodeId = Number(req.params.nodeId);
-  const nodeInfo = resolveKnownNode(nodeId);
-  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
-  const payload = {
-    channel: Number(req.body.channel || 1),
-    node_id: Number(req.body.targetNodeId || nodeId),
-    request_id: crypto.randomBytes(8).toString("hex"),
-  };
-  if (!mqttPublishCommand(nodeInfo.cluster, "scheduler/resume", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+app.post("/send/:nodeId/scheduler/resume", async (req, res) => {
+  // Firmware has no MQTT scheduler/resume handler. Proxy via MCU HTTP instead.
+  try {
+    const data = await remoteNodeRequest(
+      Number(req.params.nodeId),
+      `/api/relay/channels/${Number(req.body.channel || 1)}/scheduler/resume`,
+      "POST",
+      new URLSearchParams()
+    );
+    res.json(data);
+  } catch (error) {
+    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
   }
-  return res.json({ ok: true });
 });
 
 app.post("/send/:nodeId/protection/force-stop", (req, res) => {
   const nodeId = Number(req.params.nodeId);
+  const channel = Number(req.body.channel || 1);
   const nodeInfo = resolveKnownNode(nodeId);
   if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  if (!Number.isInteger(channel) || channel < 1 || channel > 16) {
+    return res.status(400).json({ ok: false, error: "bad_channel" });
+  }
   const payload = {
-    channel: Number(req.body.channel || 1),
+    channel,
     node_id: Number(req.body.targetNodeId || nodeId),
     request_id: crypto.randomBytes(8).toString("hex"),
   };
   if (!mqttPublishCommand(nodeInfo.cluster, "protection/force-stop", payload)) {
     return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
   }
+  setKnownNodeRelayMask(Number(payload.node_id), (Number(nodeInfo.relayMask || 0) >>> 0) & ~(1 << (channel - 1)));
   return res.json({ ok: true });
 });
 
@@ -3742,7 +3421,7 @@ app.post("/send/:nodeId/protection/clear-learning", (req, res) => {
   return res.json({ ok: true });
 });
 
-// ── MCU Provisioning API ──────────────────────────────────────────
+// ?? MCU Provisioning API ??????????????????????????????????????????
 // Path A in the dual-path architecture: the MCU calls this over HTTPS
 // (through Cloudflare) to obtain its PSK and broker configuration.
 //
@@ -3771,16 +3450,40 @@ app.post("/api/provision", (req, res) => {
   }
 
   /* Devices must be claimed by a user before they can provision.
-     An unclaimed device is registered but has no owner — it cannot
+     An unclaimed device is registered but has no owner ??it cannot
      obtain a PSK and therefore cannot connect to the MQTT broker. */
   if (!deviceRecord.owner || String(deviceRecord.owner).trim() === "") {
     return res.status(403).json({ ok: false, error: "device_not_claimed" });
   }
 
-  // Optional fingerprint verification (strict when fingerprint is set)
-  if (deviceFingerprint && deviceRecord.deviceFingerprint) {
-    if (deviceFingerprint !== deviceRecord.deviceFingerprint) {
-      return res.status(403).json({ ok: false, error: "fingerprint_mismatch" });
+  // Device fingerprint is trust-on-first-use for MCU provisioning.
+  //
+  // Older dashboard-created records may contain a backend-generated
+  // deviceFingerprint from an unused device-key bundle.  That value is not the
+  // MCU fingerprint and must not block the first MCU provision request.
+  const boundFingerprint = String(deviceRecord.mcuDeviceFingerprint || "").trim();
+  const fingerprintSource = String(deviceRecord.deviceFingerprintSource || "").trim();
+  if (deviceFingerprint) {
+    if (boundFingerprint) {
+      if (deviceFingerprint !== boundFingerprint) {
+        return res.status(403).json({ ok: false, error: "fingerprint_mismatch" });
+      }
+    } else if (fingerprintSource === "mcu" && deviceRecord.deviceFingerprint) {
+      if (deviceFingerprint !== String(deviceRecord.deviceFingerprint || "")) {
+        return res.status(403).json({ ok: false, error: "fingerprint_mismatch" });
+      }
+    } else {
+      deviceRecord.mcuDeviceFingerprint = deviceFingerprint;
+      deviceRecord.deviceFingerprintSource = "mcu";
+      deviceRecord.fingerprintBoundAt = nowIso();
+      deviceRecord.lastUpdatedAt = nowIso();
+      cloudDevices.set(deviceRecord.registryKey, deviceRecord);
+      scheduleCloudRegistrySave();
+      pushEvent("device-fingerprint-bound", {
+        clusterId,
+        deviceId,
+        fingerprint: deviceFingerprint,
+      });
     }
   }
 
@@ -3812,7 +3515,7 @@ app.post("/api/provision", (req, res) => {
   });
 });
 
-// ── Device Claim API ──────────────────────────────────────────────
+// ?? Device Claim API ??????????????????????????????????????????????
 // A user claims ownership of a registered device.  Until claimed,
 // the device cannot obtain a PSK through /api/provision and cannot
 // connect to the MQTT broker.
@@ -3848,7 +3551,55 @@ app.post("/api/devices/:deviceId/claim", (req, res) => {
   return res.json({ ok: true, deviceId, owner });
 });
 
-// ── PSK Rotation ──────────────────────────────────────────────────
+app.post("/api/cloud/devices/:clusterId/:deviceId/reset-fingerprint", (req, res) => {
+  const clusterId = String(req.params.clusterId || "").trim();
+  const deviceId = String(req.params.deviceId || "").trim();
+  const record = findCloudDeviceRecord(clusterId, deviceId);
+
+  if (!record) {
+    return res.status(404).json({ ok: false, error: "cloud_device_not_found" });
+  }
+
+  delete record.mcuDeviceFingerprint;
+  delete record.deviceFingerprintSource;
+  delete record.fingerprintBoundAt;
+  record.lastUpdatedAt = nowIso();
+  cloudDevices.set(record.registryKey, record);
+  scheduleCloudRegistrySave();
+  scheduleStateBroadcast();
+  pushEvent("device-fingerprint-reset", { clusterId, deviceId });
+  return res.json({ ok: true, device: cloudDeviceSummary(record) });
+});
+
+app.post("/api/devices/:deviceId/reset-fingerprint", (req, res) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  let foundRecord = null;
+
+  for (const record of cloudDevices.values()) {
+    if (String(record.deviceId || "").trim() === deviceId) {
+      foundRecord = record;
+      break;
+    }
+  }
+  if (!foundRecord) {
+    return res.status(404).json({ ok: false, error: "device_not_found" });
+  }
+
+  delete foundRecord.mcuDeviceFingerprint;
+  delete foundRecord.deviceFingerprintSource;
+  delete foundRecord.fingerprintBoundAt;
+  foundRecord.lastUpdatedAt = nowIso();
+  cloudDevices.set(foundRecord.registryKey, foundRecord);
+  scheduleCloudRegistrySave();
+  scheduleStateBroadcast();
+  pushEvent("device-fingerprint-reset", {
+    clusterId: foundRecord.clusterId,
+    deviceId: foundRecord.deviceId,
+  });
+  return res.json({ ok: true, deviceId: foundRecord.deviceId });
+});
+
+// ?? PSK Rotation ??????????????????????????????????????????????????
 // Increments the cluster revision, generates a new binding secret,
 // and stores the old secret for a 5-minute transition window.
 app.post("/api/cloud/clusters/:clusterId/rotate-psk", (req, res) => {
@@ -3882,9 +3633,9 @@ loadCloudRegistry();
 
 /* Commands are published to the MQTT broker via its control API on port 4301 */
 
-/* ═══════════════════════════════════════════════════════════════
-   Sensor Auto Hold API — Grafana/backend sensor alerts → MCU
-   ═══════════════════════════════════════════════════════════════ */
+/* ????????????????????????????????????????????????????????????????
+   Sensor Auto Hold API ??Grafana/backend sensor alerts ??MCU
+   ????????????????????????????????????????????????????????????????*/
 
 // activeSensors: key = "cluster|device|channel"
 const activeSensors = new Map();
@@ -3896,7 +3647,7 @@ function makeSensorKey(clusterId, deviceId, channel) {
 // POST /api/sensor/alert
 // Body: { cluster_id?, device_id?, channel, target, duration_seconds, reason }
 // Creates or renews an Auto Hold session.  Only sends MQTT if this is
-// a new session OR ≥5 minutes have passed since the last MQTT renew.
+// a new session OR ?? minutes have passed since the last MQTT renew.
 app.post("/api/sensor/alert", (req, res) => {
   const channel        = Number(req.body.channel);
   const target         = Number(req.body.target ?? 1);
@@ -3962,7 +3713,7 @@ app.post("/api/sensor/alert", (req, res) => {
   if (sensor) sensor.lastCommandTs = nowUnix;
 
   if (isNewSession) {
-    // First alert — create new session
+    // First alert ??create new session
     sensor = {
       session:     crypto.randomBytes(4).readUInt32BE(0) >>> 0,  // positive uint32
       channel,
@@ -3978,7 +3729,7 @@ app.post("/api/sensor/alert", (req, res) => {
     };
     activeSensors.set(key, sensor);
   } else {
-    // Existing session — update tracking, maybe renew
+    // Existing session ??update tracking, maybe renew
     sensor.lastAlertMs = nowMs;
     sensor.reason = reason;
     activeSensors.set(key, sensor);
@@ -4045,7 +3796,7 @@ app.post("/api/sensor/recover", (req, res) => {
     duration_seconds: 0,         // clear
     session: sensor.session,
     command_ts: nowUnix,
-    reason: "感測器恢復正常",
+    reason: "sensor_clear",
     node_id: sensor.targetNodeId,
     request_id: crypto.randomBytes(8).toString("hex"),
   };
@@ -4062,7 +3813,7 @@ app.post("/api/sensor/recover", (req, res) => {
   });
 });
 
-// GET /api/sensor/status — list all active sensor sessions
+// GET /api/sensor/status ??list all active sensor sessions
 app.get("/api/sensor/status", (_req, res) => {
   const list = [];
   for (const [key, s] of activeSensors) {

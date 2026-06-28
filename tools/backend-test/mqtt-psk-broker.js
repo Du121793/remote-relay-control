@@ -383,6 +383,23 @@ function handlePublish(client, packet) {
     cursor += 2;
   }
   const payload = packet.body.subarray(cursor);
+  try {
+    const text = payload.toString("utf8");
+    const message = JSON.parse(text);
+    if (message && message.type === "status") {
+      client.lastStatusAt = new Date().toISOString();
+      client.nodeId = Number(message.node_id || client.nodeId || 0);
+      client.role = Number(message.role || client.role || 0);
+      client.term = Number(message.term || client.term || 0);
+      client.relayMask = Number(message.relay_mask || 0) >>> 0;
+      client.deviceState = Number(message.device_state || 1);
+      client.clusterId = String(message.cluster_id || client.clusterId || "");
+      client.deviceId = String(message.device_id || client.deviceId || "");
+      client.nodes = Array.isArray(message.nodes) ? message.nodes.slice(0, 16) : [];
+    }
+  } catch (_error) {
+    /* Non-JSON payloads are valid MQTT messages; no broker-side state update. */
+  }
   publishToSubscribers(parsedTopic.value, payload, {
     qos: 0,
     retain: (packet.header & 0x01) !== 0,
@@ -453,6 +470,13 @@ mqttServer.on("secureConnection", (socket) => {
     clientId: "",
     clusterId: "",
     deviceId: "",
+    nodeId: 0,
+    role: 0,
+    term: 0,
+    relayMask: 0,
+    deviceState: 0,
+    lastStatusAt: "",
+    nodes: [],
     connected: false,
     graceful: false,
     buffer: Buffer.alloc(0),
@@ -541,6 +565,13 @@ const controlServer = http.createServer((request, response) => {
         clientId: client.clientId,
         deviceId: client.deviceId,
         clusterId: client.clusterId,
+        nodeId: client.nodeId || 0,
+        role: client.role || 0,
+        term: client.term || 0,
+        relayMask: client.relayMask || 0,
+        deviceState: client.deviceState || 0,
+        lastStatusAt: client.lastStatusAt || "",
+        nodes: Array.isArray(client.nodes) ? client.nodes : [],
         connected: client.connected,
         remote: client.socket.remoteAddress,
         subscriptions: Array.from(client.subscriptions),

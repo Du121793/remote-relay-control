@@ -393,18 +393,37 @@ int main(void)
   MX_TIM2_Init();
   MX_USART3_UART_Init();
   uart3_write("\r\n[boot] uart ready\r\n");
+  uart3_write("[boot] pre relay off 1\r\n");
+  (void)board_relay_apply_mask(0U);  /* hard OFF before config/protection init */
+  uart3_write("[boot] post relay off 1\r\n");
+  uart3_write("[boot] pre rng\r\n");
   MX_RNG_Init();
+  uart3_write("[boot] post rng\r\n");
+  uart3_write("[boot] pre mbedtls\r\n");
   MX_MBEDTLS_Init();
+  uart3_write("[boot] post mbedtls\r\n");
   /* USER CODE BEGIN 2 */
-  relay_protection_init();  /* force all relays OFF before config applies startup mask */
-  scheduler_init();
+  uart3_write("[boot] pre config\r\n");
   device_config_init();
+  uart3_write("[boot] post config\r\n");
+  uart3_write("[boot] pre rtc\r\n");
+  MX_RTC_Init();
+  uart3_write("[boot] post rtc\r\n");
+  uart3_write("[boot] pre protection\r\n");
+  relay_protection_init();  /* force all relays OFF before config applies startup mask */
+  uart3_write("[boot] post protection\r\n");
+  uart3_write("[boot] pre scheduler\r\n");
+  scheduler_init();
+  uart3_write("[boot] post scheduler\r\n");
   /* Startup relay mask is now managed by relay_protection:
      boot_default_on / remember_state become pending requests
      that are only applied after boot delay expires. */
+  uart3_write("[boot] pre relay off 2\r\n");
   (void)board_relay_apply_mask(0U);  /* all OFF — protection module owns boot state */
+  uart3_write("[boot] post relay off 2\r\n");
+  uart3_write("[boot] pre cluster\r\n");
   cluster_service_init();
-  MX_RTC_Init();
+  uart3_write("[boot] post cluster\r\n");
   log_startup_banner();
 
   /* USER CODE END 2 */

@@ -1,4 +1,4 @@
-# autoControl 系統架構文件
+﻿# autoControl 系統架構文件
 
 > 工業 IoT 繼電器控制 — STM32F767ZI + FreeRTOS + lwIP + MQTT TLS-PSK  
 > Branch: `feature/scheduler-v4` | Updated: 2026-06-26

@@ -1,6 +1,7 @@
 #ifndef CONTROL_QUEUE_H
 #define CONTROL_QUEUE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "main.h"
@@ -34,6 +35,9 @@ typedef struct
 #define CONTROL_QUEUE_RELAY_CONFIG_DELAY_PRESENT      0x80U
 #define CONTROL_QUEUE_RELAY_CONFIG_HYSTERESIS_PRESENT 0x100U
 #define CONTROL_QUEUE_REQUEST_ID_MAX_LEN               64U
+#define CONTROL_QUEUE_REMOTE_HTTP_METHOD_MAX_LEN        8U
+#define CONTROL_QUEUE_REMOTE_HTTP_PATH_MAX_LEN          160U
+#define CONTROL_QUEUE_REMOTE_HTTP_BODY_MAX_LEN          1152U
 
 typedef struct
 {
@@ -66,6 +70,18 @@ HAL_StatusTypeDef control_queue_submit_relay_config_async(
   uint32_t node_id,
   const control_queue_relay_config_t *relay_config,
   const char *request_id);
+HAL_StatusTypeDef control_queue_submit_remote_http_async(
+  uint32_t ip_addr,
+  const char *method,
+  const char *path,
+  const char *body,
+  uint32_t *request_id);
+HAL_StatusTypeDef control_queue_get_remote_http_result(
+  uint32_t request_id,
+  uint8_t *done,
+  uint8_t *remote_ok,
+  char *response_body,
+  size_t response_body_size);
 void control_queue_poll(void);
 void control_queue_get_stats(control_queue_stats_t *stats);
 void control_queue_force_stop(uint8_t channel);

@@ -27,7 +27,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MQTT_LINK_CONNECT_RETRY_MS       5000UL
+#define MQTT_LINK_CONNECT_RETRY_MIN_MS   5000UL
+#define MQTT_LINK_CONNECT_RETRY_MAX_MS   30000UL
 #define MQTT_LINK_HEARTBEAT_INTERVAL_MS  5000UL
 #define MQTT_LINK_STATUS_INTERVAL_MS     3000UL
 #define MQTT_LINK_TCPIP_STEP_INTERVAL_MS 200UL
@@ -35,7 +36,7 @@
 #define MQTT_LINK_KEEP_ALIVE_SECONDS     20U
 #define MQTT_LINK_PSK_MAX_LEN            32U
 #define MQTT_LINK_PAYLOAD_MAX_LEN        512U
-#define MQTT_LINK_STATUS_PAYLOAD_MAX_LEN 1024U
+#define MQTT_LINK_STATUS_PAYLOAD_MAX_LEN 2048U
 #define MQTT_LINK_COMMAND_MAX_LEN        384U
 #define MQTT_LINK_REQUEST_ID_MAX_LEN     64U
 #define MQTT_LINK_ACK_TOPIC_MAX_LEN      192U
@@ -89,6 +90,7 @@ typedef struct
   uint32_t master_since_ms;
   uint32_t last_poll_ms;
   uint32_t last_connect_attempt_ms;
+  uint32_t connect_retry_ms;
   uint32_t last_heartbeat_ms;
   uint32_t last_status_ms;
   mqtt_client_t *client;
@@ -127,6 +129,40 @@ static void mqtt_link_connection_callback(mqtt_client_t *client,
                                           mqtt_connection_status_t status);
 static void mqtt_link_ack_try_publish(void);
 static void mqtt_link_apply_pending_time(void);
+static void mqtt_link_release_transport_keep_backoff(uint8_t disconnect_first);
+
+static uint32_t mqtt_link_current_retry_ms(void)
+{
+  if (g_mqtt_link_context.connect_retry_ms < MQTT_LINK_CONNECT_RETRY_MIN_MS)
+  {
+    return MQTT_LINK_CONNECT_RETRY_MIN_MS;
+  }
+  if (g_mqtt_link_context.connect_retry_ms > MQTT_LINK_CONNECT_RETRY_MAX_MS)
+  {
+    return MQTT_LINK_CONNECT_RETRY_MAX_MS;
+  }
+  return g_mqtt_link_context.connect_retry_ms;
+}
+
+static void mqtt_link_note_connect_failure(void)
+{
+  uint32_t next_retry_ms = mqtt_link_current_retry_ms();
+
+  if (next_retry_ms < MQTT_LINK_CONNECT_RETRY_MAX_MS)
+  {
+    next_retry_ms *= 2U;
+    if (next_retry_ms > MQTT_LINK_CONNECT_RETRY_MAX_MS)
+    {
+      next_retry_ms = MQTT_LINK_CONNECT_RETRY_MAX_MS;
+    }
+  }
+  g_mqtt_link_context.connect_retry_ms = next_retry_ms;
+}
+
+static void mqtt_link_note_connect_success(void)
+{
+  g_mqtt_link_context.connect_retry_ms = MQTT_LINK_CONNECT_RETRY_MIN_MS;
+}
 
 static void mqtt_link_log(const char *text)
 {
@@ -641,9 +677,13 @@ static err_t mqtt_link_publish_status(void)
   static char payload[MQTT_LINK_STATUS_PAYLOAD_MAX_LEN];
   cluster_service_state_t cluster_state;
   adc_service_state_t adc_state;
+  const cluster_node_t *nodes;
+  size_t used;
+  uint32_t index;
 
   cluster_service_get_state(&cluster_state);
   adc_service_get_state(&adc_state);
+  nodes = cluster_service_get_nodes(NULL);
   written = snprintf(payload, sizeof(payload),
                      "{\"type\":\"status\",\"online\":1,\"cluster_id\":\"%s\","
                      "\"device_id\":\"%s\",\"node_id\":%lu,\"master_node_id\":%lu,"
@@ -657,7 +697,7 @@ static err_t mqtt_link_publish_status(void)
                      "\"adc_rms_millivolts\":%u,\"adc_current_milliamps\":%lu,"
                      "\"adc_sample_rate_hz\":%lu,\"adc_window_samples\":%lu,"
                      "\"adc_sample_count\":%lu,\"adc_dma_overruns\":%lu,"
-                     "\"adc_saturation_count\":%lu}",
+                     "\"adc_saturation_count\":%lu,\"nodes\":[",
                      g_mqtt_link_context.cloud_cluster_id,
                      g_mqtt_link_context.cloud_device_id,
                      (unsigned long)cluster_state.self_node_id,
@@ -690,6 +730,60 @@ static err_t mqtt_link_publish_status(void)
                      (unsigned long)adc_state.dma_overrun_count,
                      (unsigned long)adc_state.saturation_count);
   if ((written < 0) || ((size_t)written >= sizeof(payload)))
+  {
+    return ERR_BUF;
+  }
+  used = (size_t)written;
+
+  if (nodes != NULL)
+  {
+    uint8_t first_node = 1U;
+    for (index = 0U; index < CLUSTER_SERVICE_NODE_CAPACITY; ++index)
+    {
+      char ip_text[16];
+      ip4_addr_t ip_addr;
+      int node_written;
+      const cluster_node_t *node = &nodes[index];
+
+      if ((node->valid == 0U) || (node->node_id == 0U))
+      {
+        continue;
+      }
+
+      ip_addr.addr = node->ip_addr;
+      (void)ip4addr_ntoa_r(&ip_addr, ip_text, sizeof(ip_text));
+      node_written = snprintf(&payload[used],
+                              sizeof(payload) - used,
+                              "%s{\"node_id\":%lu,\"ip_text\":\"%s\","
+                              "\"role\":%u,\"term\":%lu,\"relay_mask\":%lu,"
+                              "\"online\":%u,\"device_state\":%u,"
+                              "\"name\":\"Node %lu\","
+                              "\"cloud_cluster_id\":\"%s\","
+                              "\"cloud_device_id\":\"%s\","
+                              "\"cloud_key_id\":\"%s\"}",
+                              (first_node != 0U) ? "" : ",",
+                              (unsigned long)node->node_id,
+                              ip_text,
+                              (unsigned int)node->role,
+                              (unsigned long)node->term,
+                              (unsigned long)node->relay_mask,
+                              (unsigned int)node->online,
+                              (unsigned int)node->device_state,
+                              (unsigned long)node->node_id,
+                              node->cloud_cluster_id,
+                              node->cloud_device_id,
+                              node->cloud_key_id);
+      if ((node_written < 0) || ((size_t)node_written >= (sizeof(payload) - used)))
+      {
+        return ERR_BUF;
+      }
+      used += (size_t)node_written;
+      first_node = 0U;
+    }
+  }
+
+  written = snprintf(&payload[used], sizeof(payload) - used, "]}");
+  if ((written < 0) || ((size_t)written >= (sizeof(payload) - used)))
   {
     return ERR_BUF;
   }
@@ -1546,7 +1640,9 @@ static void mqtt_link_connection_callback(mqtt_client_t *client,
     g_mqtt_link_context.stats.connected = 0U;
     g_mqtt_link_context.stats.connect_failures++;
     g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_CONNECT + (uint32_t)status;
+    mqtt_link_note_connect_failure();
     mqtt_link_log_value("[mqtt] disconnected status=", (uint32_t)status);
+    mqtt_link_release_transport_keep_backoff(0U);
     /* TLS/PSK failure may mean bindingSecret changed — re-provision now */
     https_client_service_trigger();
     return;
@@ -1554,6 +1650,7 @@ static void mqtt_link_connection_callback(mqtt_client_t *client,
 
   g_mqtt_link_context.stats.connected = 1U;
   g_mqtt_link_context.stats.last_error = 0U;
+  mqtt_link_note_connect_success();
   g_mqtt_link_context.last_heartbeat_ms = 0U;
   g_mqtt_link_context.last_status_ms = 0U;
 
@@ -1587,6 +1684,7 @@ static void mqtt_link_start_connect(const ip_addr_t *address)
     {
       g_mqtt_link_context.stats.connect_failures++;
       g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_CLIENT_ALLOC;
+      mqtt_link_note_connect_failure();
       return;
     }
   }
@@ -1601,6 +1699,8 @@ static void mqtt_link_start_connect(const ip_addr_t *address)
     {
       g_mqtt_link_context.stats.connect_failures++;
       g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_PSK;
+      mqtt_link_note_connect_failure();
+      mqtt_link_release_transport_keep_backoff(0U);
       return;
     }
 
@@ -1613,6 +1713,8 @@ static void mqtt_link_start_connect(const ip_addr_t *address)
     {
       g_mqtt_link_context.stats.connect_failures++;
       g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_TLS_CONFIG;
+      mqtt_link_note_connect_failure();
+      mqtt_link_release_transport_keep_backoff(0U);
       return;
     }
   }
@@ -1644,7 +1746,9 @@ static void mqtt_link_start_connect(const ip_addr_t *address)
     g_mqtt_link_context.connecting = 0U;
     g_mqtt_link_context.stats.connect_failures++;
     g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_CONNECT + (uint32_t)(-error);
+    mqtt_link_note_connect_failure();
     mqtt_link_log_value("[mqtt] connect start fail=", (uint32_t)(-error));
+    mqtt_link_release_transport_keep_backoff(0U);
   }
 }
 
@@ -1666,6 +1770,7 @@ static void mqtt_link_dns_callback(const char *name,
   {
     g_mqtt_link_context.stats.connect_failures++;
     g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_DNS;
+    mqtt_link_note_connect_failure();
     mqtt_link_log("[mqtt] dns failed\r\n");
     return;
   }
@@ -1698,7 +1803,33 @@ static void mqtt_link_begin_connect(void)
   {
     g_mqtt_link_context.stats.connect_failures++;
     g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_DNS + (uint32_t)(-error);
+    mqtt_link_note_connect_failure();
   }
+}
+
+static void mqtt_link_release_transport_keep_backoff(uint8_t disconnect_first)
+{
+  if (g_mqtt_link_context.client != NULL)
+  {
+    if (disconnect_first != 0U)
+    {
+      mqtt_disconnect(g_mqtt_link_context.client);
+    }
+    mqtt_client_free(g_mqtt_link_context.client);
+    g_mqtt_link_context.client = NULL;
+  }
+  if (g_mqtt_link_context.tls_config != NULL)
+  {
+    altcp_tls_free_config(g_mqtt_link_context.tls_config);
+    g_mqtt_link_context.tls_config = NULL;
+  }
+
+  memset(g_mqtt_link_context.psk, 0, sizeof(g_mqtt_link_context.psk));
+  g_mqtt_link_context.psk_len = 0U;
+  g_mqtt_link_context.connecting = 0U;
+  g_mqtt_link_context.dns_pending = 0U;
+  g_mqtt_link_context.initial_publish_stage = 0U;
+  g_mqtt_link_context.stats.connected = 0U;
 }
 
 static void mqtt_link_reset_transport(void)
@@ -1732,6 +1863,7 @@ static void mqtt_link_reset_transport(void)
   g_mqtt_link_context.stats.ack_queue_depth = 0U;
   g_mqtt_link_context.stats.connected = 0U;
   g_mqtt_link_context.last_connect_attempt_ms = 0U;
+  g_mqtt_link_context.connect_retry_ms = MQTT_LINK_CONNECT_RETRY_MIN_MS;
   g_mqtt_link_context.reset_requested = 0U;
 }
 
@@ -1757,7 +1889,7 @@ static void mqtt_link_tcpip_step(void *argument)
       (g_mqtt_link_context.dns_pending == 0U) &&
       ((g_mqtt_link_context.last_connect_attempt_ms == 0U) ||
        ((int32_t)(now - g_mqtt_link_context.last_connect_attempt_ms) >=
-        (int32_t)MQTT_LINK_CONNECT_RETRY_MS)))
+        (int32_t)mqtt_link_current_retry_ms())))
   {
     mqtt_link_begin_connect();
     return;

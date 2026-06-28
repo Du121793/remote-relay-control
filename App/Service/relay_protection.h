@@ -32,6 +32,7 @@ extern "C" {
 /* Device strategy */
 #define RELAY_PROTECTION_STRATEGY_SAFETY     0U
 #define RELAY_PROTECTION_STRATEGY_CONTINUITY 1U
+#define RELAY_PROTECTION_STRATEGY_MANUAL     2U
 
 /* Phase enum */
 #define RELAY_PROTECTION_PHASE_OFF           0U
@@ -53,6 +54,8 @@ extern "C" {
 #define RELAY_PROTECTION_DEFAULT_AGING_HOURS          24U
 #define RELAY_PROTECTION_DEFAULT_AGING_CAP_PERCENT    50U
 #define RELAY_PROTECTION_DEFAULT_STALL_MULTIPLIER     20U  /* ×0.1 → 2.0 */
+#define RELAY_PROTECTION_DEFAULT_RELAY_ON_SPACING_MS  500U
+#define RELAY_PROTECTION_DEFAULT_SAME_RELAY_ON_SPACING_MS 3000U
 #define RELAY_PROTECTION_HARD_CURRENT_LIMIT_MA     30000U
 #define RELAY_PROTECTION_STALL_FALLBACK_MS         10000U  /* unlearned channel fallback */
 
@@ -65,6 +68,8 @@ typedef struct {
   uint32_t learning_samples;       /* global */
   uint32_t aging_update_hours;     /* global */
   uint32_t aging_cap_percent;      /* global */
+  uint32_t relay_on_spacing_ms;    /* global */
+  uint32_t same_relay_on_spacing_ms; /* global */
   uint32_t stall_timeout_multiplier_x10; /* global, ×10 (20=2.0) */
 } relay_protection_user_config_t;
 
@@ -76,12 +81,13 @@ typedef struct
   uint8_t  fault_reason;
   uint8_t  learning_complete;
   uint8_t  protection_enabled;
+  uint8_t  ct_valid;
   uint8_t  ct_degraded;
   uint8_t  adc_saturated;
   uint8_t  tripped;
   uint8_t  fault_locked;
   uint8_t  device_strategy;
-  uint8_t  reserved0[2];
+  uint8_t  reserved0[1];
   uint32_t current_milliamps;
   uint32_t current_reference_ma;
   uint32_t initial_health_baseline_ma;

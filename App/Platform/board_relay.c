@@ -20,15 +20,22 @@ static const uint16_t relay_pins[BOARD_RELAY_CHANNEL_COUNT] = {
 
 HAL_StatusTypeDef board_relay_set(uint8_t channel, GPIO_PinState state)
 {
+  GPIO_TypeDef *port;
+  uint16_t pin;
+
   if ((channel == 0U) || (channel > BOARD_RELAY_CHANNEL_COUNT))
   {
     printf("[RELAY] board_relay_set: channel %u out of bounds\r\n", channel);
     return HAL_ERROR;
   }
 
+  port = relay_ports[channel - 1U];
+  pin = relay_pins[channel - 1U];
+
   printf("[RELAY] board_relay_set: ch=%u, state=%d (Port=%p, Pin=%u)\r\n",
          channel, state, (void*)relay_ports[channel - 1U], relay_pins[channel - 1U]);
-  HAL_GPIO_WritePin(relay_ports[channel - 1U], relay_pins[channel - 1U], state);
+  HAL_GPIO_WritePin(port, pin, state);
+
   return HAL_OK;
 }
 

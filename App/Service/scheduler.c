@@ -1,4 +1,4 @@
-#include "scheduler.h"
+﻿#include "scheduler.h"
 #include "../Config/device_config.h"
 #include "control_queue.h"
 #include "relay_protection.h"
@@ -14,7 +14,9 @@
 
 extern RTC_HandleTypeDef hrtc;
 
-/* ── Per-channel state arrays ── */
+#define SCHEDULER_LOCAL_UTC_OFFSET_SECONDS (8UL * 60UL * 60UL)
+
+/* ?? Per-channel state arrays ?? */
 static channel_scheduler_state_t g_scheduler_state[SCHEDULER_CHANNEL_COUNT];
 static weekly_schedule_t g_weekly_schedule[SCHEDULER_CHANNEL_COUNT];
 
@@ -30,13 +32,13 @@ static weekly_schedule_t *scheduler_weekly_mut(uint8_t channel)
     return &g_weekly_schedule[channel - 1];
 }
 
-/* ── Monotonic time helpers ── */
+/* ?? Monotonic time helpers ?? */
 static bool time_after_or_equal(uint32_t a, uint32_t b)
 {
     return (int32_t)(a - b) >= 0;
 }
 
-/* ── init ── */
+/* ?? init ?? */
 void scheduler_init(void)
 {
     memset(g_scheduler_state, 0, sizeof(g_scheduler_state));
@@ -48,14 +50,12 @@ void scheduler_init(void)
     scheduler_load_from_flash();
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   Persistence: RTC backup (pause/enable) + Flash (schedule)
-   Sector chosen to avoid overlap with device_config at 0x081E0000.
-   ═══════════════════════════════════════════════════════════════ */
+/* Persistence: RTC backup (pause/enable) + Flash (schedule).
+   Sector chosen to avoid overlap with device_config at 0x081E0000. */
 
 #define SCHEDULER_FLASH_ADDR_DUAL 0x081A0000UL  /* dual-bank: sector 21 */
 #define SCHEDULER_FLASH_ADDR_SINGLE 0x080E0000UL /* single-bank: sector 7 */
-#define SCHEDULER_FLASH_MAGIC2 0x53434833U  /* "SCH3" — bumped for sector fix */
+#define SCHEDULER_FLASH_MAGIC2 0x53434833U  /* "SCH3" ??bumped for sector fix */
 #define SCHEDULER_FLASH_VERSION 2U
 
 typedef struct {
@@ -123,7 +123,7 @@ void scheduler_load_from_flash(void)
     }
 }
 
-/* RTC backup dirty flag — only write when state actually changed */
+/* RTC backup dirty flag ??only write when state actually changed */
 static volatile uint8_t g_scheduler_rtc_dirty = 0U;
 void scheduler_mark_rtc_dirty(void);
 void scheduler_mark_rtc_dirty(void) { g_scheduler_rtc_dirty = 1U; }
@@ -135,7 +135,7 @@ void scheduler_save_to_flash(void)
     g_scheduler_rtc_dirty = 0U;
 
     /* Clear magic first, then write pause, then write new magic.
-       If reset occurs mid-write, old magic is already gone → safe. */
+       If reset occurs mid-write, old magic is already gone ??safe. */
     HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_SCHED_MAGIC_EN, 0U);
     for (uint8_t i = 0; i < SCHEDULER_CHANNEL_COUNT; i++) {
         uint32_t pause = g_scheduler_state[i].schedule_pause_until & 0xFFFFFFFEU;
@@ -266,11 +266,11 @@ void scheduler_save_weekly_to_flash(void)
         g_scheduler_flash_dirty = 0U;
         g_last_flash_save_ms = now;
       }
-      /* On failure, dirty stays set → retry next tick */
+      /* On failure, dirty stays set ??retry next tick */
     }
 }
 
-/* ── state access (snapshot-only, no raw pointers exposed) ── */
+/* ?? state access (snapshot-only, no raw pointers exposed) ?? */
 uint8_t scheduler_get_state_copy(uint8_t channel, channel_scheduler_state_t *dst)
 {
     if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT || dst == NULL) return 0U;
@@ -289,7 +289,7 @@ uint8_t scheduler_get_weekly_copy(uint8_t channel, weekly_schedule_t *dst)
     return 1U;
 }
 
-/* ── state access ── */
+/* ?? state access ?? */
 const channel_scheduler_state_t *scheduler_get_state(uint8_t channel)
 {
     if (channel == 0 || channel > SCHEDULER_CHANNEL_COUNT) return NULL;
@@ -353,7 +353,7 @@ uint8_t scheduler_copy_weekly_day(uint8_t channel, uint8_t src_wd, const uint8_t
     return 1U;
 }
 
-/* ── interval validation ── */
+/* ?? interval validation ?? */
 bool scheduler_validate_intervals(const daily_schedule_t *day)
 {
     if (day->interval_count > SCHEDULER_MAX_INTERVALS) return false;
@@ -372,7 +372,7 @@ bool scheduler_validate_intervals(const daily_schedule_t *day)
     return true;
 }
 
-/* ── interval matching ── */
+/* ?? interval matching ?? */
 static bool interval_match(const daily_schedule_t *day, uint16_t minute_of_day)
 {
     for (uint8_t i = 0; i < day->interval_count; i++) {
@@ -384,20 +384,69 @@ static bool interval_match(const daily_schedule_t *day, uint16_t minute_of_day)
     return false;
 }
 
-/* ── weekday from unix time (Monday=0) ── */
+/* ?? weekday from unix time (Monday=0) ?? */
+static uint32_t scheduler_local_unix(uint32_t unix_time)
+{
+    return unix_time + SCHEDULER_LOCAL_UTC_OFFSET_SECONDS;
+}
+
 static uint8_t weekday_from_unix(uint32_t unix_time)
 {
     /* 1970-01-01 was Thursday (3).  (unix/86400 + 3) % 7 */
     return (uint8_t)(((unix_time / 86400UL) + 3UL) % 7UL);
 }
 
-/* ── minute of day from unix time ── */
+/* ?? minute of day from unix time ?? */
 static uint16_t minute_of_day(uint32_t unix_time)
 {
     return (uint16_t)((unix_time % 86400UL) / 60UL);
 }
 
-/* ── reason copy with validation ── */
+uint32_t scheduler_compute_current_segment_pause_until(uint8_t channel, uint32_t unix_time)
+{
+    uint32_t local_unix;
+    uint8_t wd;
+    uint16_t minute;
+    uint32_t best_delta_minutes = 0U;
+
+    if (channel == 0U || channel > SCHEDULER_CHANNEL_COUNT) {
+        return unix_time + 60U;
+    }
+
+    local_unix = scheduler_local_unix(unix_time);
+    wd = weekday_from_unix(local_unix);
+    minute = minute_of_day(local_unix);
+
+    for (uint8_t offset = 0U; offset < 7U; ++offset) {
+        uint8_t day_index = (uint8_t)((wd + offset) % 7U);
+        const daily_schedule_t *day = &g_weekly_schedule[channel - 1U].days[day_index];
+        uint16_t start_minute = (offset == 0U) ? minute : 0U;
+
+        for (uint8_t i = 0U; i < day->interval_count; ++i) {
+            uint16_t s = day->intervals[i].start_minute;
+            uint16_t e = day->intervals[i].end_minute;
+
+            if ((offset == 0U) && (minute >= s) && (minute < e)) {
+                best_delta_minutes = (uint32_t)(e - minute);
+                break;
+            }
+            if (s > start_minute) {
+                best_delta_minutes = (uint32_t)offset * 1440UL +
+                                     (uint32_t)s -
+                                     (uint32_t)minute;
+                break;
+            }
+        }
+
+        if (best_delta_minutes != 0U) {
+            return unix_time + (best_delta_minutes * 60UL) + 60UL;
+        }
+    }
+
+    return unix_time + 60U;
+}
+
+/* ?? reason copy with validation ?? */
 static void copy_reason(char *dst, const char *src)
 {
     if (!src || src[0] == '\0') {
@@ -421,7 +470,7 @@ static void copy_reason(char *dst, const char *src)
     dst[len] = '\0';
 }
 
-/* ── request relay state through control queue ── */
+/* ?? request relay state through control queue ?? */
 static void request_relay(uint8_t channel, uint8_t target)
 {
     control_proto_command_t cmd;
@@ -432,9 +481,9 @@ static void request_relay(uint8_t channel, uint8_t target)
     (void)control_queue_submit_async(&cmd);
 }
 
-/* ═══════════════════════════════════════════════════════════════
+/* ????????????????????????????????????????????????????????????????
    Auto Hold handler
-   ═══════════════════════════════════════════════════════════════ */
+   ????????????????????????????????????????????????????????????????*/
 
 static void auto_hold_clear(uint8_t channel)
 {
@@ -512,9 +561,9 @@ void scheduler_handle_auto_hold(const auto_hold_cmd_t *cmd, uint32_t monotonic_m
     scheduler_mark_rtc_dirty();
 }
 
-/* ═══════════════════════════════════════════════════════════════
+/* ????????????????????????????????????????????????????????????????
    Auto Hold finish
-   ═══════════════════════════════════════════════════════════════ */
+   ????????????????????????????????????????????????????????????????*/
 
 static void auto_hold_finish(uint8_t channel, uint32_t unix_time, uint8_t time_valid)
 {
@@ -548,9 +597,9 @@ static void auto_hold_finish(uint8_t channel, uint32_t unix_time, uint8_t time_v
     request_relay(channel, restore_state);
 }
 
-/* ═══════════════════════════════════════════════════════════════
+/* ????????????????????????????????????????????????????????????????
    User control (atomic)
-   ═══════════════════════════════════════════════════════════════ */
+   ????????????????????????????????????????????????????????????????*/
 
 void scheduler_user_control(uint8_t channel, uint8_t target,
                             scheduler_pause_mode_t pause_mode,
@@ -568,9 +617,13 @@ void scheduler_user_control(uint8_t channel, uint8_t target,
     uint8_t tv;
     switch (pause_mode) {
         case SCHEDULER_PAUSE_CURRENT_SEGMENT:
-            /* pause until end of current schedule segment + 1 minute */
-            /* simplified: pause for 1 minute */
-            st->schedule_pause_until = cluster_service_get_unix_time(&tv) + 60;
+            {
+                uint32_t now_unix = cluster_service_get_unix_time(&tv);
+                st->schedule_pause_until =
+                    (tv != 0U)
+                    ? scheduler_compute_current_segment_pause_until(channel, now_unix)
+                    : (now_unix + 60U);
+            }
             break;
         case SCHEDULER_PAUSE_DURATION:
             st->schedule_pause_until = cluster_service_get_unix_time(&tv) + pause_duration_seconds;
@@ -589,9 +642,9 @@ void scheduler_user_control(uint8_t channel, uint8_t target,
     request_relay(channel, target);
 }
 
-/* ═══════════════════════════════════════════════════════════════
+/* ????????????????????????????????????????????????????????????????
    Main tick
-   ═══════════════════════════════════════════════════════════════ */
+   ????????????????????????????????????????????????????????????????*/
 
 void scheduler_tick(uint32_t monotonic_ms, uint32_t unix_time, uint8_t time_valid)
 {
@@ -599,13 +652,13 @@ void scheduler_tick(uint32_t monotonic_ms, uint32_t unix_time, uint8_t time_vali
         uint8_t ch = i + 1;
         channel_scheduler_state_t *st = &g_scheduler_state[i];
 
-        /* ── Auto Hold expiry check ── */
+        /* ?? Auto Hold expiry check ?? */
         if (st->auto_hold.session != 0 &&
             time_after_or_equal(monotonic_ms, st->auto_hold.until_ms)) {
             auto_hold_finish(ch, unix_time, time_valid);
         }
 
-        /* ── Auto Hold active: override scheduler ── */
+        /* ?? Auto Hold active: override scheduler ?? */
         if (st->auto_hold.session != 0) {
             uint8_t desired = st->auto_hold.target_state;
             if (relay_actual_state(ch) != desired) {
@@ -614,19 +667,20 @@ void scheduler_tick(uint32_t monotonic_ms, uint32_t unix_time, uint8_t time_vali
             continue;
         }
 
-        /* ── Scheduler disabled ── */
+        /* ?? Scheduler disabled ?? */
         if (!st->schedule_enabled) continue;
 
-        /* ── Pause active ── */
+        /* ?? Pause active ?? */
         if (st->schedule_pause_until != 0 &&
             unix_time < st->schedule_pause_until) continue;
 
-        /* ── Time invalid ── */
+        /* ?? Time invalid ?? */
         if (!time_valid) continue;
 
-        /* ── Interval match ── */
-        uint8_t wd = weekday_from_unix(unix_time);
-        uint16_t minute = minute_of_day(unix_time);
+        /* ?? Interval match ?? */
+        uint32_t local_unix = scheduler_local_unix(unix_time);
+        uint8_t wd = weekday_from_unix(local_unix);
+        uint16_t minute = minute_of_day(local_unix);
         daily_schedule_t *day = &g_weekly_schedule[i].days[wd];
 
         uint8_t desired = interval_match(day, minute) ? 1 : 0;

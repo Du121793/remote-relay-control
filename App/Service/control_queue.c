@@ -31,7 +31,6 @@ typedef struct
   uint16_t backend_port;
   uint8_t cloud_enabled;
   uint8_t cloud_transport;
-  char backend_key[DEVICE_CONFIG_BACKEND_KEY_MAX_LEN];
   char cloud_broker_host[DEVICE_CONFIG_CLOUD_HOST_MAX_LEN];
   uint16_t cloud_broker_port;
   uint16_t reserved;
@@ -50,17 +49,33 @@ typedef struct
   TaskHandle_t waiting_task;
   uint32_t remote_ip_addr;
   uint32_t remote_node_id;
+  uint32_t coalesce_seq;
   uint8_t remote;
 } control_queue_request_t;
 
 typedef struct
 {
+  uint32_t ip_addr;
+  char method[CONTROL_QUEUE_REMOTE_HTTP_METHOD_MAX_LEN];
+  char path[CONTROL_QUEUE_REMOTE_HTTP_PATH_MAX_LEN];
+  char body[CONTROL_QUEUE_REMOTE_HTTP_BODY_MAX_LEN];
+} control_queue_remote_http_request_t;
+
+typedef struct
+{
+  control_queue_remote_http_request_t request;
+  volatile uint8_t state;
+  volatile uint8_t ok;
+  uint32_t request_id;
+} control_queue_remote_http_slot_t;
+
+typedef struct
+{
   char login_request[512];
   char login_response[512];
-  char config_request[1280];
-  char config_response[6144];
+  char config_request[1792];
+  char config_response[13312];
   char encoded_host[(DEVICE_CONFIG_BACKEND_HOST_MAX_LEN * 3U) + 1U];
-  char encoded_key[(DEVICE_CONFIG_BACKEND_KEY_MAX_LEN * 3U) + 1U];
   char encoded_cloud_host[(DEVICE_CONFIG_CLOUD_HOST_MAX_LEN * 3U) + 1U];
   char encoded_cloud_cluster_id[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 3U) + 1U];
   char encoded_cloud_cluster_ca_fingerprint[(DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 3U) + 1U];
@@ -69,12 +84,26 @@ typedef struct
   char body[1152];
 } control_queue_backend_sync_workspace_t;
 
-#define CONTROL_QUEUE_LENGTH             8U
+typedef struct
+{
+  uint32_t node_id;
+  uint32_t seq[BOARD_RELAY_CHANNEL_COUNT];
+} control_queue_remote_coalesce_t;
+
+#define CONTROL_QUEUE_LENGTH             16U
 #define CONTROL_QUEUE_WAIT_TIMEOUT_MS    1000U
 #define CONTROL_QUEUE_REQ_COMMAND        0U
 #define CONTROL_QUEUE_REQ_BACKEND_SYNC   1U
 #define CONTROL_QUEUE_REQ_RELAY_CONFIG   2U
-#define CONTROL_QUEUE_REMOTE_ADMIN_PASSWORD "admin"
+#define CONTROL_QUEUE_REQ_REMOTE_HTTP    3U
+#define CONTROL_QUEUE_REMOTE_HTTP_RESPONSE_MAX_LEN 12288U
+#define CONTROL_QUEUE_REMOTE_HTTP_IDLE      0U
+#define CONTROL_QUEUE_REMOTE_HTTP_PREPARING 1U
+#define CONTROL_QUEUE_REMOTE_HTTP_PENDING   2U
+#define CONTROL_QUEUE_REMOTE_HTTP_RUNNING   3U
+#define CONTROL_QUEUE_REMOTE_HTTP_DONE      4U
+#define CONTROL_QUEUE_REMOTE_HTTP_SLOTS     4U
+#define CONTROL_QUEUE_REMOTE_COALESCE_SLOTS 16U
 
 static control_queue_stats_t g_control_queue_stats;
 static QueueHandle_t g_control_queue_handle = NULL;
@@ -91,6 +120,141 @@ static StackType_t g_control_queue_task_stack[2048] /* 8 KB — enc_buf+ct_buf+A
 static StaticSemaphore_t g_control_queue_sync_mutex_buffer;
 static SemaphoreHandle_t g_control_queue_sync_mutex = NULL;
 static relay_domain_result_t g_control_queue_sync_result;
+static control_queue_remote_http_slot_t g_control_queue_remote_http_slots[CONTROL_QUEUE_REMOTE_HTTP_SLOTS];
+static char g_control_queue_remote_http_response[CONTROL_QUEUE_REMOTE_HTTP_RESPONSE_MAX_LEN];
+static uint32_t g_control_queue_remote_http_next_request_id = 1U;
+static uint32_t g_control_queue_last_relay_on_ms = 0U;
+static uint32_t g_control_queue_last_relay_on_by_channel_ms[BOARD_RELAY_CHANNEL_COUNT];
+static uint32_t g_control_queue_next_coalesce_seq = 1U;
+static uint32_t g_control_queue_local_coalesce_seq[BOARD_RELAY_CHANNEL_COUNT];
+static control_queue_remote_coalesce_t g_control_queue_remote_coalesce[CONTROL_QUEUE_REMOTE_COALESCE_SLOTS];
+
+static void control_queue_note_enqueued(void);
+
+static int32_t control_queue_remote_http_find_slot_by_id(uint32_t request_id)
+{
+  uint32_t index;
+
+  if (request_id == 0U)
+  {
+    return -1;
+  }
+
+  for (index = 0U; index < CONTROL_QUEUE_REMOTE_HTTP_SLOTS; ++index)
+  {
+    if ((g_control_queue_remote_http_slots[index].state != CONTROL_QUEUE_REMOTE_HTTP_IDLE) &&
+        (g_control_queue_remote_http_slots[index].request_id == request_id))
+    {
+      return (int32_t)index;
+    }
+  }
+
+  return -1;
+}
+
+static int32_t control_queue_remote_http_find_free_slot(void)
+{
+  uint32_t index;
+
+  for (index = 0U; index < CONTROL_QUEUE_REMOTE_HTTP_SLOTS; ++index)
+  {
+    if (g_control_queue_remote_http_slots[index].state == CONTROL_QUEUE_REMOTE_HTTP_IDLE)
+    {
+      return (int32_t)index;
+    }
+  }
+
+  return -1;
+}
+
+static int32_t control_queue_remote_http_select_pending_slot(void)
+{
+  uint32_t index;
+
+  for (index = 0U; index < CONTROL_QUEUE_REMOTE_HTTP_SLOTS; ++index)
+  {
+    if ((g_control_queue_remote_http_slots[index].state == CONTROL_QUEUE_REMOTE_HTTP_RUNNING) ||
+        (g_control_queue_remote_http_slots[index].state == CONTROL_QUEUE_REMOTE_HTTP_DONE))
+    {
+      return -1;
+    }
+  }
+
+  for (index = 0U; index < CONTROL_QUEUE_REMOTE_HTTP_SLOTS; ++index)
+  {
+    if (g_control_queue_remote_http_slots[index].state == CONTROL_QUEUE_REMOTE_HTTP_PENDING)
+    {
+      return (int32_t)index;
+    }
+  }
+
+  return -1;
+}
+
+static void control_queue_remote_http_kick_worker(void)
+{
+  control_queue_request_t request;
+
+  if (g_control_queue_handle == NULL)
+  {
+    return;
+  }
+
+  memset(&request, 0, sizeof(request));
+  request.kind = CONTROL_QUEUE_REQ_REMOTE_HTTP;
+  if (xQueueSend(g_control_queue_handle, &request, 0U) == pdPASS)
+  {
+    g_control_queue_stats.submitted++;
+    control_queue_note_enqueued();
+  }
+  else
+  {
+    g_control_queue_stats.queue_full++;
+  }
+}
+
+static HAL_StatusTypeDef control_queue_build_service_login_body(char *body, size_t body_size)
+{
+  const device_config_t *config = device_config_get();
+  cluster_service_state_t state;
+  uint8_t time_valid = 0U;
+  uint32_t unix_time;
+  uint32_t auth_tag;
+  int written;
+
+  if ((body == NULL) || (body_size == 0U) || (config == NULL))
+  {
+    return HAL_ERROR;
+  }
+
+  if (device_config_hash_is_zero(config->cluster_password_hash) != 0U)
+  {
+    return HAL_ERROR;
+  }
+
+  cluster_service_get_state(&state);
+  unix_time = cluster_service_get_unix_time(&time_valid);
+  if ((time_valid == 0U) || (unix_time == 0U))
+  {
+    unix_time = state.unix_time;
+  }
+  if ((state.self_node_id == 0U) || (unix_time == 0U))
+  {
+    return HAL_ERROR;
+  }
+
+  auth_tag = device_config_compute_auth_tag(config->cluster_password_hash,
+                                            unix_time,
+                                            state.self_node_id,
+                                            config->cluster_name);
+  written = snprintf(body,
+                     body_size,
+                     "scope=service&node_id=%lu&unix_time=%lu&auth_tag=%lu",
+                     (unsigned long)state.self_node_id,
+                     (unsigned long)unix_time,
+                     (unsigned long)auth_tag);
+  return ((written >= 0) && ((size_t)written < body_size)) ? HAL_OK : HAL_ERROR;
+}
 
 static HAL_StatusTypeDef control_queue_send_all(int sock, const char *text)
 {
@@ -140,6 +304,169 @@ static void control_queue_note_dequeued(void)
     g_control_queue_stats.current_depth =
       (uint32_t)uxQueueMessagesWaiting(g_control_queue_handle);
   }
+}
+
+static uint8_t control_queue_command_can_coalesce(const control_proto_command_t *command)
+{
+  return ((command != NULL) &&
+          (command->type == CONTROL_PROTO_CMD_SET_RELAY) &&
+          (command->channel >= 1U) &&
+          (command->channel <= BOARD_RELAY_CHANNEL_COUNT)) ? 1U : 0U;
+}
+
+static uint32_t control_queue_alloc_coalesce_seq(void)
+{
+  uint32_t seq;
+
+  seq = g_control_queue_next_coalesce_seq++;
+  if (seq == 0U)
+  {
+    seq = g_control_queue_next_coalesce_seq++;
+  }
+  return seq;
+}
+
+static control_queue_remote_coalesce_t *control_queue_get_remote_coalesce_slot(uint32_t node_id)
+{
+  control_queue_remote_coalesce_t *empty_slot = NULL;
+  uint32_t index;
+
+  if (node_id == 0U)
+  {
+    return NULL;
+  }
+
+  for (index = 0U; index < CONTROL_QUEUE_REMOTE_COALESCE_SLOTS; ++index)
+  {
+    if (g_control_queue_remote_coalesce[index].node_id == node_id)
+    {
+      return &g_control_queue_remote_coalesce[index];
+    }
+    if ((g_control_queue_remote_coalesce[index].node_id == 0U) && (empty_slot == NULL))
+    {
+      empty_slot = &g_control_queue_remote_coalesce[index];
+    }
+  }
+
+  if (empty_slot != NULL)
+  {
+    empty_slot->node_id = node_id;
+    memset(empty_slot->seq, 0, sizeof(empty_slot->seq));
+  }
+  return empty_slot;
+}
+
+static uint32_t control_queue_mark_latest_relay_command(uint8_t remote,
+                                                        uint32_t node_id,
+                                                        uint8_t channel,
+                                                        uint32_t *previous_seq)
+{
+  uint32_t seq = 0U;
+
+  if ((channel == 0U) || (channel > BOARD_RELAY_CHANNEL_COUNT))
+  {
+    return 0U;
+  }
+
+  taskENTER_CRITICAL();
+  seq = control_queue_alloc_coalesce_seq();
+  if (remote != 0U)
+  {
+    control_queue_remote_coalesce_t *slot =
+      control_queue_get_remote_coalesce_slot(node_id);
+
+    if (slot != NULL)
+    {
+      if (previous_seq != NULL)
+      {
+        *previous_seq = slot->seq[channel - 1U];
+      }
+      slot->seq[channel - 1U] = seq;
+    }
+    else
+    {
+      seq = 0U;
+    }
+  }
+  else
+  {
+    if (previous_seq != NULL)
+    {
+      *previous_seq = g_control_queue_local_coalesce_seq[channel - 1U];
+    }
+    g_control_queue_local_coalesce_seq[channel - 1U] = seq;
+  }
+  taskEXIT_CRITICAL();
+
+  return seq;
+}
+
+static void control_queue_restore_latest_relay_command(uint8_t remote,
+                                                       uint32_t node_id,
+                                                       uint8_t channel,
+                                                       uint32_t failed_seq,
+                                                       uint32_t previous_seq)
+{
+  if ((channel == 0U) || (channel > BOARD_RELAY_CHANNEL_COUNT))
+  {
+    return;
+  }
+
+  taskENTER_CRITICAL();
+  if (remote != 0U)
+  {
+    control_queue_remote_coalesce_t *slot =
+      control_queue_get_remote_coalesce_slot(node_id);
+
+    if (slot != NULL)
+    {
+      if (slot->seq[channel - 1U] == failed_seq)
+      {
+        slot->seq[channel - 1U] = previous_seq;
+      }
+    }
+  }
+  else
+  {
+    if (g_control_queue_local_coalesce_seq[channel - 1U] == failed_seq)
+    {
+      g_control_queue_local_coalesce_seq[channel - 1U] = previous_seq;
+    }
+  }
+  taskEXIT_CRITICAL();
+}
+
+static uint8_t control_queue_request_is_stale(const control_queue_request_t *request)
+{
+  uint32_t latest = 0U;
+  uint8_t stale = 0U;
+
+  if ((request == NULL) ||
+      (request->coalesce_seq == 0U) ||
+      (control_queue_command_can_coalesce(&request->command) == 0U))
+  {
+    return 0U;
+  }
+
+  taskENTER_CRITICAL();
+  if (request->remote != 0U)
+  {
+    control_queue_remote_coalesce_t *slot =
+      control_queue_get_remote_coalesce_slot(request->remote_node_id);
+
+    if (slot != NULL)
+    {
+      latest = slot->seq[request->command.channel - 1U];
+    }
+  }
+  else
+  {
+    latest = g_control_queue_local_coalesce_seq[request->command.channel - 1U];
+  }
+  stale = (latest != request->coalesce_seq) ? 1U : 0U;
+  taskEXIT_CRITICAL();
+
+  return stale;
 }
 
 static size_t control_queue_url_encode(const char *src, char *dst, size_t dst_size)
@@ -361,13 +688,11 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_sync_remote_bac
     return HAL_ERROR;
   }
 
-  control_queue_url_encode(config->backend_key,
-                           workspace->encoded_key,
-                           sizeof(workspace->encoded_key));
-  (void)snprintf(workspace->body, sizeof(workspace->body),
-                 "password=%s&scope=service&service_key=%s",
-                 CONTROL_QUEUE_REMOTE_ADMIN_PASSWORD,
-                 workspace->encoded_key);
+  if (control_queue_build_service_login_body(workspace->body,
+                                             sizeof(workspace->body)) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
   (void)snprintf(workspace->login_request, sizeof(workspace->login_request),
                  "POST /api/login HTTP/1.1\r\n"
                  "Host: remote\r\n"
@@ -402,9 +727,6 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_sync_remote_bac
   control_queue_url_encode(config->backend_host,
                            workspace->encoded_host,
                            sizeof(workspace->encoded_host));
-  control_queue_url_encode(config->backend_key,
-                           workspace->encoded_key,
-                           sizeof(workspace->encoded_key));
   control_queue_url_encode(config->cloud_broker_host,
                            workspace->encoded_cloud_host,
                            sizeof(workspace->encoded_cloud_host));
@@ -418,14 +740,13 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_sync_remote_bac
                            workspace->encoded_cloud_cluster_binding_secret,
                            sizeof(workspace->encoded_cloud_cluster_binding_secret));
   (void)snprintf(workspace->body, sizeof(workspace->body),
-                 "backend_host=%s&backend_port=%u&backend_key=%s"
+                 "backend_host=%s&backend_port=%u"
                  "&cloud_enabled=%u&cloud_transport=%u"
                  "&cloud_broker_host=%s&cloud_broker_port=%u"
                  "&cloud_cluster_id=%s&cloud_cluster_ca_fingerprint=%s"
                  "&cloud_cluster_binding_secret=%s&cloud_cluster_sync_only=1",
                  workspace->encoded_host,
                  (unsigned int)config->backend_port,
-                 workspace->encoded_key,
                  (unsigned int)config->cloud_enabled,
                  (unsigned int)config->cloud_transport,
                  workspace->encoded_cloud_host,
@@ -541,13 +862,9 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_local_rel
   }
   if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_ADC_PRESENT) != 0U)
   {
-    if ((relay_config->adc_channel >= ADC_SERVICE_CHANNEL_COUNT) &&
-        (relay_config->adc_channel != DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED))
-    {
-      return HAL_ERROR;
-    }
-    current->adc_channel = relay_config->adc_channel;
+    (void)relay_config->adc_channel;
   }
+  current->adc_channel = (uint8_t)(relay_config->channel - 1U);
   if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_PROTECTION_PRESENT) != 0U)
   {
     if (relay_config->protection_enabled > 1U)
@@ -582,11 +899,6 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_local_rel
     current->reset_hysteresis_milliamps =
       relay_config->reset_hysteresis_milliamps;
   }
-  if ((current->protection_enabled != 0U) &&
-      (current->adc_channel == DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED))
-  {
-    return HAL_ERROR;
-  }
   if (current->reset_hysteresis_milliamps >=
       current->overcurrent_milliamps)
   {
@@ -616,13 +928,11 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_remote_re
     return HAL_ERROR;
   }
 
-  control_queue_url_encode(device_config_get()->backend_key,
-                           workspace->encoded_key,
-                           sizeof(workspace->encoded_key));
-  (void)snprintf(workspace->body, sizeof(workspace->body),
-                 "password=%s&scope=service&service_key=%s",
-                 CONTROL_QUEUE_REMOTE_ADMIN_PASSWORD,
-                 workspace->encoded_key);
+  if (control_queue_build_service_login_body(workspace->body,
+                                             sizeof(workspace->body)) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
   (void)snprintf(workspace->login_request, sizeof(workspace->login_request),
                  "POST /api/login HTTP/1.1\r\n"
                  "Host: remote\r\n"
@@ -787,6 +1097,355 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_remote_re
   }
 
   return HAL_OK;
+}
+
+static HAL_StatusTypeDef control_queue_extract_http_body(const char *response,
+                                                         char *body,
+                                                         size_t body_size)
+{
+  const char *body_start;
+  size_t body_len;
+
+  if ((response == NULL) || (body == NULL) || (body_size == 0U))
+  {
+    return HAL_ERROR;
+  }
+
+  body_start = strstr(response, "\r\n\r\n");
+  if (body_start == NULL)
+  {
+    return HAL_ERROR;
+  }
+  body_start += 4;
+  body_len = strlen(body_start);
+  if (body_len >= body_size)
+  {
+    body_len = body_size - 1U;
+  }
+  memcpy(body, body_start, body_len);
+  body[body_len] = '\0';
+  return HAL_OK;
+}
+
+static HAL_StatusTypeDef control_queue_remote_http_login(uint32_t ip_addr,
+                                                         uint32_t *token)
+{
+  control_queue_backend_sync_workspace_t *workspace = &g_control_queue_backend_sync_workspace;
+  char *token_text;
+  char *endptr = NULL;
+  int written;
+
+  if ((ip_addr == 0U) || (token == NULL))
+  {
+    return HAL_ERROR;
+  }
+
+  if (control_queue_build_service_login_body(workspace->body,
+                                             sizeof(workspace->body)) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+  written = snprintf(workspace->login_request, sizeof(workspace->login_request),
+                     "POST /api/login HTTP/1.1\r\n"
+                     "Host: remote\r\n"
+                     "Content-Type: application/x-www-form-urlencoded\r\n"
+                     "Content-Length: %u\r\n"
+                     "Connection: close\r\n"
+                     "\r\n"
+                     "%s",
+                     (unsigned int)strlen(workspace->body),
+                     workspace->body);
+  if ((written < 0) || ((size_t)written >= sizeof(workspace->login_request)))
+  {
+    return HAL_ERROR;
+  }
+
+  if (control_queue_http_request(ip_addr,
+                                 workspace->login_request,
+                                 workspace->login_response,
+                                 sizeof(workspace->login_response)) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  token_text = strstr(workspace->login_response, "\"token\":");
+  if (token_text == NULL)
+  {
+    return HAL_ERROR;
+  }
+  *token = (uint32_t)strtoul(token_text + 8, &endptr, 10);
+  if ((endptr == (token_text + 8)) || (*token == 0U))
+  {
+    return HAL_ERROR;
+  }
+  return HAL_OK;
+}
+
+static HAL_StatusTypeDef control_queue_execute_remote_http(uint32_t ip_addr,
+                                                           const char *method,
+                                                           const char *path,
+                                                           const char *body,
+                                                           char *response_body,
+                                                           size_t response_body_size)
+{
+  control_queue_backend_sync_workspace_t *workspace = &g_control_queue_backend_sync_workspace;
+  uint32_t token = 0U;
+  const char *request_body = (body != NULL) ? body : "";
+  int written;
+
+  if ((ip_addr == 0U) || (method == NULL) || (path == NULL) ||
+      (response_body == NULL) || (response_body_size == 0U) ||
+      (method[0] == '\0') || (path[0] != '/'))
+  {
+    return HAL_ERROR;
+  }
+
+  if (control_queue_remote_http_login(ip_addr, &token) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  written = snprintf(workspace->config_request, sizeof(workspace->config_request),
+                     "%s %s HTTP/1.1\r\n"
+                     "Host: remote\r\n"
+                     "X-Auth-Token: %lu\r\n"
+                     "Content-Type: application/x-www-form-urlencoded\r\n"
+                     "Content-Length: %u\r\n"
+                     "Connection: close\r\n"
+                     "\r\n"
+                     "%s",
+                     method,
+                     path,
+                     (unsigned long)token,
+                     (unsigned int)strlen(request_body),
+                     request_body);
+  if ((written < 0) || ((size_t)written >= sizeof(workspace->config_request)))
+  {
+    return HAL_ERROR;
+  }
+
+  if (control_queue_http_request(ip_addr,
+                                 workspace->config_request,
+                                 workspace->config_response,
+                                 sizeof(workspace->config_response)) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  if (strstr(workspace->config_response, "401 Unauthorized") != NULL)
+  {
+    if (control_queue_remote_http_login(ip_addr, &token) != HAL_OK)
+    {
+      return HAL_ERROR;
+    }
+    written = snprintf(workspace->config_request, sizeof(workspace->config_request),
+                       "%s %s HTTP/1.1\r\n"
+                       "Host: remote\r\n"
+                       "X-Auth-Token: %lu\r\n"
+                       "Content-Type: application/x-www-form-urlencoded\r\n"
+                       "Content-Length: %u\r\n"
+                       "Connection: close\r\n"
+                       "\r\n"
+                       "%s",
+                       method,
+                       path,
+                       (unsigned long)token,
+                       (unsigned int)strlen(request_body),
+                       request_body);
+    if ((written < 0) || ((size_t)written >= sizeof(workspace->config_request)))
+    {
+      return HAL_ERROR;
+    }
+    if (control_queue_http_request(ip_addr,
+                                   workspace->config_request,
+                                   workspace->config_response,
+                                   sizeof(workspace->config_response)) != HAL_OK)
+    {
+      return HAL_ERROR;
+    }
+  }
+
+  if (control_queue_extract_http_body(workspace->config_response,
+                                      response_body,
+                                      response_body_size) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  return (strstr(workspace->config_response, "200 OK") != NULL) ? HAL_OK : HAL_ERROR;
+}
+
+static void control_queue_wait_relay_on_spacing(uint8_t channel)
+{
+  relay_protection_user_config_t cfg;
+  uint32_t now = HAL_GetTick();
+  uint32_t wait_ms = 0U;
+  uint32_t relay_spacing_ms;
+  uint32_t same_relay_spacing_ms;
+
+  relay_protection_get_user_config(&cfg);
+  relay_spacing_ms = cfg.relay_on_spacing_ms;
+  same_relay_spacing_ms = cfg.same_relay_on_spacing_ms;
+
+  if (g_control_queue_last_relay_on_ms != 0U)
+  {
+    uint32_t elapsed = now - g_control_queue_last_relay_on_ms;
+
+    if (elapsed < relay_spacing_ms)
+    {
+      wait_ms = relay_spacing_ms - elapsed;
+    }
+  }
+
+  if ((channel >= 1U) && (channel <= BOARD_RELAY_CHANNEL_COUNT))
+  {
+    uint32_t last_same = g_control_queue_last_relay_on_by_channel_ms[channel - 1U];
+    if (last_same != 0U)
+    {
+      uint32_t elapsed_same = now - last_same;
+      if (elapsed_same < same_relay_spacing_ms)
+      {
+        uint32_t same_wait = same_relay_spacing_ms - elapsed_same;
+        if (same_wait > wait_ms)
+        {
+          wait_ms = same_wait;
+        }
+      }
+    }
+  }
+
+  if (wait_ms > 0U)
+  {
+    vTaskDelay(pdMS_TO_TICKS(wait_ms));
+    now = HAL_GetTick();
+  }
+
+  g_control_queue_last_relay_on_ms = now;
+  if ((channel >= 1U) && (channel <= BOARD_RELAY_CHANNEL_COUNT))
+  {
+    g_control_queue_last_relay_on_by_channel_ms[channel - 1U] = now;
+  }
+}
+
+static uint8_t control_queue_validate_relay_on(uint8_t channel,
+                                               relay_domain_result_t *result)
+{
+  uint32_t fault_mask = relay_protection_fault_lock_mask();
+
+  if ((channel == 0U) || (channel > BOARD_RELAY_CHANNEL_COUNT))
+  {
+    if (result != NULL)
+    {
+      result->error = CONTROL_PROTO_ERR_BAD_CHANNEL;
+      result->relay_mask = board_relay_snapshot();
+    }
+    return 0U;
+  }
+
+  if (relay_protection_boot_safety_active(HAL_GetTick()) ||
+      (((fault_mask >> (channel - 1U)) & 1U) != 0U) ||
+      relay_protection_is_cooldown(channel, HAL_GetTick()))
+  {
+    if (result != NULL)
+    {
+      result->error = CONTROL_PROTO_ERR_BAD_COMMAND;
+      result->relay_mask = board_relay_snapshot();
+    }
+    return 0U;
+  }
+
+  return 1U;
+}
+
+static void control_queue_execute_local_relay_command(const control_proto_command_t *command,
+                                                      relay_domain_result_t *result)
+{
+  uint32_t current_mask;
+  uint32_t target_mask;
+  uint32_t new_on_mask;
+  uint32_t off_first_mask;
+  uint8_t ch;
+
+  if (result == NULL)
+  {
+    return;
+  }
+
+  result->error = CONTROL_PROTO_ERR_BAD_COMMAND;
+  result->relay_mask = board_relay_snapshot();
+
+  if (command == NULL)
+  {
+    return;
+  }
+
+  if (command->type == CONTROL_PROTO_CMD_SET_RELAY)
+  {
+    if (command->value != 0U)
+    {
+      uint32_t bit;
+      if (control_queue_validate_relay_on(command->channel, result) == 0U)
+      {
+        return;
+      }
+      bit = 1UL << (command->channel - 1U);
+      if ((board_relay_snapshot() & bit) == 0U)
+      {
+        control_queue_wait_relay_on_spacing(command->channel);
+      }
+    }
+    relay_domain_execute(command, result);
+    return;
+  }
+
+  if ((command->type != CONTROL_PROTO_CMD_SET_RELAY_MASK) &&
+      (command->type != CONTROL_PROTO_CMD_SET_RELAY_ALL))
+  {
+    relay_domain_execute(command, result);
+    return;
+  }
+
+  current_mask = board_relay_snapshot() & BOARD_RELAY_ALL_MASK;
+  target_mask = (command->type == CONTROL_PROTO_CMD_SET_RELAY_MASK)
+                  ? (command->mask & BOARD_RELAY_ALL_MASK)
+                  : ((command->value != 0U) ? BOARD_RELAY_ALL_MASK : 0U);
+  new_on_mask = target_mask & ~current_mask;
+
+  for (ch = 1U; ch <= BOARD_RELAY_CHANNEL_COUNT; ++ch)
+  {
+    if (((new_on_mask >> (ch - 1U)) & 1U) != 0U)
+    {
+      if (control_queue_validate_relay_on(ch, result) == 0U)
+      {
+        return;
+      }
+    }
+  }
+
+  off_first_mask = current_mask & target_mask;
+  if (board_relay_apply_mask(off_first_mask) != HAL_OK)
+  {
+    result->error = CONTROL_PROTO_ERR_BAD_VALUE;
+    result->relay_mask = board_relay_snapshot();
+    return;
+  }
+
+  for (ch = 1U; ch <= BOARD_RELAY_CHANNEL_COUNT; ++ch)
+  {
+    if (((new_on_mask >> (ch - 1U)) & 1U) != 0U)
+    {
+      control_queue_wait_relay_on_spacing(ch);
+      if (board_relay_set(ch, GPIO_PIN_SET) != HAL_OK)
+      {
+        result->error = CONTROL_PROTO_ERR_BAD_CHANNEL;
+        result->relay_mask = board_relay_snapshot();
+        return;
+      }
+    }
+  }
+
+  result->error = CONTROL_PROTO_ERR_NONE;
+  result->relay_mask = board_relay_snapshot();
 }
 
 static void control_queue_format_request(const control_proto_command_t *command,
@@ -1106,7 +1765,60 @@ static void control_queue_worker_task(void const *argument)
       control_queue_request_t *request = &g_control_queue_worker_request;
 
       control_queue_note_dequeued();
-      if (request->kind == CONTROL_QUEUE_REQ_BACKEND_SYNC)
+      if (control_queue_request_is_stale(request) != 0U)
+      {
+        g_control_queue_stats.dropped++;
+        if (request->waiting_task != NULL)
+        {
+          xTaskNotifyGive(request->waiting_task);
+        }
+        continue;
+      }
+
+      if (request->kind == CONTROL_QUEUE_REQ_REMOTE_HTTP)
+      {
+        HAL_StatusTypeDef remote_http_status;
+        int32_t slot_index;
+        control_queue_remote_http_slot_t *slot;
+
+        taskENTER_CRITICAL();
+        slot_index = control_queue_remote_http_select_pending_slot();
+        if (slot_index >= 0)
+        {
+          g_control_queue_remote_http_slots[slot_index].state = CONTROL_QUEUE_REMOTE_HTTP_RUNNING;
+        }
+        taskEXIT_CRITICAL();
+
+        if (slot_index < 0)
+        {
+          continue;
+        }
+
+        slot = &g_control_queue_remote_http_slots[(uint32_t)slot_index];
+        memset(g_control_queue_remote_http_response, 0, sizeof(g_control_queue_remote_http_response));
+        remote_http_status =
+          control_queue_execute_remote_http(slot->request.ip_addr,
+                                            slot->request.method,
+                                            slot->request.path,
+                                            slot->request.body,
+                                            g_control_queue_remote_http_response,
+                                            sizeof(g_control_queue_remote_http_response));
+
+        taskENTER_CRITICAL();
+        slot->ok = (remote_http_status == HAL_OK) ? 1U : 0U;
+        slot->state = CONTROL_QUEUE_REMOTE_HTTP_DONE;
+        taskEXIT_CRITICAL();
+
+        if (remote_http_status == HAL_OK)
+        {
+          g_control_queue_stats.executed++;
+        }
+        else
+        {
+          g_control_queue_stats.dropped++;
+        }
+      }
+      else if (request->kind == CONTROL_QUEUE_REQ_BACKEND_SYNC)
       {
         if (control_queue_sync_remote_backend_config(request->remote_ip_addr,
                                                      &g_control_queue_backend_sync_request) == HAL_OK)
@@ -1224,7 +1936,7 @@ static void control_queue_worker_task(void const *argument)
           }
         }
 
-        relay_domain_execute(&request->command, target_result);
+        control_queue_execute_local_relay_command(&request->command, target_result);
         skip_execute:
 
         /* Phase B-H: Notify protection module of relay state changes */
@@ -1364,6 +2076,7 @@ void control_queue_force_stop(uint8_t channel)
 HAL_StatusTypeDef control_queue_submit_async(const control_proto_command_t *command)
 {
   control_queue_request_t request;
+  uint32_t previous_seq = 0U;
 
   if (command == NULL)
   {
@@ -1381,9 +2094,22 @@ HAL_StatusTypeDef control_queue_submit_async(const control_proto_command_t *comm
   memset(&request, 0, sizeof(request));
   request.command = *command;
   request.kind = CONTROL_QUEUE_REQ_COMMAND;
+  if (control_queue_command_can_coalesce(command) != 0U)
+  {
+    request.coalesce_seq =
+      control_queue_mark_latest_relay_command(0U, 0U, command->channel, &previous_seq);
+  }
 
   if (xQueueSend(g_control_queue_handle, &request, 0U) != pdPASS)
   {
+    if (request.coalesce_seq != 0U)
+    {
+      control_queue_restore_latest_relay_command(0U,
+                                                 0U,
+                                                 command->channel,
+                                                 request.coalesce_seq,
+                                                 previous_seq);
+    }
     g_control_queue_stats.queue_full++;
     g_control_queue_stats.dropped++;
     return HAL_BUSY;
@@ -1452,11 +2178,140 @@ HAL_StatusTypeDef control_queue_submit_remote(uint32_t ip_addr,
   return (result->error == CONTROL_PROTO_ERR_NONE) ? HAL_OK : HAL_ERROR;
 }
 
+HAL_StatusTypeDef control_queue_submit_remote_http_async(
+  uint32_t ip_addr,
+  const char *method,
+  const char *path,
+  const char *body,
+  uint32_t *request_id)
+{
+  uint32_t new_request_id;
+  int32_t slot_index;
+  control_queue_remote_http_slot_t *slot;
+
+  if ((ip_addr == 0U) || (method == NULL) || (path == NULL) ||
+      (request_id == NULL) ||
+      (strlen(method) >= CONTROL_QUEUE_REMOTE_HTTP_METHOD_MAX_LEN) ||
+      (strlen(path) >= CONTROL_QUEUE_REMOTE_HTTP_PATH_MAX_LEN) ||
+      ((body != NULL) && (strlen(body) >= CONTROL_QUEUE_REMOTE_HTTP_BODY_MAX_LEN)))
+  {
+    g_control_queue_stats.dropped++;
+    return HAL_ERROR;
+  }
+
+  control_queue_init();
+  if ((g_control_queue_handle == NULL) ||
+      (g_control_queue_task_handle == NULL))
+  {
+    g_control_queue_stats.dropped++;
+    return HAL_ERROR;
+  }
+
+  taskENTER_CRITICAL();
+  slot_index = control_queue_remote_http_find_free_slot();
+  if (slot_index < 0)
+  {
+    taskEXIT_CRITICAL();
+    g_control_queue_stats.busy_rejected++;
+    g_control_queue_stats.dropped++;
+    return HAL_BUSY;
+  }
+  g_control_queue_remote_http_slots[(uint32_t)slot_index].state =
+    CONTROL_QUEUE_REMOTE_HTTP_PREPARING;
+  new_request_id = g_control_queue_remote_http_next_request_id++;
+  if (new_request_id == 0U)
+  {
+    new_request_id = g_control_queue_remote_http_next_request_id++;
+  }
+  g_control_queue_remote_http_slots[(uint32_t)slot_index].request_id = new_request_id;
+  taskEXIT_CRITICAL();
+
+  slot = &g_control_queue_remote_http_slots[(uint32_t)slot_index];
+  memset(&slot->request, 0, sizeof(slot->request));
+
+  slot->request.ip_addr = ip_addr;
+  strncpy(slot->request.method,
+          method,
+          sizeof(slot->request.method) - 1U);
+  strncpy(slot->request.path,
+          path,
+          sizeof(slot->request.path) - 1U);
+  if (body != NULL)
+  {
+    strncpy(slot->request.body,
+            body,
+            sizeof(slot->request.body) - 1U);
+  }
+
+  taskENTER_CRITICAL();
+  slot->ok = 0U;
+  slot->state = CONTROL_QUEUE_REMOTE_HTTP_PENDING;
+  taskEXIT_CRITICAL();
+
+  control_queue_remote_http_kick_worker();
+  *request_id = new_request_id;
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef control_queue_get_remote_http_result(
+  uint32_t request_id,
+  uint8_t *done,
+  uint8_t *remote_ok,
+  char *response_body,
+  size_t response_body_size)
+{
+  uint8_t state;
+  uint8_t ok;
+  int32_t slot_index;
+  control_queue_remote_http_slot_t *slot;
+
+  if ((request_id == 0U) || (done == NULL) || (remote_ok == NULL) ||
+      (response_body == NULL) || (response_body_size == 0U))
+  {
+    return HAL_ERROR;
+  }
+
+  taskENTER_CRITICAL();
+  slot_index = control_queue_remote_http_find_slot_by_id(request_id);
+  if (slot_index < 0)
+  {
+    taskEXIT_CRITICAL();
+    return HAL_ERROR;
+  }
+  slot = &g_control_queue_remote_http_slots[(uint32_t)slot_index];
+  state = slot->state;
+  ok = slot->ok;
+  taskEXIT_CRITICAL();
+
+  if (state != CONTROL_QUEUE_REMOTE_HTTP_DONE)
+  {
+    *done = 0U;
+    *remote_ok = 0U;
+    response_body[0] = '\0';
+    return HAL_OK;
+  }
+
+  strncpy(response_body, g_control_queue_remote_http_response, response_body_size - 1U);
+  response_body[response_body_size - 1U] = '\0';
+  *done = 1U;
+  *remote_ok = ok;
+
+  taskENTER_CRITICAL();
+  memset(&slot->request, 0, sizeof(slot->request));
+  slot->request_id = 0U;
+  slot->ok = 0U;
+  slot->state = CONTROL_QUEUE_REMOTE_HTTP_IDLE;
+  taskEXIT_CRITICAL();
+  control_queue_remote_http_kick_worker();
+  return HAL_OK;
+}
+
 HAL_StatusTypeDef control_queue_submit_remote_async(uint32_t ip_addr,
                                                     uint32_t node_id,
                                                     const control_proto_command_t *command)
 {
   control_queue_request_t request;
+  uint32_t previous_seq = 0U;
 
   if ((ip_addr == 0U) || (command == NULL))
   {
@@ -1479,9 +2334,22 @@ HAL_StatusTypeDef control_queue_submit_remote_async(uint32_t ip_addr,
   request.remote_ip_addr = ip_addr;
   request.remote_node_id = node_id;
   request.remote = 1U;
+  if (control_queue_command_can_coalesce(command) != 0U)
+  {
+    request.coalesce_seq =
+      control_queue_mark_latest_relay_command(1U, node_id, command->channel, &previous_seq);
+  }
 
   if (xQueueSend(g_control_queue_handle, &request, 0U) != pdPASS)
   {
+    if (request.coalesce_seq != 0U)
+    {
+      control_queue_restore_latest_relay_command(1U,
+                                                 node_id,
+                                                 command->channel,
+                                                 request.coalesce_seq,
+                                                 previous_seq);
+    }
     g_control_queue_stats.queue_full++;
     g_control_queue_stats.dropped++;
     return HAL_BUSY;
@@ -1528,9 +2396,6 @@ HAL_StatusTypeDef control_queue_submit_backend_sync_async(uint32_t ip_addr,
           config->backend_host,
           sizeof(g_control_queue_backend_sync_request.backend_host) - 1U);
   g_control_queue_backend_sync_request.backend_port = config->backend_port;
-  strncpy(g_control_queue_backend_sync_request.backend_key,
-          config->backend_key,
-          sizeof(g_control_queue_backend_sync_request.backend_key) - 1U);
   g_control_queue_backend_sync_request.cloud_enabled = config->cloud_enabled;
   g_control_queue_backend_sync_request.cloud_transport = config->cloud_transport;
   strncpy(g_control_queue_backend_sync_request.cloud_broker_host,

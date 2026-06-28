@@ -19,11 +19,22 @@ extern "C" {
 #define DEVICE_CONFIG_CLOUD_SECRET_MAX_LEN   128U
 #define DEVICE_CONFIG_CA_CERT_MAX_LEN        2048U
 #define DEVICE_CONFIG_MAGIC                  0x43464731UL
-#define DEVICE_CONFIG_VERSION                6U
+#define DEVICE_CONFIG_VERSION                1U
+#define DEVICE_CONFIG_DEFAULT_CLUSTER_PASSWORD "autoControl-cluster"
 #define DEVICE_CONFIG_ADC_CHANNEL_UNASSIGNED 255U
 #define DEVICE_CONFIG_OVERCURRENT_DEFAULT_MA 4500U
 #define DEVICE_CONFIG_OVERCURRENT_DELAY_MS   1000U
 #define DEVICE_CONFIG_OVERCURRENT_HYST_MA    500U
+#define DEVICE_CONFIG_PROT_COOLDOWN_SEC      3U
+#define DEVICE_CONFIG_PROT_RETRY_DELAY_SEC   30U
+#define DEVICE_CONFIG_PROT_MAX_RETRY         1U
+#define DEVICE_CONFIG_PROT_BOOT_DELAY_SEC    5U
+#define DEVICE_CONFIG_PROT_LEARNING_SAMPLES  5U
+#define DEVICE_CONFIG_PROT_AGING_HOURS       24U
+#define DEVICE_CONFIG_PROT_AGING_CAP_PERCENT 50U
+#define DEVICE_CONFIG_PROT_STALL_X10         20U
+#define DEVICE_CONFIG_PROT_RELAY_ON_SPACING_MS 500U
+#define DEVICE_CONFIG_PROT_SAME_RELAY_ON_SPACING_MS 3000U
 
 typedef struct
 {
@@ -38,11 +49,39 @@ typedef struct
 {
   uint8_t adc_channel;
   uint8_t protection_enabled;
-  uint16_t reserved;
+  uint8_t device_strategy;
+  uint8_t reserved;
   uint32_t overcurrent_milliamps;
   uint32_t trip_delay_ms;
   uint32_t reset_hysteresis_milliamps;
+  uint8_t learning_complete;
+  uint8_t learning_samples_collected;
+  uint8_t reserved_learning[2];
+  uint32_t learned_baseline_ma;
+  uint32_t learned_startup_peak_ma;
+  uint32_t learned_startup_duration_ms;
+  uint32_t learned_run_min_ma;
+  uint32_t learned_run_max_ma;
+  uint32_t learned_initial_normal_low_ma;
+  uint32_t learned_initial_normal_high_ma;
+  uint32_t learned_normal_low_ma;
+  uint32_t learned_normal_high_ma;
+  uint32_t learned_aging_offset_ma;
 } device_config_current_t;
+
+typedef struct
+{
+  uint32_t cooldown_seconds;
+  uint32_t retry_delay_seconds;
+  uint32_t max_retry_count;
+  uint32_t boot_delay_seconds;
+  uint32_t learning_samples;
+  uint32_t aging_update_hours;
+  uint32_t aging_cap_percent;
+  uint32_t stall_timeout_multiplier_x10;
+  uint32_t relay_on_spacing_ms;
+  uint32_t same_relay_on_spacing_ms;
+} device_config_protection_global_t;
 
 typedef struct
 {
@@ -56,6 +95,7 @@ typedef struct
   uint8_t reserved0[2];
   char cluster_name[DEVICE_CONFIG_CLUSTER_NAME_MAX_LEN];
   uint8_t cluster_password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN];
+  uint8_t local_admin_password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN];
   char backend_host[64]; uint16_t backend_port; uint16_t _reserved1; char backend_key[64]; /* deprecated — raw TCP :42001 retired */
   uint8_t cloud_enabled;
   uint8_t cloud_transport; /* deprecated — MQTT is the only transport now */
@@ -72,6 +112,7 @@ typedef struct
   uint32_t provisioning_revision;
   uint32_t ca_revocation_tag;
   uint32_t saved_relay_mask;
+  device_config_protection_global_t protection_global;
   device_config_relay_t relay[DEVICE_CONFIG_RELAY_COUNT];
   device_config_current_t current[DEVICE_CONFIG_RELAY_COUNT];
 } device_config_t;
@@ -88,6 +129,8 @@ uint8_t device_config_load(device_config_t *config);
 uint8_t device_config_save(const device_config_t *config);
 void device_config_reset(void);
 void device_config_hash_password_text(const char *text, uint8_t hash_out[DEVICE_CONFIG_PASSWORD_HASH_LEN]);
+uint8_t device_config_hash_is_zero(const uint8_t hash[DEVICE_CONFIG_PASSWORD_HASH_LEN]);
+uint8_t device_config_hash_matches_default_cluster_password(const uint8_t hash[DEVICE_CONFIG_PASSWORD_HASH_LEN]);
 uint32_t device_config_password_tag(const device_config_t *config);
 uint32_t device_config_compute_auth_tag(const uint8_t password_hash[DEVICE_CONFIG_PASSWORD_HASH_LEN],
                                         uint32_t unix_time,

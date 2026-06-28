@@ -70,6 +70,8 @@
 #define PBUF_POOL_SIZE 32
 /*----- Value in opt.h for MEM_ALIGNMENT: 1 -----*/
 #define MEM_ALIGNMENT 4
+/* Keep IPv4/TCP headers 32-bit aligned after the 14-byte Ethernet header. */
+#define ETH_PAD_SIZE 2
 /*----- lwIP heap placed by linker in SRAM1 (no hardcoded address) -----*/
 /* LWIP_RAM_HEAP_POINTER removed — linker-managed BSS array avoids DMA overlap */
 /*----- Value in opt.h for MEMP_NUM_SYS_TIMEOUT: (LWIP_TCP + IP_REASSEMBLY + LWIP_ARP + (2*LWIP_DHCP) + LWIP_AUTOIP + LWIP_IGMP + LWIP_DNS + (PPP_SUPPORT*6*MEMP_NUM_PPP_PCB) + (LWIP_IPV6 ? (1 + LWIP_IPV6_REASS + LWIP_IPV6_MLD) : 0)) -*/
