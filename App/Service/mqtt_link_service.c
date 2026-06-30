@@ -36,12 +36,14 @@
 #define MQTT_LINK_KEEP_ALIVE_SECONDS     20U
 #define MQTT_LINK_PSK_MAX_LEN            32U
 #define MQTT_LINK_PAYLOAD_MAX_LEN        512U
-#define MQTT_LINK_STATUS_PAYLOAD_MAX_LEN 2048U
+#define MQTT_LINK_STATUS_PAYLOAD_MAX_LEN 4096U
+#define MQTT_LINK_QUERY_RESPONSE_MAX_LEN 4096U
 #define MQTT_LINK_COMMAND_MAX_LEN        384U
 #define MQTT_LINK_REQUEST_ID_MAX_LEN     64U
 #define MQTT_LINK_ACK_TOPIC_MAX_LEN      192U
 #define MQTT_LINK_ACK_ERROR_MAX_LEN      32U
 #define MQTT_LINK_ACK_QUEUE_LENGTH       32U
+#define MQTT_LINK_QUERY_PENDING_SLOTS    4U
 
 #define MQTT_LINK_ERROR_CONFIG           1001U
 #define MQTT_LINK_ERROR_NETWORK          1002U
@@ -60,7 +62,8 @@ typedef enum
   MQTT_LINK_PUBLISH_HELLO = 1,
   MQTT_LINK_PUBLISH_HEARTBEAT,
   MQTT_LINK_PUBLISH_STATUS,
-  MQTT_LINK_PUBLISH_FAULT
+  MQTT_LINK_PUBLISH_FAULT,
+  MQTT_LINK_PUBLISH_QUERY_RESPONSE
 } mqtt_link_publish_kind_t;
 
 typedef struct
@@ -72,6 +75,14 @@ typedef struct
   uint8_t queued;
   uint8_t completed;
 } mqtt_link_ack_t;
+
+typedef struct
+{
+  uint8_t active;
+  uint32_t remote_request_id;
+  uint32_t started_ms;
+  char request_id[MQTT_LINK_REQUEST_ID_MAX_LEN];
+} mqtt_link_pending_query_t;
 
 typedef struct
 {
@@ -111,6 +122,7 @@ typedef struct
   uint32_t pending_time_target_node_id;
   char pending_time_request_id[MQTT_LINK_REQUEST_ID_MAX_LEN];
   mqtt_link_ack_t ack_queue[MQTT_LINK_ACK_QUEUE_LENGTH];
+  mqtt_link_pending_query_t pending_queries[MQTT_LINK_QUERY_PENDING_SLOTS];
   uint8_t ack_head;
   uint8_t ack_tail;
   uint8_t ack_count;
@@ -120,8 +132,10 @@ typedef struct
 } mqtt_link_context_t;
 
 static mqtt_link_context_t g_mqtt_link_context;
+static char g_mqtt_query_response[MQTT_LINK_QUERY_RESPONSE_MAX_LEN];
 
 extern struct netif gnetif;
+extern volatile int altcp_tls_mbedtls_last_config_error;
 
 static void mqtt_link_tcpip_step(void *argument);
 static void mqtt_link_connection_callback(mqtt_client_t *client,
@@ -162,6 +176,21 @@ static void mqtt_link_note_connect_failure(void)
 static void mqtt_link_note_connect_success(void)
 {
   g_mqtt_link_context.connect_retry_ms = MQTT_LINK_CONNECT_RETRY_MIN_MS;
+}
+
+static uint32_t mqtt_link_tls_config_error_code(void)
+{
+  const int tls_error = altcp_tls_mbedtls_last_config_error;
+
+  if (tls_error > 0)
+  {
+    return MQTT_LINK_ERROR_TLS_CONFIG + ((uint32_t)tls_error * 10U);
+  }
+  if (tls_error < 0)
+  {
+    return MQTT_LINK_ERROR_TLS_CONFIG + 1000U + (uint32_t)(-tls_error);
+  }
+  return MQTT_LINK_ERROR_TLS_CONFIG;
 }
 
 static void mqtt_link_log(const char *text)
@@ -290,6 +319,9 @@ static void mqtt_link_build_topics(const device_config_t *config)
   (void)snprintf(stats->topic_command_config_relay,
                  sizeof(stats->topic_command_config_relay),
                  "cluster/%s/command/config/relay", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_config_cluster,
+                 sizeof(stats->topic_command_config_cluster),
+                 "cluster/%s/command/config/cluster", config->cloud_cluster_id);
   (void)snprintf(stats->topic_command_time,
                  sizeof(stats->topic_command_time),
                  "cluster/%s/command/time", config->cloud_cluster_id);
@@ -308,6 +340,15 @@ static void mqtt_link_build_topics(const device_config_t *config)
   (void)snprintf(stats->topic_command_scheduler_pause,
                  sizeof(stats->topic_command_scheduler_pause),
                  "cluster/%s/command/scheduler/pause", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_scheduler_resume,
+                 sizeof(stats->topic_command_scheduler_resume),
+                 "cluster/%s/command/scheduler/resume", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_config_protection,
+                 sizeof(stats->topic_command_config_protection),
+                 "cluster/%s/command/config/protection", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_command_protection_strategy,
+                 sizeof(stats->topic_command_protection_strategy),
+                 "cluster/%s/command/protection/strategy", config->cloud_cluster_id);
   (void)snprintf(stats->topic_command_protection_force_stop,
                  sizeof(stats->topic_command_protection_force_stop),
                  "cluster/%s/command/protection/force-stop", config->cloud_cluster_id);
@@ -317,6 +358,12 @@ static void mqtt_link_build_topics(const device_config_t *config)
   (void)snprintf(stats->topic_command_protection_clear_learning,
                  sizeof(stats->topic_command_protection_clear_learning),
                  "cluster/%s/command/protection/clear-learning", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_query_request,
+                 sizeof(stats->topic_query_request),
+                 "cluster/%s/query/request", config->cloud_cluster_id);
+  (void)snprintf(stats->topic_query_response_prefix,
+                 sizeof(stats->topic_query_response_prefix),
+                 "cluster/%s/query/response/", config->cloud_cluster_id);
   (void)snprintf(stats->topic_ack_prefix, sizeof(stats->topic_ack_prefix),
                  "cluster/%s/ack/", config->cloud_cluster_id);
 
@@ -680,14 +727,67 @@ static err_t mqtt_link_publish_status(void)
   const cluster_node_t *nodes;
   size_t used;
   uint32_t index;
+  uint32_t scheduler_enabled_mask = 0U;
+  uint32_t scheduler_pause_mask = 0U;
+  uint32_t scheduler_pause_blocks_mask = 0U;
+  uint32_t protection_enabled_mask = 0U;
+  uint32_t protection_tripped_mask = 0U;
+  uint32_t protection_fault_lock_mask = 0U;
+  uint32_t protection_ct_valid_mask = 0U;
+  uint32_t protection_learning_mask = 0U;
+  uint32_t protection_strategy_lsb_mask = 0U;
+  uint32_t protection_strategy_msb_mask = 0U;
+  uint8_t time_valid = 0U;
+  uint32_t now_unix;
 
   cluster_service_get_state(&cluster_state);
   adc_service_get_state(&adc_state);
   nodes = cluster_service_get_nodes(NULL);
+  now_unix = cluster_service_get_unix_time(&time_valid);
+  for (index = 1U; index <= SCHEDULER_CHANNEL_COUNT; ++index)
+  {
+    channel_scheduler_state_t st;
+    relay_protection_summary_t prot_state;
+    if (scheduler_get_state_copy((uint8_t)index, &st) == 0U)
+    {
+      continue;
+    }
+    if (st.schedule_enabled != 0U)
+    {
+      scheduler_enabled_mask |= (1UL << (index - 1U));
+    }
+    if ((st.schedule_pause_until != 0U) &&
+        ((st.schedule_pause_until == SCHEDULER_PAUSE_FOREVER) ||
+         ((time_valid != 0U) && (now_unix < st.schedule_pause_until))))
+    {
+      scheduler_pause_mask |= (1UL << (index - 1U));
+    }
+    if (st.pause_blocks_auto_trigger != 0U)
+    {
+      scheduler_pause_blocks_mask |= (1UL << (index - 1U));
+    }
+    if (relay_protection_get_summary((uint8_t)index, &prot_state) != 0U)
+    {
+      if (prot_state.protection_enabled != 0U) protection_enabled_mask |= (1UL << (index - 1U));
+      if (prot_state.tripped != 0U) protection_tripped_mask |= (1UL << (index - 1U));
+      if (prot_state.fault_locked != 0U) protection_fault_lock_mask |= (1UL << (index - 1U));
+      if (prot_state.ct_valid != 0U) protection_ct_valid_mask |= (1UL << (index - 1U));
+      if (prot_state.learning_complete != 0U) protection_learning_mask |= (1UL << (index - 1U));
+      if ((prot_state.device_strategy & 0x01U) != 0U) protection_strategy_lsb_mask |= (1UL << (index - 1U));
+      if ((prot_state.device_strategy & 0x02U) != 0U) protection_strategy_msb_mask |= (1UL << (index - 1U));
+    }
+  }
+  protection_fault_lock_mask |= relay_protection_fault_lock_mask();
   written = snprintf(payload, sizeof(payload),
                      "{\"type\":\"status\",\"online\":1,\"cluster_id\":\"%s\","
                      "\"device_id\":\"%s\",\"node_id\":%lu,\"master_node_id\":%lu,"
                      "\"role\":%u,\"term\":%lu,\"relay_mask\":%lu,"
+                     "\"scheduler_enabled_mask\":%lu,\"scheduler_pause_mask\":%lu,"
+                     "\"scheduler_pause_blocks_mask\":%lu,"
+                     "\"protection_enabled_mask\":%lu,\"protection_tripped_mask\":%lu,"
+                     "\"protection_fault_lock_mask\":%lu,\"protection_ct_valid_mask\":%lu,"
+                     "\"protection_learning_mask\":%lu,\"protection_strategy_lsb_mask\":%lu,"
+                     "\"protection_strategy_msb_mask\":%lu,"
                      "\"uptime_ms\":%lu,\"unix_time\":%lu,\"time_valid\":%u,"
                      "\"time_source\":%u,\"time_quality\":%u,\"time_seq\":%lu,"
                      "\"gateway_epoch\":%lu,\"gateway_node_id\":%lu,"
@@ -705,6 +805,16 @@ static err_t mqtt_link_publish_status(void)
                      (unsigned int)cluster_state.role,
                      (unsigned long)cluster_state.term,
                      (unsigned long)board_relay_snapshot(),
+                     (unsigned long)scheduler_enabled_mask,
+                     (unsigned long)scheduler_pause_mask,
+                     (unsigned long)scheduler_pause_blocks_mask,
+                     (unsigned long)protection_enabled_mask,
+                     (unsigned long)protection_tripped_mask,
+                     (unsigned long)protection_fault_lock_mask,
+                     (unsigned long)protection_ct_valid_mask,
+                     (unsigned long)protection_learning_mask,
+                     (unsigned long)protection_strategy_lsb_mask,
+                     (unsigned long)protection_strategy_msb_mask,
                      (unsigned long)HAL_GetTick(),
                      (unsigned long)cluster_state.unix_time,
                      (unsigned int)cluster_state.time_valid,
@@ -756,6 +866,16 @@ static err_t mqtt_link_publish_status(void)
                               sizeof(payload) - used,
                               "%s{\"node_id\":%lu,\"ip_text\":\"%s\","
                               "\"role\":%u,\"term\":%lu,\"relay_mask\":%lu,"
+                              "\"scheduler_enabled_mask\":%lu,"
+                              "\"scheduler_pause_mask\":%lu,"
+                              "\"scheduler_pause_blocks_mask\":%lu,"
+                              "\"protection_enabled_mask\":%lu,"
+                              "\"protection_tripped_mask\":%lu,"
+                              "\"protection_fault_lock_mask\":%lu,"
+                              "\"protection_ct_valid_mask\":%lu,"
+                              "\"protection_learning_mask\":%lu,"
+                              "\"protection_strategy_lsb_mask\":%lu,"
+                              "\"protection_strategy_msb_mask\":%lu,"
                               "\"online\":%u,\"device_state\":%u,"
                               "\"name\":\"Node %lu\","
                               "\"cloud_cluster_id\":\"%s\","
@@ -767,6 +887,16 @@ static err_t mqtt_link_publish_status(void)
                               (unsigned int)node->role,
                               (unsigned long)node->term,
                               (unsigned long)node->relay_mask,
+                              (unsigned long)node->scheduler_enabled_mask,
+                              (unsigned long)node->scheduler_pause_mask,
+                              (unsigned long)node->scheduler_pause_blocks_mask,
+                              (unsigned long)node->protection_enabled_mask,
+                              (unsigned long)node->protection_tripped_mask,
+                              (unsigned long)node->protection_fault_lock_mask,
+                              (unsigned long)node->protection_ct_valid_mask,
+                              (unsigned long)node->protection_learning_mask,
+                              (unsigned long)node->protection_strategy_lsb_mask,
+                              (unsigned long)node->protection_strategy_msb_mask,
                               (unsigned int)node->online,
                               (unsigned int)node->device_state,
                               (unsigned long)node->node_id,
@@ -832,7 +962,7 @@ static err_t mqtt_link_publish_fault(void)
 
 /* Subscription state machine: topics subscribed one-by-one waiting for SUBACK */
 static uint8_t  g_mqtt_sub_index = 0U;
-static const char *g_mqtt_sub_topics[12];
+static const char *g_mqtt_sub_topics[17];
 static uint8_t  g_mqtt_sub_count = 0U;
 
 static void mqtt_link_subscription_callback(void *argument, err_t error)
@@ -1093,6 +1223,777 @@ static HAL_StatusTypeDef mqtt_link_queue_relay_config(
                                                  request_id);
 }
 
+static uint8_t mqtt_link_is_local_target(uint32_t target_node_id)
+{
+  cluster_service_state_t cluster_state;
+
+  cluster_service_get_state(&cluster_state);
+  return ((target_node_id == 0U) ||
+          (target_node_id == cluster_state.self_node_id)) ? 1U : 0U;
+}
+
+static HAL_StatusTypeDef mqtt_link_forward_remote_http(uint32_t target_node_id,
+                                                       const char *method,
+                                                       const char *path,
+                                                       const char *body)
+{
+  const cluster_node_t *remote_node;
+  uint32_t remote_request_id = 0U;
+
+  remote_node = cluster_service_find_node(target_node_id);
+  if ((remote_node == NULL) ||
+      (remote_node->online == 0U) ||
+      (remote_node->ip_addr == 0U))
+  {
+    return HAL_ERROR;
+  }
+
+  return control_queue_submit_remote_http_async(remote_node->ip_addr,
+                                                method,
+                                                path,
+                                                body,
+                                                &remote_request_id);
+}
+
+static void mqtt_link_json_escape_copy(char *dst, size_t dst_size, const char *src, size_t src_max_len)
+{
+  size_t used = 0U;
+  size_t index;
+
+  if ((dst == NULL) || (dst_size == 0U))
+  {
+    return;
+  }
+  dst[0] = '\0';
+  if (src == NULL)
+  {
+    return;
+  }
+  for (index = 0U; (index < src_max_len) && (src[index] != '\0') && ((used + 1U) < dst_size); ++index)
+  {
+    const char c = src[index];
+    if ((c == '\"') || (c == '\\'))
+    {
+      if ((used + 2U) >= dst_size)
+      {
+        break;
+      }
+      dst[used++] = '\\';
+      dst[used++] = c;
+    }
+    else if ((unsigned char)c >= 0x20U)
+    {
+      dst[used++] = c;
+    }
+  }
+  dst[used] = '\0';
+}
+
+static void mqtt_link_sanitize_topic_token(char *text)
+{
+  size_t index;
+
+  if (text == NULL)
+  {
+    return;
+  }
+  for (index = 0U; text[index] != '\0'; ++index)
+  {
+    if ((isalnum((unsigned char)text[index]) == 0) &&
+        (text[index] != '-') &&
+        (text[index] != '_') &&
+        (text[index] != '.'))
+    {
+      text[index] = '_';
+    }
+  }
+}
+
+static void mqtt_link_format_query_error(char *buffer,
+                                         size_t buffer_size,
+                                         const char *request_id,
+                                         const char *error_text)
+{
+  (void)snprintf(buffer, buffer_size,
+                 "{\"ok\":false,\"request_id\":\"%s\",\"error\":\"%s\"}",
+                 (request_id != NULL) ? request_id : "",
+                 (error_text != NULL) ? error_text : "error");
+}
+
+static err_t mqtt_link_publish_query_response(const char *request_id,
+                                              const char *payload)
+{
+  char topic[MQTT_LINK_ACK_TOPIC_MAX_LEN];
+  char safe_request_id[MQTT_LINK_REQUEST_ID_MAX_LEN];
+
+  if ((request_id == NULL) || (request_id[0] == '\0') || (payload == NULL))
+  {
+    return ERR_ARG;
+  }
+  mqtt_link_copy_text(safe_request_id, sizeof(safe_request_id), request_id);
+  mqtt_link_sanitize_topic_token(safe_request_id);
+  (void)snprintf(topic, sizeof(topic), "%s%s",
+                 g_mqtt_link_context.stats.topic_query_response_prefix,
+                 safe_request_id);
+  return mqtt_link_publish(topic, payload, 0U, MQTT_LINK_PUBLISH_QUERY_RESPONSE);
+}
+
+static void mqtt_link_format_relay_config_response(char *buffer, size_t buffer_size, const char *request_id)
+{
+  device_config_t cfg;
+  size_t pos;
+  uint32_t index;
+
+  device_config_copy(&cfg);
+  pos = (size_t)snprintf(buffer, buffer_size,
+                         "{\"ok\":true,\"source\":\"mqtt-query\",\"request_id\":\"%s\","
+                         "\"compact\":\"relays-v1\",\"relays\":[",
+                         (request_id != NULL) ? request_id : "");
+  for (index = 0U; index < DEVICE_CONFIG_RELAY_COUNT; ++index)
+  {
+    char name_json[(DEVICE_CONFIG_NAME_MAX_LEN * 2U) + 4U];
+    int written;
+
+    mqtt_link_json_escape_copy(name_json, sizeof(name_json),
+                               cfg.relay[index].name,
+                               sizeof(cfg.relay[index].name));
+    written = snprintf(buffer + pos, buffer_size - pos,
+                       "%s[%lu,\"%s\",%u,%u,%u,%u,%u,%u,%lu,%lu,%lu]",
+                       (index == 0U) ? "" : ",",
+                       (unsigned long)(index + 1U),
+                       name_json,
+                       (unsigned int)cfg.relay[index].enabled,
+                       (unsigned int)cfg.relay[index].remember_state,
+                       (unsigned int)cfg.relay[index].boot_default_on,
+                       (unsigned int)cfg.current[index].adc_channel,
+                       (unsigned int)cfg.current[index].protection_enabled,
+                       (unsigned int)cfg.current[index].device_strategy,
+                       (unsigned long)cfg.current[index].overcurrent_milliamps,
+                       (unsigned long)cfg.current[index].trip_delay_ms,
+                       (unsigned long)cfg.current[index].reset_hysteresis_milliamps);
+    if ((written < 0) || ((size_t)written >= (buffer_size - pos)))
+    {
+      mqtt_link_format_query_error(buffer, buffer_size, request_id, "response_too_large");
+      return;
+    }
+    pos += (size_t)written;
+  }
+  (void)snprintf(buffer + pos, buffer_size - pos, "]}");
+}
+
+static void mqtt_link_format_protection_config_response(char *buffer, size_t buffer_size, const char *request_id)
+{
+  relay_protection_user_config_t cfg;
+  relay_protection_get_user_config(&cfg);
+  (void)snprintf(buffer, buffer_size,
+                 "{\"ok\":true,\"source\":\"mqtt-query\",\"request_id\":\"%s\","
+                 "\"cooldown_seconds\":%lu,\"retry_delay_seconds\":%lu,"
+                 "\"max_retry_count\":%lu,\"boot_delay_seconds\":%lu,"
+                 "\"learning_samples\":%lu,\"aging_update_hours\":%lu,"
+                 "\"aging_cap_percent\":%lu,\"relay_on_spacing_ms\":%lu,"
+                 "\"same_relay_on_spacing_ms\":%lu,\"stall_multiplier_x10\":%lu}",
+                 (request_id != NULL) ? request_id : "",
+                 (unsigned long)cfg.cooldown_seconds,
+                 (unsigned long)cfg.retry_delay_seconds,
+                 (unsigned long)cfg.max_retry_count,
+                 (unsigned long)cfg.boot_delay_seconds,
+                 (unsigned long)cfg.learning_samples,
+                 (unsigned long)cfg.aging_update_hours,
+                 (unsigned long)cfg.aging_cap_percent,
+                 (unsigned long)cfg.relay_on_spacing_ms,
+                 (unsigned long)cfg.same_relay_on_spacing_ms,
+                 (unsigned long)cfg.stall_timeout_multiplier_x10);
+}
+
+static void mqtt_link_format_protection_response(char *buffer, size_t buffer_size, const char *request_id)
+{
+  relay_protection_global_summary_t gs;
+  size_t pos;
+  uint8_t ch;
+
+  relay_protection_get_global_summary(&gs);
+  pos = (size_t)snprintf(buffer, buffer_size,
+                         "{\"ok\":true,\"source\":\"mqtt-query\",\"request_id\":\"%s\","
+                         "\"compact\":\"protection-v1\","
+                         "\"boot_safety_active\":%u,\"boot_delay_until_ms\":%lu,"
+                         "\"restart_count\":%lu,\"fault_locked_any\":%u,"
+                         "\"fault_lock_mask\":%lu,\"channels\":[",
+                         (request_id != NULL) ? request_id : "",
+                         (unsigned int)gs.boot_safety_active,
+                         (unsigned long)gs.boot_delay_until_ms,
+                         (unsigned long)gs.restart_count,
+                         (unsigned int)gs.fault_locked_any,
+                         (unsigned long)relay_protection_fault_lock_mask());
+  for (ch = 0U; ch < RELAY_PROTECTION_CHANNEL_COUNT; ++ch)
+  {
+    relay_protection_summary_t ps;
+    int written;
+    (void)relay_protection_get_summary((uint8_t)(ch + 1U), &ps);
+    written = snprintf(buffer + pos, buffer_size - pos,
+                       "%s[%u,%u,%u,%u,%u,%u,%u,%u,"
+                       "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
+                       "%u,%u,%u,%u,%u,%u]",
+                       (ch == 0U) ? "" : ",",
+                       (unsigned int)(ch + 1U),
+                       (unsigned int)ps.phase,
+                       (unsigned int)ps.fault_level,
+                       (unsigned int)ps.fault_reason,
+                       (unsigned int)ps.learning_complete,
+                       (unsigned int)ps.protection_enabled,
+                       (unsigned int)ps.tripped,
+                       (unsigned int)ps.fault_locked,
+                       (unsigned long)ps.current_milliamps,
+                       (unsigned long)ps.current_reference_ma,
+                       (unsigned long)ps.initial_health_baseline_ma,
+                       (unsigned long)ps.aging_offset_ma,
+                       (unsigned long)ps.normal_low_ma,
+                       (unsigned long)ps.normal_high_ma,
+                       (unsigned long)ps.startup_peak_ma,
+                       (unsigned long)ps.startup_duration_ms,
+                       (unsigned long)ps.trip_count,
+                       (unsigned long)ps.cooldown_until_ms,
+                       (unsigned long)ps.learning_samples_collected,
+                       (unsigned int)ps.ct_valid,
+                       (unsigned int)ps.ct_degraded,
+                       (unsigned int)ps.adc_saturated,
+                       (unsigned int)ps.device_strategy,
+                       (unsigned int)((ps.off_since_ms != 0U) ? 1U : 0U),
+                       (unsigned int)ps.stuck_check_pending);
+    if ((written < 0) || ((size_t)written >= (buffer_size - pos)))
+    {
+      mqtt_link_format_query_error(buffer, buffer_size, request_id, "response_too_large");
+      return;
+    }
+    pos += (size_t)written;
+  }
+  (void)snprintf(buffer + pos, buffer_size - pos, "]}");
+}
+
+static void mqtt_link_format_scheduler_status_response(char *buffer,
+                                                       size_t buffer_size,
+                                                       const char *request_id,
+                                                       uint32_t channel)
+{
+  channel_scheduler_state_t st;
+  uint8_t time_valid = 0U;
+  uint32_t now_unix;
+  uint32_t remain = 0U;
+  char reason_json[96];
+
+  if ((channel == 0U) || (channel > SCHEDULER_CHANNEL_COUNT) ||
+      (scheduler_get_state_copy((uint8_t)channel, &st) == 0U))
+  {
+    mqtt_link_format_query_error(buffer, buffer_size, request_id, "not_found");
+    return;
+  }
+  now_unix = cluster_service_get_unix_time(&time_valid);
+  mqtt_link_json_escape_copy(reason_json, sizeof(reason_json),
+                             st.auto_hold.reason,
+                             sizeof(st.auto_hold.reason));
+  if (st.auto_hold.session != 0U)
+  {
+    const uint32_t now_ms = HAL_GetTick();
+    remain = (st.auto_hold.until_ms > now_ms) ?
+      ((st.auto_hold.until_ms - now_ms) / 1000U) : 0U;
+  }
+  (void)snprintf(buffer, buffer_size,
+                 "{\"ok\":true,\"source\":\"mqtt-query\",\"request_id\":\"%s\","
+                 "\"channel\":%lu,\"schedule_enabled\":%u,"
+                 "\"pause_active\":%u,\"schedule_pause_until\":%lu,"
+                 "\"pause_blocks_auto_trigger\":%u,\"auto_hold_active\":%u,"
+                 "\"auto_hold_target\":%u,\"auto_hold_start_state\":%u,"
+                 "\"auto_hold_remaining_seconds\":%lu,\"auto_hold_session\":%lu,"
+                 "\"auto_hold_last_command_ts\":%lu,\"auto_hold_reason\":\"%s\","
+                 "\"time_valid\":%u}",
+                 (request_id != NULL) ? request_id : "",
+                 (unsigned long)channel,
+                 (unsigned int)st.schedule_enabled,
+                 (unsigned int)((st.schedule_pause_until != 0U) &&
+                                (now_unix < st.schedule_pause_until)),
+                 (unsigned long)st.schedule_pause_until,
+                 (unsigned int)st.pause_blocks_auto_trigger,
+                 (unsigned int)(st.auto_hold.session != 0U),
+                 (unsigned int)st.auto_hold.target_state,
+                 (unsigned int)st.auto_hold.start_state,
+                 (unsigned long)remain,
+                 (unsigned long)st.auto_hold.session,
+                 (unsigned long)st.last_auto_hold_command_ts,
+                 reason_json,
+                 (unsigned int)time_valid);
+}
+
+static void mqtt_link_format_scheduler_week_response(char *buffer,
+                                                     size_t buffer_size,
+                                                     const char *request_id,
+                                                     uint32_t channel)
+{
+  weekly_schedule_t ws;
+  channel_scheduler_state_t st;
+  size_t pos;
+  uint8_t day_index;
+
+  if ((channel == 0U) || (channel > SCHEDULER_CHANNEL_COUNT) ||
+      (scheduler_get_weekly_copy((uint8_t)channel, &ws) == 0U) ||
+      (scheduler_get_state_copy((uint8_t)channel, &st) == 0U))
+  {
+    mqtt_link_format_query_error(buffer, buffer_size, request_id, "not_found");
+    return;
+  }
+  pos = (size_t)snprintf(buffer, buffer_size,
+                         "{\"ok\":true,\"source\":\"mqtt-query\",\"request_id\":\"%s\","
+                         "\"channel\":%lu,\"schedule_enabled\":%u,\"days\":[",
+                         (request_id != NULL) ? request_id : "",
+                         (unsigned long)channel,
+                         (unsigned int)st.schedule_enabled);
+  for (day_index = 0U; day_index < 7U; ++day_index)
+  {
+    const daily_schedule_t *day = &ws.days[day_index];
+    uint8_t interval_index;
+    int written = snprintf(buffer + pos, buffer_size - pos,
+                           "%s{\"weekday\":%u,\"intervals\":[",
+                           (day_index == 0U) ? "" : ",",
+                           (unsigned int)day_index);
+    if ((written < 0) || ((size_t)written >= (buffer_size - pos)))
+    {
+      mqtt_link_format_query_error(buffer, buffer_size, request_id, "response_too_large");
+      return;
+    }
+    pos += (size_t)written;
+    for (interval_index = 0U; interval_index < day->interval_count; ++interval_index)
+    {
+      written = snprintf(buffer + pos, buffer_size - pos,
+                         "%s{\"start_minute\":%u,\"end_minute\":%u}",
+                         (interval_index == 0U) ? "" : ",",
+                         (unsigned int)day->intervals[interval_index].start_minute,
+                         (unsigned int)day->intervals[interval_index].end_minute);
+      if ((written < 0) || ((size_t)written >= (buffer_size - pos)))
+      {
+        mqtt_link_format_query_error(buffer, buffer_size, request_id, "response_too_large");
+        return;
+      }
+      pos += (size_t)written;
+    }
+    written = snprintf(buffer + pos, buffer_size - pos, "]}");
+    if ((written < 0) || ((size_t)written >= (buffer_size - pos)))
+    {
+      mqtt_link_format_query_error(buffer, buffer_size, request_id, "response_too_large");
+      return;
+    }
+    pos += (size_t)written;
+  }
+  (void)snprintf(buffer + pos, buffer_size - pos, "]}");
+}
+
+static uint8_t mqtt_link_query_path_to_local_response(const char *path,
+                                                      const char *request_id,
+                                                      char *buffer,
+                                                      size_t buffer_size)
+{
+  uint32_t channel = 0U;
+
+  if ((path == NULL) || (buffer == NULL) || (buffer_size == 0U))
+  {
+    return 0U;
+  }
+  if (strcmp(path, "/api/config/relays") == 0)
+  {
+    mqtt_link_format_relay_config_response(buffer, buffer_size, request_id);
+    return 1U;
+  }
+  if (strcmp(path, "/api/protection") == 0)
+  {
+    mqtt_link_format_protection_response(buffer, buffer_size, request_id);
+    return 1U;
+  }
+  if (strcmp(path, "/api/config/protection") == 0)
+  {
+    mqtt_link_format_protection_config_response(buffer, buffer_size, request_id);
+    return 1U;
+  }
+  {
+    unsigned long parsed_channel = 0UL;
+    int consumed = 0;
+    if (sscanf(path, "/api/relay/channels/%lu/scheduler/status%n",
+               &parsed_channel, &consumed) == 1)
+    {
+      if ((consumed > 0) && (path[consumed] == '\0'))
+      {
+        channel = (uint32_t)parsed_channel;
+        mqtt_link_format_scheduler_status_response(buffer, buffer_size, request_id, channel);
+        return 1U;
+      }
+    }
+  }
+  {
+    unsigned long parsed_channel = 0UL;
+    int consumed = 0;
+    if (sscanf(path, "/api/relay/channels/%lu/schedule-week%n",
+               &parsed_channel, &consumed) == 1)
+    {
+      if ((consumed > 0) && (path[consumed] == '\0'))
+      {
+        channel = (uint32_t)parsed_channel;
+        mqtt_link_format_scheduler_week_response(buffer, buffer_size, request_id, channel);
+        return 1U;
+      }
+    }
+  }
+  return 0U;
+}
+
+static int32_t mqtt_link_find_free_pending_query_slot(void)
+{
+  uint32_t index;
+  for (index = 0U; index < MQTT_LINK_QUERY_PENDING_SLOTS; ++index)
+  {
+    if (g_mqtt_link_context.pending_queries[index].active == 0U)
+    {
+      return (int32_t)index;
+    }
+  }
+  return -1;
+}
+
+static void mqtt_link_pending_query_poll(void)
+{
+  uint32_t index;
+  char *response = g_mqtt_query_response;
+
+  for (index = 0U; index < MQTT_LINK_QUERY_PENDING_SLOTS; ++index)
+  {
+    mqtt_link_pending_query_t *slot = &g_mqtt_link_context.pending_queries[index];
+    uint8_t done = 0U;
+    uint8_t remote_ok = 0U;
+
+    if (slot->active == 0U)
+    {
+      continue;
+    }
+    if ((int32_t)(HAL_GetTick() - slot->started_ms) > 8000)
+    {
+      mqtt_link_format_query_error(response, MQTT_LINK_QUERY_RESPONSE_MAX_LEN,
+                                   slot->request_id, "remote_timeout");
+      (void)mqtt_link_publish_query_response(slot->request_id, response);
+      memset(slot, 0, sizeof(*slot));
+      return;
+    }
+    if (control_queue_get_remote_http_result(slot->remote_request_id,
+                                             &done,
+                                             &remote_ok,
+                                             response,
+                                             MQTT_LINK_QUERY_RESPONSE_MAX_LEN) != HAL_OK)
+    {
+      continue;
+    }
+    if (done == 0U)
+    {
+      continue;
+    }
+    if (remote_ok == 0U)
+    {
+      mqtt_link_format_query_error(response, MQTT_LINK_QUERY_RESPONSE_MAX_LEN,
+                                   slot->request_id, "remote_query_failed");
+    }
+    (void)mqtt_link_publish_query_response(slot->request_id, response);
+    memset(slot, 0, sizeof(*slot));
+    return;
+  }
+}
+
+static void mqtt_link_process_query_request(void)
+{
+  uint32_t target_node_id = 0U;
+  char request_id[MQTT_LINK_REQUEST_ID_MAX_LEN];
+  char path[CONTROL_QUEUE_REMOTE_HTTP_PATH_MAX_LEN];
+  char *response = g_mqtt_query_response;
+
+  request_id[0] = '\0';
+  path[0] = '\0';
+  (void)mqtt_link_extract_json_string(g_mqtt_link_context.rx_payload,
+                                      "request_id",
+                                      request_id,
+                                      sizeof(request_id));
+  (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload,
+                                   "node_id",
+                                   &target_node_id);
+  (void)mqtt_link_extract_json_string(g_mqtt_link_context.rx_payload,
+                                      "path",
+                                      path,
+                                      sizeof(path));
+  if (request_id[0] == '\0')
+  {
+    mqtt_link_copy_text(request_id, sizeof(request_id), "latest");
+  }
+  mqtt_link_sanitize_topic_token(request_id);
+  if (path[0] == '\0')
+  {
+    mqtt_link_format_query_error(response, MQTT_LINK_QUERY_RESPONSE_MAX_LEN, request_id, "bad_path");
+    (void)mqtt_link_publish_query_response(request_id, response);
+    return;
+  }
+  if (mqtt_link_is_local_target(target_node_id) != 0U)
+  {
+    if (mqtt_link_query_path_to_local_response(path, request_id, response, MQTT_LINK_QUERY_RESPONSE_MAX_LEN) == 0U)
+    {
+      mqtt_link_format_query_error(response, MQTT_LINK_QUERY_RESPONSE_MAX_LEN, request_id, "unsupported_path");
+    }
+    (void)mqtt_link_publish_query_response(request_id, response);
+    return;
+  }
+  {
+    const cluster_node_t *remote_node = cluster_service_find_node(target_node_id);
+    uint32_t remote_request_id = 0U;
+    int32_t slot_index;
+    const char *remote_path = path;
+
+    if ((remote_node == NULL) || (remote_node->online == 0U) ||
+        (remote_node->ip_addr == 0U))
+    {
+      mqtt_link_format_query_error(response, MQTT_LINK_QUERY_RESPONSE_MAX_LEN, request_id, "target_unavailable");
+      (void)mqtt_link_publish_query_response(request_id, response);
+      return;
+    }
+    slot_index = mqtt_link_find_free_pending_query_slot();
+    if (slot_index < 0)
+    {
+      mqtt_link_format_query_error(response, MQTT_LINK_QUERY_RESPONSE_MAX_LEN, request_id, "query_busy");
+      (void)mqtt_link_publish_query_response(request_id, response);
+      return;
+    }
+    if (strcmp(path, "/api/config/relays") == 0)
+    {
+      remote_path = "/api/config/relays-compact";
+    }
+    else if (strcmp(path, "/api/protection") == 0)
+    {
+      remote_path = "/api/protection-compact";
+    }
+    if (control_queue_submit_remote_http_async(remote_node->ip_addr,
+                                               "GET",
+                                               remote_path,
+                                               "",
+                                               &remote_request_id) != HAL_OK)
+    {
+      mqtt_link_format_query_error(response, MQTT_LINK_QUERY_RESPONSE_MAX_LEN, request_id, "remote_submit_failed");
+      (void)mqtt_link_publish_query_response(request_id, response);
+      return;
+    }
+    memset(&g_mqtt_link_context.pending_queries[(uint32_t)slot_index],
+           0,
+           sizeof(g_mqtt_link_context.pending_queries[(uint32_t)slot_index]));
+    g_mqtt_link_context.pending_queries[(uint32_t)slot_index].active = 1U;
+    g_mqtt_link_context.pending_queries[(uint32_t)slot_index].remote_request_id = remote_request_id;
+    g_mqtt_link_context.pending_queries[(uint32_t)slot_index].started_ms = HAL_GetTick();
+    mqtt_link_copy_text(g_mqtt_link_context.pending_queries[(uint32_t)slot_index].request_id,
+                        sizeof(g_mqtt_link_context.pending_queries[(uint32_t)slot_index].request_id),
+                        request_id);
+  }
+}
+
+static HAL_StatusTypeDef mqtt_link_forward_or_apply_scheduler_resume(uint32_t target_node_id,
+                                                                     uint32_t channel)
+{
+  char path[96];
+
+  if ((channel == 0U) || (channel > SCHEDULER_CHANNEL_COUNT))
+  {
+    return HAL_ERROR;
+  }
+  if (mqtt_link_is_local_target(target_node_id) != 0U)
+  {
+    scheduler_clear_pause((uint8_t)channel);
+    return HAL_OK;
+  }
+  (void)snprintf(path, sizeof(path),
+                 "/api/relay/channels/%lu/scheduler/resume",
+                 (unsigned long)channel);
+  return mqtt_link_forward_remote_http(target_node_id, "POST", path, "");
+}
+
+static HAL_StatusTypeDef mqtt_link_forward_or_apply_protection_action(uint32_t target_node_id,
+                                                                      const char *action,
+                                                                      uint32_t channel,
+                                                                      uint32_t strategy)
+{
+  char path[64];
+  char body[64];
+
+  if ((action == NULL) || (channel == 0U) ||
+      (channel > RELAY_PROTECTION_CHANNEL_COUNT))
+  {
+    return HAL_ERROR;
+  }
+
+  if (mqtt_link_is_local_target(target_node_id) != 0U)
+  {
+    if (strcmp(action, "force-stop") == 0)
+    {
+      relay_protection_force_stop((uint8_t)channel);
+    }
+    else if (strcmp(action, "unlock") == 0)
+    {
+      relay_protection_unlock((uint8_t)channel);
+    }
+    else if (strcmp(action, "clear-learning") == 0)
+    {
+      relay_protection_clear_learning((uint8_t)channel);
+    }
+    else if (strcmp(action, "strategy") == 0)
+    {
+      if (strategy > RELAY_PROTECTION_STRATEGY_MANUAL)
+      {
+        return HAL_ERROR;
+      }
+      relay_protection_set_strategy((uint8_t)channel, (uint8_t)strategy);
+    }
+    else
+    {
+      return HAL_ERROR;
+    }
+    return HAL_OK;
+  }
+
+  (void)snprintf(path, sizeof(path), "/api/protection/%s", action);
+  if (strcmp(action, "strategy") == 0)
+  {
+    (void)snprintf(body, sizeof(body), "channel=%lu&strategy=%lu",
+                   (unsigned long)channel,
+                   (unsigned long)strategy);
+  }
+  else
+  {
+    (void)snprintf(body, sizeof(body), "channel=%lu", (unsigned long)channel);
+  }
+  return mqtt_link_forward_remote_http(target_node_id, "POST", path, body);
+}
+
+static HAL_StatusTypeDef mqtt_link_forward_or_apply_cluster_config(uint32_t target_node_id)
+{
+  device_config_t persisted;
+  char device_name[DEVICE_CONFIG_NAME_MAX_LEN];
+  char body[DEVICE_CONFIG_NAME_MAX_LEN + 16U];
+  int written;
+
+  if (mqtt_link_extract_json_string(g_mqtt_link_context.rx_payload,
+                                    "device_name",
+                                    device_name,
+                                    sizeof(device_name)) == 0U)
+  {
+    return HAL_ERROR;
+  }
+  if (device_name[0] == '\0')
+  {
+    return HAL_ERROR;
+  }
+
+  if (mqtt_link_is_local_target(target_node_id) != 0U)
+  {
+    persisted = *device_config_get();
+    memset(persisted.device_name, 0, sizeof(persisted.device_name));
+    strncpy(persisted.device_name, device_name, sizeof(persisted.device_name) - 1U);
+    return (device_config_update_and_save(&persisted) != 0U) ? HAL_OK : HAL_ERROR;
+  }
+
+  written = snprintf(body, sizeof(body), "device_name=%s", device_name);
+  if ((written < 0) || ((size_t)written >= sizeof(body)))
+  {
+    return HAL_ERROR;
+  }
+  return mqtt_link_forward_remote_http(target_node_id, "POST", "/api/config/cluster", body);
+}
+
+static HAL_StatusTypeDef mqtt_link_forward_or_apply_protection_config(uint32_t target_node_id)
+{
+  relay_protection_user_config_t cfg;
+  device_config_t persisted;
+  uint32_t value;
+  char body[256];
+  int written;
+
+  relay_protection_get_user_config(&cfg);
+  if (mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "cooldown_seconds", &value) != 0U)
+  {
+    cfg.cooldown_seconds = value;
+  }
+  if (mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "retry_delay_seconds", &value) != 0U)
+  {
+    cfg.retry_delay_seconds = value;
+  }
+  if (mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "max_retry_count", &value) != 0U)
+  {
+    cfg.max_retry_count = value;
+  }
+  if (mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "boot_delay_seconds", &value) != 0U)
+  {
+    cfg.boot_delay_seconds = value;
+  }
+  if (mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "learning_samples", &value) != 0U)
+  {
+    cfg.learning_samples = value;
+  }
+  if (mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "aging_update_hours", &value) != 0U)
+  {
+    cfg.aging_update_hours = value;
+  }
+  if (mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "aging_cap_percent", &value) != 0U)
+  {
+    cfg.aging_cap_percent = value;
+  }
+  if (mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "relay_on_spacing_ms", &value) != 0U)
+  {
+    cfg.relay_on_spacing_ms = value;
+  }
+  if (mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "same_relay_on_spacing_ms", &value) != 0U)
+  {
+    cfg.same_relay_on_spacing_ms = value;
+  }
+  if (mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "stall_multiplier_x10", &value) != 0U)
+  {
+    cfg.stall_timeout_multiplier_x10 = value;
+  }
+
+  if (mqtt_link_is_local_target(target_node_id) != 0U)
+  {
+    relay_protection_set_user_config(&cfg);
+    persisted = *device_config_get();
+    persisted.protection_global.cooldown_seconds = cfg.cooldown_seconds;
+    persisted.protection_global.retry_delay_seconds = cfg.retry_delay_seconds;
+    persisted.protection_global.max_retry_count = cfg.max_retry_count;
+    persisted.protection_global.boot_delay_seconds = cfg.boot_delay_seconds;
+    persisted.protection_global.learning_samples = cfg.learning_samples;
+    persisted.protection_global.aging_update_hours = cfg.aging_update_hours;
+    persisted.protection_global.aging_cap_percent = cfg.aging_cap_percent;
+    persisted.protection_global.stall_timeout_multiplier_x10 = cfg.stall_timeout_multiplier_x10;
+    persisted.protection_global.relay_on_spacing_ms = cfg.relay_on_spacing_ms;
+    persisted.protection_global.same_relay_on_spacing_ms = cfg.same_relay_on_spacing_ms;
+    return (device_config_update_and_save(&persisted) != 0U) ? HAL_OK : HAL_ERROR;
+  }
+
+  written = snprintf(body, sizeof(body),
+                     "cooldown_seconds=%lu&retry_delay_seconds=%lu&max_retry_count=%lu"
+                     "&boot_delay_seconds=%lu&learning_samples=%lu&aging_update_hours=%lu"
+                     "&aging_cap_percent=%lu&stall_multiplier_x10=%lu"
+                     "&relay_on_spacing_ms=%lu&same_relay_on_spacing_ms=%lu",
+                     (unsigned long)cfg.cooldown_seconds,
+                     (unsigned long)cfg.retry_delay_seconds,
+                     (unsigned long)cfg.max_retry_count,
+                     (unsigned long)cfg.boot_delay_seconds,
+                     (unsigned long)cfg.learning_samples,
+                     (unsigned long)cfg.aging_update_hours,
+                     (unsigned long)cfg.aging_cap_percent,
+                     (unsigned long)cfg.stall_timeout_multiplier_x10,
+                     (unsigned long)cfg.relay_on_spacing_ms,
+                     (unsigned long)cfg.same_relay_on_spacing_ms);
+  if ((written < 0) || ((size_t)written >= sizeof(body)))
+  {
+    return HAL_ERROR;
+  }
+  return mqtt_link_forward_remote_http(target_node_id,
+                                       "POST",
+                                       "/api/config/protection",
+                                       body);
+}
+
 static void mqtt_link_process_command(void)
 {
   control_proto_command_t command;
@@ -1117,6 +2018,12 @@ static void mqtt_link_process_command(void)
   (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload,
                                    "node_id",
                                    &target_node_id);
+  if (strcmp(g_mqtt_link_context.rx_topic,
+             g_mqtt_link_context.stats.topic_query_request) == 0)
+  {
+    mqtt_link_process_query_request();
+    return;
+  }
   if (request_id[0] == '\0')
   {
     mqtt_link_copy_text(request_id, sizeof(request_id), "latest");
@@ -1256,6 +2163,21 @@ static void mqtt_link_process_command(void)
         relay_config.fields |= CONTROL_QUEUE_RELAY_CONFIG_PROTECTION_PRESENT;
       }
     }
+    if (strstr(g_mqtt_link_context.rx_payload, "\"device_strategy\"") != NULL)
+    {
+      if ((mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload,
+                                      "device_strategy",
+                                      &value) == 0U) ||
+          (value > RELAY_PROTECTION_STRATEGY_MANUAL))
+      {
+        malformed = 1U;
+      }
+      else
+      {
+        relay_config.device_strategy = (uint8_t)value;
+        relay_config.fields |= CONTROL_QUEUE_RELAY_CONFIG_STRATEGY_PRESENT;
+      }
+    }
     if (strstr(g_mqtt_link_context.rx_payload, "\"overcurrent_milliamps\"") != NULL)
     {
       if ((mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload,
@@ -1322,6 +2244,21 @@ static void mqtt_link_process_command(void)
                             (queue_status == HAL_BUSY) ? "queue_full" : "target_unavailable",
                             target_node_id);
     }
+    return;
+  }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                  g_mqtt_link_context.stats.topic_command_config_cluster) == 0)
+  {
+    if (mqtt_link_forward_or_apply_cluster_config(target_node_id) != HAL_OK)
+    {
+      mqtt_link_publish_ack(request_id, 0U, "bad_cluster_config", target_node_id);
+      return;
+    }
+    if (mqtt_link_is_local_target(target_node_id) != 0U)
+    {
+      mqtt_link_service_mark_status_dirty();
+    }
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;
   }
   else if (strcmp(g_mqtt_link_context.rx_topic,
@@ -1403,6 +2340,47 @@ static void mqtt_link_process_command(void)
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &sch_ch);
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "weekday", &sch_weekday);
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "count", &sch_count);
+    if (mqtt_link_is_local_target(target_node_id) == 0U)
+    {
+      char path[96];
+      char body[192];
+      size_t used;
+      int written;
+      (void)snprintf(path, sizeof(path),
+                     "/api/relay/channels/%lu/schedule-week/%lu",
+                     (unsigned long)sch_ch,
+                     (unsigned long)sch_weekday);
+      written = snprintf(body, sizeof(body), "count=%lu",
+                         (unsigned long)sch_count);
+      if ((written < 0) || ((size_t)written >= sizeof(body))) {
+        mqtt_link_publish_ack(request_id, 0U, "bad_scheduler_set", target_node_id);
+        return;
+      }
+      used = (size_t)written;
+      for (uint32_t k = 0; k < sch_count && k < SCHEDULER_MAX_INTERVALS; k++) {
+        uint32_t sv = 0, ev = 0;
+        char key[8];
+        (void)snprintf(key, sizeof(key), "s%lu", (unsigned long)k);
+        (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, key, &sv);
+        (void)snprintf(key, sizeof(key), "e%lu", (unsigned long)k);
+        (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, key, &ev);
+        written = snprintf(body + used, sizeof(body) - used,
+                           "&s%lu=%lu&e%lu=%lu",
+                           (unsigned long)k, (unsigned long)sv,
+                           (unsigned long)k, (unsigned long)ev);
+        if ((written < 0) || ((size_t)written >= (sizeof(body) - used))) {
+          mqtt_link_publish_ack(request_id, 0U, "bad_scheduler_set", target_node_id);
+          return;
+        }
+        used += (size_t)written;
+      }
+      if (mqtt_link_forward_remote_http(target_node_id, "PUT", path, body) != HAL_OK) {
+        mqtt_link_publish_ack(request_id, 0U, "target_unavailable", target_node_id);
+        return;
+      }
+      mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+      return;
+    }
     if (sch_weekday > 6 || sch_count > SCHEDULER_MAX_INTERVALS) {
       mqtt_link_publish_ack(request_id, 0U, "bad_scheduler_set", target_node_id);
       return;
@@ -1429,6 +2407,7 @@ static void mqtt_link_process_command(void)
       mqtt_link_publish_ack(request_id, 0U, "bad_scheduler_set", target_node_id);
       return;
     }
+    mqtt_link_service_mark_status_dirty();
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;
   }
@@ -1438,10 +2417,27 @@ static void mqtt_link_process_command(void)
     uint32_t sch_en_ch = 0, sch_enabled = 0;
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &sch_en_ch);
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "enabled", &sch_enabled);
+    if (mqtt_link_is_local_target(target_node_id) == 0U)
+    {
+      char path[96];
+      char body[32];
+      (void)snprintf(path, sizeof(path),
+                     "/api/relay/channels/%lu/scheduler/enabled",
+                     (unsigned long)sch_en_ch);
+      (void)snprintf(body, sizeof(body), "enabled=%lu",
+                     (unsigned long)(sch_enabled ? 1U : 0U));
+      if (mqtt_link_forward_remote_http(target_node_id, "PATCH", path, body) != HAL_OK) {
+        mqtt_link_publish_ack(request_id, 0U, "target_unavailable", target_node_id);
+        return;
+      }
+      mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+      return;
+    }
     if (scheduler_set_enabled((uint8_t)sch_en_ch, (uint8_t)(sch_enabled ? 1 : 0)) == 0U) {
       mqtt_link_publish_ack(request_id, 0U, "not_found", target_node_id);
       return;
     }
+    mqtt_link_service_mark_status_dirty();
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;
   }
@@ -1454,6 +2450,26 @@ static void mqtt_link_process_command(void)
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "duration_seconds", &sp_dur);
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "until", &sp_until);
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "pause_blocks_auto_trigger", &sp_blocks);
+    if (mqtt_link_is_local_target(target_node_id) == 0U)
+    {
+      char path[96];
+      char body[128];
+      (void)snprintf(path, sizeof(path),
+                     "/api/relay/channels/%lu/scheduler/pause",
+                     (unsigned long)sp_ch);
+      (void)snprintf(body, sizeof(body),
+                     "mode=%lu&duration_seconds=%lu&until=%lu&pause_blocks_auto_trigger=%lu",
+                     (unsigned long)sp_mode,
+                     (unsigned long)sp_dur,
+                     (unsigned long)sp_until,
+                     (unsigned long)(sp_blocks ? 1U : 0U));
+      if (mqtt_link_forward_remote_http(target_node_id, "POST", path, body) != HAL_OK) {
+        mqtt_link_publish_ack(request_id, 0U, "target_unavailable", target_node_id);
+        return;
+      }
+      mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+      return;
+    }
     {
       uint8_t tv;
       uint32_t now_unix = cluster_service_get_unix_time(&tv);
@@ -1470,6 +2486,55 @@ static void mqtt_link_process_command(void)
         return;
       }
     }
+    mqtt_link_service_mark_status_dirty();
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+    return;
+  }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                   g_mqtt_link_context.stats.topic_command_scheduler_resume) == 0)
+  {
+    uint32_t sr_ch = 0;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &sr_ch);
+    if (mqtt_link_forward_or_apply_scheduler_resume(target_node_id, sr_ch) != HAL_OK) {
+      mqtt_link_publish_ack(request_id, 0U, "target_unavailable", target_node_id);
+      return;
+    }
+    if (mqtt_link_is_local_target(target_node_id) != 0U)
+    {
+      mqtt_link_service_mark_status_dirty();
+    }
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+    return;
+  }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                   g_mqtt_link_context.stats.topic_command_config_protection) == 0)
+  {
+    if (mqtt_link_forward_or_apply_protection_config(target_node_id) != HAL_OK) {
+      mqtt_link_publish_ack(request_id, 0U, "bad_protection_config", target_node_id);
+      return;
+    }
+    if (mqtt_link_is_local_target(target_node_id) != 0U)
+    {
+      mqtt_link_service_mark_status_dirty();
+    }
+    mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
+    return;
+  }
+  else if (strcmp(g_mqtt_link_context.rx_topic,
+                   g_mqtt_link_context.stats.topic_command_protection_strategy) == 0)
+  {
+    uint32_t prot_ch = 0, prot_strategy = 0;
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &prot_ch);
+    (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "strategy", &prot_strategy);
+    if (mqtt_link_forward_or_apply_protection_action(target_node_id, "strategy",
+                                                     prot_ch, prot_strategy) != HAL_OK) {
+      mqtt_link_publish_ack(request_id, 0U, "bad_strategy", target_node_id);
+      return;
+    }
+    if (mqtt_link_is_local_target(target_node_id) != 0U)
+    {
+      mqtt_link_service_mark_status_dirty();
+    }
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;
   }
@@ -1478,8 +2543,14 @@ static void mqtt_link_process_command(void)
   {
     uint32_t prot_ch = 0;
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &prot_ch);
-    if (prot_ch >= 1 && prot_ch <= SCHEDULER_CHANNEL_COUNT) {
-      relay_protection_force_stop((uint8_t)prot_ch);
+    if (mqtt_link_forward_or_apply_protection_action(target_node_id, "force-stop",
+                                                     prot_ch, 0U) != HAL_OK) {
+      mqtt_link_publish_ack(request_id, 0U, "target_unavailable", target_node_id);
+      return;
+    }
+    if (mqtt_link_is_local_target(target_node_id) != 0U)
+    {
+      mqtt_link_service_mark_status_dirty();
     }
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;
@@ -1489,8 +2560,14 @@ static void mqtt_link_process_command(void)
   {
     uint32_t prot_ch = 0;
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &prot_ch);
-    if (prot_ch >= 1 && prot_ch <= SCHEDULER_CHANNEL_COUNT) {
-      relay_protection_unlock((uint8_t)prot_ch);
+    if (mqtt_link_forward_or_apply_protection_action(target_node_id, "unlock",
+                                                     prot_ch, 0U) != HAL_OK) {
+      mqtt_link_publish_ack(request_id, 0U, "target_unavailable", target_node_id);
+      return;
+    }
+    if (mqtt_link_is_local_target(target_node_id) != 0U)
+    {
+      mqtt_link_service_mark_status_dirty();
     }
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;
@@ -1500,8 +2577,14 @@ static void mqtt_link_process_command(void)
   {
     uint32_t prot_ch = 0;
     (void)mqtt_link_extract_json_u32(g_mqtt_link_context.rx_payload, "channel", &prot_ch);
-    if (prot_ch >= 1 && prot_ch <= SCHEDULER_CHANNEL_COUNT) {
-      relay_protection_clear_learning((uint8_t)prot_ch);
+    if (mqtt_link_forward_or_apply_protection_action(target_node_id, "clear-learning",
+                                                     prot_ch, 0U) != HAL_OK) {
+      mqtt_link_publish_ack(request_id, 0U, "target_unavailable", target_node_id);
+      return;
+    }
+    if (mqtt_link_is_local_target(target_node_id) != 0U)
+    {
+      mqtt_link_service_mark_status_dirty();
     }
     mqtt_link_publish_ack(request_id, 1U, "", target_node_id);
     return;
@@ -1552,9 +2635,13 @@ static void mqtt_link_incoming_publish(void *argument, const char *topic, u32_t 
 	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_scheduler_set) == 0) ||
 	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_scheduler_enabled) == 0) ||
 	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_scheduler_pause) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_scheduler_resume) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_config_protection) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_protection_strategy) == 0) ||
 	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_protection_force_stop) == 0) ||
 	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_protection_unlock) == 0) ||
-	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_protection_clear_learning) == 0))) ? 1U : 0U;
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_command_protection_clear_learning) == 0) ||
+	      (strcmp(topic, g_mqtt_link_context.stats.topic_query_request) == 0))) ? 1U : 0U;
 
   if (g_mqtt_link_context.rx_accept == 0U)
   {
@@ -1608,16 +2695,21 @@ static void mqtt_link_subscribe_commands(void)
   g_mqtt_sub_topics[0]  = g_mqtt_link_context.stats.topic_command_relay;
   g_mqtt_sub_topics[1]  = g_mqtt_link_context.stats.topic_command_mask;
   g_mqtt_sub_topics[2]  = g_mqtt_link_context.stats.topic_command_config_relay;
-  g_mqtt_sub_topics[3]  = g_mqtt_link_context.stats.topic_command_time;
-  g_mqtt_sub_topics[4]  = g_mqtt_link_context.stats.topic_command_auto_hold;
-  g_mqtt_sub_topics[5]  = g_mqtt_link_context.stats.topic_command_control;
-  g_mqtt_sub_topics[6]  = g_mqtt_link_context.stats.topic_command_scheduler_set;
-  g_mqtt_sub_topics[7]  = g_mqtt_link_context.stats.topic_command_scheduler_enabled;
-  g_mqtt_sub_topics[8]  = g_mqtt_link_context.stats.topic_command_scheduler_pause;
-  g_mqtt_sub_topics[9]  = g_mqtt_link_context.stats.topic_command_protection_force_stop;
-  g_mqtt_sub_topics[10] = g_mqtt_link_context.stats.topic_command_protection_unlock;
-  g_mqtt_sub_topics[11] = g_mqtt_link_context.stats.topic_command_protection_clear_learning;
-  g_mqtt_sub_count = 12U;
+  g_mqtt_sub_topics[3]  = g_mqtt_link_context.stats.topic_command_config_cluster;
+  g_mqtt_sub_topics[4]  = g_mqtt_link_context.stats.topic_command_time;
+  g_mqtt_sub_topics[5]  = g_mqtt_link_context.stats.topic_command_auto_hold;
+  g_mqtt_sub_topics[6]  = g_mqtt_link_context.stats.topic_command_control;
+  g_mqtt_sub_topics[7]  = g_mqtt_link_context.stats.topic_command_scheduler_set;
+  g_mqtt_sub_topics[8]  = g_mqtt_link_context.stats.topic_command_scheduler_enabled;
+  g_mqtt_sub_topics[9]  = g_mqtt_link_context.stats.topic_command_scheduler_pause;
+  g_mqtt_sub_topics[10] = g_mqtt_link_context.stats.topic_command_scheduler_resume;
+  g_mqtt_sub_topics[11] = g_mqtt_link_context.stats.topic_command_config_protection;
+  g_mqtt_sub_topics[12] = g_mqtt_link_context.stats.topic_command_protection_strategy;
+  g_mqtt_sub_topics[13] = g_mqtt_link_context.stats.topic_command_protection_force_stop;
+  g_mqtt_sub_topics[14] = g_mqtt_link_context.stats.topic_command_protection_unlock;
+  g_mqtt_sub_topics[15] = g_mqtt_link_context.stats.topic_command_protection_clear_learning;
+  g_mqtt_sub_topics[16] = g_mqtt_link_context.stats.topic_query_request;
+  g_mqtt_sub_count = 17U;
   g_mqtt_sub_index = 0U;
 
   /* Kick off first subscribe — the rest chain via mqtt_link_subscription_callback */
@@ -1712,8 +2804,9 @@ static void mqtt_link_start_connect(const ip_addr_t *address)
     if (g_mqtt_link_context.tls_config == NULL)
     {
       g_mqtt_link_context.stats.connect_failures++;
-      g_mqtt_link_context.stats.last_error = MQTT_LINK_ERROR_TLS_CONFIG;
+      g_mqtt_link_context.stats.last_error = mqtt_link_tls_config_error_code();
       mqtt_link_note_connect_failure();
+      mqtt_link_log_value("[mqtt] tls cfg err=", g_mqtt_link_context.stats.last_error);
       mqtt_link_release_transport_keep_backoff(0U);
       return;
     }
@@ -1860,6 +2953,7 @@ static void mqtt_link_reset_transport(void)
   g_mqtt_link_context.ack_tail = 0U;
   g_mqtt_link_context.ack_count = 0U;
   g_mqtt_link_context.ack_in_flight = 0U;
+  memset(g_mqtt_link_context.pending_queries, 0, sizeof(g_mqtt_link_context.pending_queries));
   g_mqtt_link_context.stats.ack_queue_depth = 0U;
   g_mqtt_link_context.stats.connected = 0U;
   g_mqtt_link_context.last_connect_attempt_ms = 0U;
@@ -1908,6 +3002,8 @@ static void mqtt_link_tcpip_step(void *argument)
       return;
     }
   }
+
+  mqtt_link_pending_query_poll();
 
   if (g_mqtt_link_context.initial_publish_stage == 1U)
   {

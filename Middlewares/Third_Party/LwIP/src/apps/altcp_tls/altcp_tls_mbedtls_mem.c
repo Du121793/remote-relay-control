@@ -59,6 +59,7 @@
 #include "altcp_tls_mbedtls_mem.h"
 #include "altcp_tls_mbedtls_structs.h"
 #include "lwip/mem.h"
+#include "lwip/sys.h"
 
 #include "mbedtls/platform.h"
 
@@ -67,6 +68,34 @@
 #ifndef ALTCP_MBEDTLS_MEM_DEBUG
 #define ALTCP_MBEDTLS_MEM_DEBUG   LWIP_DBG_OFF
 #endif
+
+/* autoControl note:
+ * TLS config objects are long-lived compared with HTTP chunks and MQTT pbufs.
+ * Keeping them on the lwIP heap makes MQTT reconnect sensitive to heap
+ * fragmentation: the allocation can fail before the handshake even starts
+ * (application log: "tls cfg err=1202", internal stage 10).
+ *
+ * Reserve a tiny fixed pool for TLS config objects instead. Two slots cover the
+ * expected concurrent users: MQTT cloud link and HTTPS provisioning. Per-
+ * connection TLS state and mbedTLS temporary allocations still use the normal
+ * lwIP/mbedTLS path below.
+ */
+#ifndef ALTCP_MBEDTLS_CONFIG_POOL_SLOTS
+#define ALTCP_MBEDTLS_CONFIG_POOL_SLOTS       2U
+#endif
+
+#ifndef ALTCP_MBEDTLS_CONFIG_POOL_SLOT_SIZE
+#define ALTCP_MBEDTLS_CONFIG_POOL_SLOT_SIZE   8192U
+#endif
+
+typedef union altcp_mbedtls_config_pool_slot_u {
+  void *align_ptr;
+  size_t align_size;
+  u8_t bytes[ALTCP_MBEDTLS_CONFIG_POOL_SLOT_SIZE];
+} altcp_mbedtls_config_pool_slot_t;
+
+static altcp_mbedtls_config_pool_slot_t altcp_mbedtls_config_pool[ALTCP_MBEDTLS_CONFIG_POOL_SLOTS];
+static u8_t altcp_mbedtls_config_pool_used[ALTCP_MBEDTLS_CONFIG_POOL_SLOTS];
 
 #if defined(MBEDTLS_PLATFORM_MEMORY) && \
    (!defined(MBEDTLS_PLATFORM_FREE_MACRO) || \
@@ -189,21 +218,49 @@ altcp_mbedtls_free(void *conf, altcp_mbedtls_state_t *state)
 void *
 altcp_mbedtls_alloc_config(size_t size)
 {
-  void *ret;
-  size_t checked_size = (mem_size_t)size;
-  if (size != checked_size) {
-    /* allocation too big (mem_size_t overflow) */
+  u8_t i;
+  void *ret = NULL;
+  SYS_ARCH_DECL_PROTECT(lev);
+
+  if (size > ALTCP_MBEDTLS_CONFIG_POOL_SLOT_SIZE) {
     return NULL;
   }
-  ret = (altcp_mbedtls_state_t *)mem_calloc(1, (mem_size_t)size);
+
+  SYS_ARCH_PROTECT(lev);
+  for (i = 0U; i < ALTCP_MBEDTLS_CONFIG_POOL_SLOTS; i++) {
+    if (altcp_mbedtls_config_pool_used[i] == 0U) {
+      altcp_mbedtls_config_pool_used[i] = 1U;
+      ret = altcp_mbedtls_config_pool[i].bytes;
+      break;
+    }
+  }
+  SYS_ARCH_UNPROTECT(lev);
+
+  if (ret != NULL) {
+    memset(ret, 0, size);
+  }
   return ret;
 }
 
 void
 altcp_mbedtls_free_config(void *item)
 {
+  u8_t i;
+  SYS_ARCH_DECL_PROTECT(lev);
+
   LWIP_ASSERT("item != NULL", item != NULL);
-  mem_free(item);
+
+  SYS_ARCH_PROTECT(lev);
+  for (i = 0U; i < ALTCP_MBEDTLS_CONFIG_POOL_SLOTS; i++) {
+    if (item == (void *)altcp_mbedtls_config_pool[i].bytes) {
+      altcp_mbedtls_config_pool_used[i] = 0U;
+      SYS_ARCH_UNPROTECT(lev);
+      return;
+    }
+  }
+  SYS_ARCH_UNPROTECT(lev);
+
+  LWIP_ASSERT("unknown TLS config allocation", 0);
 }
 
 #endif /* LWIP_ALTCP_TLS && LWIP_ALTCP_TLS_MBEDTLS */

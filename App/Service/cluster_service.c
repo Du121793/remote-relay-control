@@ -515,21 +515,14 @@ static uint8_t cluster_service_node_is_eligible(const cluster_node_t *node,
     return 0U;
   }
 
-  /* Compute the expected auth_tag with the same shared function the
-     sender uses.  The tag binds the announce to the sender's unix_time,
-     node_id and cluster_name, keyed with the cluster password.  Reject
-     if the tag mismatches or the timestamp is outside ±30 seconds. */
+  /* Election eligibility must not depend on local/remote unix_time skew.
+     A valid peer may be ahead/behind during boot or RTC/NTP recovery.
+     Time skew only affects whether we trust and adopt the peer clock.
+     Authentication still binds the announce to unix_time, node_id and
+     cluster_name through the shared cluster password. */
   {
     const device_config_t *config = device_config_get();
-    int32_t time_diff;
-
     if (config == NULL)
-    {
-      return 0U;
-    }
-
-    time_diff = (int32_t)(state->unix_time - node->unix_time);
-    if ((time_diff > 30) || (time_diff < -30))
     {
       return 0U;
     }

@@ -94,6 +94,11 @@
    since it contains pointers to static functions declared here */
 extern const struct altcp_functions altcp_mbedtls_functions;
 
+/* Diagnostic hook used by the application when TLS config creation returns
+ * NULL. 0 means no error or not set. Positive values are local creation stages;
+ * negative values are raw mbedTLS return codes from the failing call. */
+volatile int altcp_tls_mbedtls_last_config_error;
+
 /** Our global mbedTLS configuration (server-specific, not connection-specific) */
 struct altcp_tls_config {
   mbedtls_ssl_config conf;
@@ -697,6 +702,7 @@ altcp_tls_create_config(int is_server, int have_cert, int have_pkey, int have_ca
 
   conf = (struct altcp_tls_config *)altcp_mbedtls_alloc_config(sz);
   if (conf == NULL) {
+    altcp_tls_mbedtls_last_config_error = 10;
     return NULL;
   }
   mem = (mbedtls_x509_crt *)(conf + 1);
@@ -720,6 +726,7 @@ altcp_tls_create_config(int is_server, int have_cert, int have_pkey, int have_ca
   ret = mbedtls_ctr_drbg_seed(&conf->ctr_drbg, ALTCP_MBEDTLS_RNG_FN, &conf->entropy, ALTCP_MBEDTLS_ENTROPY_PTR, ALTCP_MBEDTLS_ENTROPY_LEN);
   if (ret != 0) {
     LWIP_DEBUGF(ALTCP_MBEDTLS_DEBUG, ("mbedtls_ctr_drbg_seed failed: %d\n", ret));
+    altcp_tls_mbedtls_last_config_error = ret;
     altcp_mbedtls_free_config(conf);
     return NULL;
   }
@@ -729,6 +736,7 @@ altcp_tls_create_config(int is_server, int have_cert, int have_pkey, int have_ca
                                     MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
   if (ret != 0) {
     LWIP_DEBUGF(ALTCP_MBEDTLS_DEBUG, ("mbedtls_ssl_config_defaults failed: %d\n", ret));
+    altcp_tls_mbedtls_last_config_error = ret;
     altcp_mbedtls_free_config(conf);
     return NULL;
   }
@@ -838,8 +846,10 @@ altcp_tls_create_config_client_psk(const u8_t *psk, size_t psk_len,
   int ret;
   struct altcp_tls_config *conf;
 
+  altcp_tls_mbedtls_last_config_error = 0;
   if ((psk == NULL) || (psk_len == 0U) ||
       (identity == NULL) || (identity_len == 0U)) {
+    altcp_tls_mbedtls_last_config_error = 1;
     return NULL;
   }
 
@@ -852,16 +862,19 @@ altcp_tls_create_config_client_psk(const u8_t *psk, size_t psk_len,
   ret = mbedtls_ssl_conf_psk(&conf->conf, psk, psk_len, identity, identity_len);
   if (ret != 0) {
     LWIP_DEBUGF(ALTCP_MBEDTLS_DEBUG, ("mbedtls_ssl_conf_psk failed: %d\n", ret));
+    altcp_tls_mbedtls_last_config_error = ret;
     altcp_mbedtls_free_config(conf);
     return NULL;
   }
 
+  altcp_tls_mbedtls_last_config_error = 0;
   return conf;
 #else
   LWIP_UNUSED_ARG(psk);
   LWIP_UNUSED_ARG(psk_len);
   LWIP_UNUSED_ARG(identity);
   LWIP_UNUSED_ARG(identity_len);
+  altcp_tls_mbedtls_last_config_error = 2;
   return NULL;
 #endif
 }

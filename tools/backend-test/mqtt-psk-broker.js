@@ -17,6 +17,7 @@ const KEEPALIVE_GRACE_FACTOR = 1.5;
 const clients = new Set();
 const retained = new Map();
 const events = [];
+const responseWaiters = new Map();
 
 function pushEvent(type, payload = {}) {
   const entry = {
@@ -30,6 +31,56 @@ function pushEvent(type, payload = {}) {
   }
   console.log(`[mqtt-broker] ${type}`, payload);
   return entry;
+}
+
+function addResponseWaiter(topic, timeoutMs) {
+  const key = String(topic || "");
+  let waiter = null;
+  const cleanup = () => {
+    const list = responseWaiters.get(key) || [];
+    responseWaiters.set(key, list.filter((item) => item !== waiter));
+    if ((responseWaiters.get(key) || []).length === 0) {
+      responseWaiters.delete(key);
+    }
+  };
+  const promise = new Promise((resolve) => {
+    waiter = {
+      resolve,
+      timer: setTimeout(() => {
+        cleanup();
+        resolve({ ok: false, error: "response_timeout" });
+      }, Math.max(100, Math.min(Number(timeoutMs || 3000), 15000))),
+    };
+    const list = responseWaiters.get(key) || [];
+    list.push(waiter);
+    responseWaiters.set(key, list);
+  });
+  return {
+    promise,
+    cancel() {
+      if (waiter) {
+        clearTimeout(waiter.timer);
+        cleanup();
+      }
+    },
+  };
+}
+
+function resolveResponseWaiters(topic, payload) {
+  const key = String(topic || "");
+  const list = responseWaiters.get(key);
+  if (!list || list.length === 0) {
+    return;
+  }
+  responseWaiters.delete(key);
+  for (const waiter of list) {
+    clearTimeout(waiter.timer);
+    waiter.resolve({
+      ok: true,
+      topic: key,
+      payload: payload.toString("utf8"),
+    });
+  }
 }
 
 function readJson(filePath, fallback) {
@@ -383,6 +434,7 @@ function handlePublish(client, packet) {
     cursor += 2;
   }
   const payload = packet.body.subarray(cursor);
+  resolveResponseWaiters(parsedTopic.value, payload);
   try {
     const text = payload.toString("utf8");
     const message = JSON.parse(text);
@@ -392,9 +444,35 @@ function handlePublish(client, packet) {
       client.role = Number(message.role || client.role || 0);
       client.term = Number(message.term || client.term || 0);
       client.relayMask = Number(message.relay_mask || 0) >>> 0;
+      client.schedulerEnabledMask = Number(message.scheduler_enabled_mask || 0) >>> 0;
+      client.schedulerPauseMask = Number(message.scheduler_pause_mask || 0) >>> 0;
+      client.schedulerPauseBlocksMask = Number(message.scheduler_pause_blocks_mask || 0) >>> 0;
+      client.protectionEnabledMask = Number(message.protection_enabled_mask || 0) >>> 0;
+      client.protectionTrippedMask = Number(message.protection_tripped_mask || 0) >>> 0;
+      client.protectionFaultLockMask = Number(message.protection_fault_lock_mask || 0) >>> 0;
+      client.protectionCtValidMask = Number(message.protection_ct_valid_mask || 0) >>> 0;
+      client.protectionLearningMask = Number(message.protection_learning_mask || 0) >>> 0;
+      client.protectionStrategyLsbMask = Number(message.protection_strategy_lsb_mask || 0) >>> 0;
+      client.protectionStrategyMsbMask = Number(message.protection_strategy_msb_mask || 0) >>> 0;
       client.deviceState = Number(message.device_state || 1);
       client.clusterId = String(message.cluster_id || client.clusterId || "");
       client.deviceId = String(message.device_id || client.deviceId || "");
+      client.adcValid = Number(message.adc_valid || 0);
+      client.adcCtValid = Number(message.adc_ct_valid || 0);
+      client.adcSignalPresent = Number(message.adc_signal_present || 0);
+      client.adcRaw = Number(message.adc_raw || 0);
+      client.adcMillivolts = Number(message.adc_millivolts || 0);
+      client.adcMin = Number(message.adc_min || 0);
+      client.adcMax = Number(message.adc_max || 0);
+      client.adcAverage = Number(message.adc_average || 0);
+      client.adcRawRms = Number(message.adc_raw_rms || 0);
+      client.adcRmsMillivolts = Number(message.adc_rms_millivolts || 0);
+      client.adcCurrentMilliamps = Number(message.adc_current_milliamps || 0);
+      client.adcSampleRateHz = Number(message.adc_sample_rate_hz || 0);
+      client.adcWindowSamples = Number(message.adc_window_samples || 0);
+      client.adcSampleCount = Number(message.adc_sample_count || 0);
+      client.adcDmaOverruns = Number(message.adc_dma_overruns || 0);
+      client.adcSaturationCount = Number(message.adc_saturation_count || 0);
       client.nodes = Array.isArray(message.nodes) ? message.nodes.slice(0, 16) : [];
     }
   } catch (_error) {
@@ -569,7 +647,33 @@ const controlServer = http.createServer((request, response) => {
         role: client.role || 0,
         term: client.term || 0,
         relayMask: client.relayMask || 0,
+        schedulerEnabledMask: client.schedulerEnabledMask || 0,
+        schedulerPauseMask: client.schedulerPauseMask || 0,
+        schedulerPauseBlocksMask: client.schedulerPauseBlocksMask || 0,
+        protectionEnabledMask: client.protectionEnabledMask || 0,
+        protectionTrippedMask: client.protectionTrippedMask || 0,
+        protectionFaultLockMask: client.protectionFaultLockMask || 0,
+        protectionCtValidMask: client.protectionCtValidMask || 0,
+        protectionLearningMask: client.protectionLearningMask || 0,
+        protectionStrategyLsbMask: client.protectionStrategyLsbMask || 0,
+        protectionStrategyMsbMask: client.protectionStrategyMsbMask || 0,
         deviceState: client.deviceState || 0,
+        adcValid: client.adcValid || 0,
+        adcCtValid: client.adcCtValid || 0,
+        adcSignalPresent: client.adcSignalPresent || 0,
+        adcRaw: client.adcRaw || 0,
+        adcMillivolts: client.adcMillivolts || 0,
+        adcMin: client.adcMin || 0,
+        adcMax: client.adcMax || 0,
+        adcAverage: client.adcAverage || 0,
+        adcRawRms: client.adcRawRms || 0,
+        adcRmsMillivolts: client.adcRmsMillivolts || 0,
+        adcCurrentMilliamps: client.adcCurrentMilliamps || 0,
+        adcSampleRateHz: client.adcSampleRateHz || 0,
+        adcWindowSamples: client.adcWindowSamples || 0,
+        adcSampleCount: client.adcSampleCount || 0,
+        adcDmaOverruns: client.adcDmaOverruns || 0,
+        adcSaturationCount: client.adcSaturationCount || 0,
         lastStatusAt: client.lastStatusAt || "",
         nodes: Array.isArray(client.nodes) ? client.nodes : [],
         connected: client.connected,
@@ -599,6 +703,38 @@ const controlServer = http.createServer((request, response) => {
           source: "control-api",
         });
         return sendJson(response, 200, { ok: true, delivered });
+      } catch (error) {
+        return sendJson(response, 400, { ok: false, error: error.message });
+      }
+    });
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/request-response") {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", async () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (!body.requestTopic || !body.responseTopic || typeof body.payload === "undefined") {
+          return sendJson(response, 400, { ok: false, error: "request_response_required" });
+        }
+        const requestTopic = String(body.requestTopic);
+        const responseTopic = String(body.responseTopic);
+        const payload = Buffer.from(
+          typeof body.payload === "string" ? body.payload : JSON.stringify(body.payload),
+          "utf8"
+        );
+        const waiter = addResponseWaiter(responseTopic, body.timeoutMs);
+        const delivered = publishToSubscribers(requestTopic, payload, {
+          retain: false,
+          source: "control-api-query",
+        });
+        if (delivered <= 0) {
+          waiter.cancel();
+          return sendJson(response, 404, { ok: false, error: "request_not_delivered", delivered });
+        }
+        const result = await waiter.promise;
+        return sendJson(response, result.ok ? 200 : 504, { ...result, delivered });
       } catch (error) {
         return sendJson(response, 400, { ok: false, error: error.message });
       }

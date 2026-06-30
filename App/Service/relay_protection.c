@@ -2,6 +2,7 @@
 #include "../Config/rtc_backup_layout.h"
 #include "board_relay.h"
 #include "control_queue.h"
+#include "mqtt_link_service.h"
 #include "../Config/device_config.h"
 #include "../Domain/ct_measurement.h"
 
@@ -11,6 +12,7 @@
 #define RELAY_PROTECTION_NORMAL_LOW_MARGIN_PERCENT   8U
 #define RELAY_PROTECTION_NORMAL_HIGH_MARGIN_PERCENT 10U
 #define RELAY_PROTECTION_NORMAL_MIN_MARGIN_MA      300U
+
 
 extern RTC_HandleTypeDef hrtc;
 extern UART_HandleTypeDef huart3;
@@ -549,6 +551,12 @@ static void rp_trip(rp_ch_t *c, uint8_t channel, uint8_t fault_level,
     c->phase = RELAY_PROTECTION_PHASE_FAULT;
     g_rp.fault_lock_mask |= (1UL << (channel - 1U));
     g_rp.fault_locked_any = 1U;
+
+    /* Lethal faults must not depend only on the normal command queue.
+       Keep the original fault_reason (Hard 30A / ADC saturation / stuck),
+       but also arm the force-stop fast path so the relay worker turns the
+       output OFF even if the queue is full or busy. */
+    control_queue_force_stop(channel);
   }
 
   /* Auto-retry for startup failures only */
@@ -566,6 +574,8 @@ static void rp_trip(rp_ch_t *c, uint8_t channel, uint8_t fault_level,
       c->phase = RELAY_PROTECTION_PHASE_FAULT;
     }
   }
+
+  mqtt_link_service_mark_status_dirty();
 
   /* Submit OFF command */
   {
@@ -781,6 +791,7 @@ static void rp_assess_startup(rp_ch_t *c, uint32_t now)
 
                 rp_persist_learning_to_config(
                   (uint8_t)((uint8_t)(c - g_ch) + 1U), c);
+                mqtt_link_service_mark_status_dirty();
               }
               else
               {
@@ -1080,14 +1091,28 @@ void relay_protection_assess(uint8_t channel,
   if (c->ct_valid == 0U)
   {
     c->current_milliamps = 0U;
-    c->adc_saturated = 0U;
+    c->adc_saturated = adc_saturated &&
+      (bias_millivolts >= CT_MEASUREMENT_BIAS_MIN_MV) &&
+      (bias_millivolts <= CT_MEASUREMENT_BIAS_MAX_MV);
     c->above_fast_since_ms = 0U;
     c->above_slow_since_ms = 0U;
     c->above_warning_since_ms = 0U;
     c->below_undercurrent_since_ms = 0U;
-    c->adc_saturation_since_ms = 0U;
     c->stuck_check_pending = 0U;
     c->stuck_above_count = 0U;
+
+    /* CT invalid normally means "do not run current protection".
+       Exception: ADC saturation itself is a hardware fault source.  Do not
+       hide it behind ct_valid==0, otherwise a rail-to-rail ADC waveform would
+       look like "CT not ready" and skip protection. */
+    if (relay_is_on)
+    {
+      (void)rp_check_saturation(c, channel, now_ms);
+    }
+    else
+    {
+      c->adc_saturation_since_ms = 0U;
+    }
     return;
   }
 
@@ -1303,6 +1328,7 @@ void relay_protection_clear_learning(uint8_t channel)
   memset(c->learning_peaks, 0, sizeof(c->learning_peaks));
   memset(c->learning_durations, 0, sizeof(c->learning_durations));
   rp_persist_learning_to_config(channel, c);
+  mqtt_link_service_mark_status_dirty();
 }
 
 void relay_protection_unlock(uint8_t channel)
@@ -1326,6 +1352,7 @@ void relay_protection_unlock(uint8_t channel)
   c->stuck_above_count = 0U;
   g_rp.fault_lock_mask &= ~(1UL << (channel - 1U));
   g_rp.fault_locked_any = (g_rp.fault_lock_mask != 0U) ? 1U : 0U;
+  mqtt_link_service_mark_status_dirty();
 }
 
 /* ── Config setters ──────────────────────────────────────────────── */
@@ -1334,12 +1361,14 @@ void relay_protection_set_strategy(uint8_t channel, uint8_t strategy)
   if (channel == 0U || channel > 16U) return;
   if (strategy > RELAY_PROTECTION_STRATEGY_MANUAL) return;
   g_ch[channel - 1U].device_strategy = strategy;
+  mqtt_link_service_mark_status_dirty();
 }
 
 void relay_protection_set_enabled(uint8_t channel, uint8_t enabled)
 {
   if (channel == 0U || channel > 16U) return;
   g_ch[channel - 1U].protection_enabled = enabled;
+  mqtt_link_service_mark_status_dirty();
 }
 
 void relay_protection_set_overcurrent_ma(uint8_t channel, uint32_t ma)

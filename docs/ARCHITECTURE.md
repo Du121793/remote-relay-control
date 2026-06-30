@@ -87,10 +87,97 @@
 | `cluster/{id}/command/scheduler/set` | Broker→MCU | 1 | 排程設定 |
 | `cluster/{id}/command/scheduler/enabled` | Broker→MCU | 1 | 排程啟用 |
 | `cluster/{id}/command/scheduler/pause` | Broker→MCU | 1 | 暫停排程 |
+| `cluster/{id}/command/scheduler/resume` | Broker→MCU | 1 | 恢復排程 |
+| `cluster/{id}/command/config/protection` | Broker→MCU | 1 | 全域保護參數 |
+| `cluster/{id}/command/protection/strategy` | Broker→MCU | 1 | 單路保護策略 |
 | `cluster/{id}/command/protection/force-stop` | Broker→MCU | 1 | 強制停止 |
 | `cluster/{id}/command/protection/unlock` | Broker→MCU | 1 | 解鎖保護 |
 | `cluster/{id}/command/protection/clear-learning` | Broker→MCU | 1 | 清除學習 |
 | `cluster/{id}/ack/{request_id}` | MCU→Broker | 0 | 命令確認 |
+| `cluster/{id}/query/request` | Broker→MCU | 0 | 後端查詢 MCU/Member 詳細狀態 |
+| `cluster/{id}/query/response/{request_id}` | MCU→Broker | 0 | 後端查詢回應 |
+
+### 2.4 後端詳細查詢
+
+後端不再預設直接連線 `192.168.x.x` MCU HTTP API。原因是雲端後端通常不在同一個 LAN，直接 HTTP 也沒有端到端加密與身分保證。
+
+目前詳細查詢流程：
+
+```
+Backend
+  → Broker control API /api/request-response
+  → MQTT cluster/{id}/query/request
+  → Master MCU
+      ├─ target 是自己：直接讀本機狀態後回覆
+      └─ target 是 Member：由 Master 透過本地 cluster proxy 查詢 Member，再回覆
+  → MQTT cluster/{id}/query/response/{request_id}
+  → Backend
+```
+
+已支援查詢：
+
+- `/api/config/relays`
+- `/api/protection`
+- `/api/config/protection`
+- `/api/relay/channels/{ch}/scheduler/status`
+- `/api/relay/channels/{ch}/schedule-week`
+
+### 2.5 後端 Live State Cache 與查詢快取
+
+後端顯示資料分成兩層：
+
+1. **Live State Cache（主要顯示來源）**
+   - 來源：MCU 透過 `cluster/{id}/status` 主動上報的 retained snapshot。
+   - 後端 broker 解析 status 後，`server.js` 會同步到 `knownNodes`。
+   - 用途：儀表板、節點清單、繼電器總覽、保護總覽的即時顯示。
+   - 目前包含：`relay_mask`、`scheduler_enabled_mask`、`scheduler_pause_mask`、`scheduler_pause_blocks_mask`、`protection_enabled_mask`、`protection_tripped_mask`、`protection_fault_lock_mask`、`protection_ct_valid_mask`、`protection_learning_mask`、保護策略 bit mask、ADC/CT 摘要、節點 online/role/ip。
+   - Member 的保護與排程「總覽狀態」由 discovery v8 與 Master 的 MQTT status `nodes[]` 轉送，因此後端不需要為每一路 Member 狀態反覆發 query fallback。
+   - 資料新鮮度：
+     - `LIVE_STATE_FRESH_MS` 預設 5000 ms。
+     - `LIVE_STATE_STALE_MS` 預設 15000 ms。
+     - 超過 stale window 後，前端不可把該資料當作已確認狀態。
+
+2. **Detail Query Cache（詳細頁與補償用）**
+   - 來源：後端透過 MQTT request-response 查詢 MCU 或 Member。
+   - 用途：Relay 設定、Protection 設定、Scheduler week、排程實際時間表等詳細資料。
+   - 同一個 `node/path` 同時只送一筆查詢；短時間內重複讀取會共用快取。
+   - 寫入命令成功 publish 後，後端會清除該 node 的 detail query cache，避免長時間顯示舊設定。
+
+狀態同步原則：
+
+```
+MCU 狀態變更
+  → mark status dirty
+  → MQTT status snapshot 立即 publish
+  → broker 更新 client state
+  → backend syncKnownNodesFromBroker()
+  → knownNodes live cache 更新
+  → SSE 推送 dashboard
+```
+
+ADC/current 類高頻資料不逐筆推送，仍跟隨 status snapshot 週期；Relay 開關、Scheduler 啟用/暫停、Protection lock/unlock/trip、學習完成等狀態變更會立即 mark dirty，觸發下一輪 MQTT poll 儘快 publish status。
+
+為避免既有 `control_queue` 的遠端 HTTP 回應 buffer 被多筆查詢互相覆蓋，MCU 只小幅保留 MQTT pending query slot（目前 4 筆）作為排隊緩衝；底層 remote HTTP 仍避免真正多工共用同一份 response buffer。Local query 會立即處理，不佔用 remote HTTP response buffer。若未來要支援 10 台以上設備的高頻詳細查詢，應擴充「Master 狀態摘要 retained publish + 後端快取 + 需要時單筆 query」，而不是繼續加大 HTTP response buffer。
+
+MCU 的 lwIP MQTT output ring buffer 目前是 4096 bytes，因此大型查詢不可直接回完整 verbose JSON。`config/relays` 與 `protection` 會使用 compact JSON array 回傳，後端收到後再展開成既有 API 欄位格式。這樣不增加常駐 RAM，也避免大型 response publish 失敗造成後端 timeout。
+
+當查詢目標是 Master 自己時，Master 直接產生 compact response。當查詢目標是 Member 時，Master 不應該向 Member 讀取 verbose `/api/config/relays` 或 `/api/protection`，而是改讀 Member 的 compact HTTP endpoint：
+
+- `/api/config/relays-compact`
+- `/api/protection-compact`
+
+這兩個 endpoint 是 MCU-to-MCU / cloud-query 轉發用的低 RAM 格式；一般本機 Web 仍可使用 verbose endpoint。
+
+### 2.6 MQTT TLS 記憶體配置
+
+MQTT 雲端連線使用 TLS-PSK。TLS config 物件生命週期比一般 HTTP chunk 與 MQTT pbuf 長，若直接走 lwIP heap，重連時容易受碎片化影響。
+
+目前 `altcp_tls_mbedtls_mem.c` 保留 2 個固定 TLS config slot，每個 slot 8192 bytes：
+
+- slot 1：主要供 MQTT cloud link 使用。
+- slot 2：保留給 HTTPS provisioning 或短時間重連交錯。
+
+若 UART 出現 `mqtt tls cfg err=1202`，代表 TLS config allocation 在建立階段失敗；優先檢查 slot size 是否小於實際 `struct altcp_tls_config`，或是否有 config 未釋放。
 
 ---
 
@@ -146,6 +233,8 @@ cluster_service_run_election():
   5. Master switch delay: CLUSTER_SERVICE_MASTER_SWITCH_DELAY_MS = 2.5s
   6. Self-promotion delay: STARTUP=4s, FAILOVER=3s
 ```
+
+選主資格只看叢集名稱、叢集密碼 auth_tag、node_id、role、term、online/stale 狀態與健康狀態；不因本機與遠端 `unix_time` 差超過 30 秒而排除節點。時間差只影響是否採信對方時間，不能讓合法節點失去選主資格，避免 RTC/NTP/MQTT 短暫不同步造成 split-brain。
 
 ### 3.3 時間同步
 
@@ -311,6 +400,8 @@ worker → GPIO write
 | POST | `/send/:nodeId/scheduler/enabled` | `{channel, enabled}` | 排程啟用/關閉 |
 | POST | `/send/:nodeId/scheduler/pause` | `{channel, mode, duration_seconds?, until?, pause_blocks_auto_trigger?}` | 暫停排程 |
 | POST | `/send/:nodeId/scheduler/resume` | `{channel}` | 恢復排程 |
+| POST | `/send/:nodeId/config/protection` | 全域保護欄位 | 全域保護設定 |
+| POST | `/send/:nodeId/protection/strategy` | `{channel, strategy}` | 單路保護策略 |
 | POST | `/send/:nodeId/protection/force-stop` | `{channel}` | 強制停止 |
 | POST | `/send/:nodeId/protection/unlock` | `{channel}` | 解鎖保護 |
 | POST | `/send/:nodeId/protection/clear-learning` | `{channel}` | 清除 CT 學習 |
@@ -320,7 +411,7 @@ worker → GPIO write
 | Method | Path | 說明 |
 |------|------|------|
 | GET | `/api/config/:nodeId/relays` | 讀取 relay 組態 |
-| POST | `/api/config/:nodeId/device-name` | 設定裝置名稱 |
+| POST | `/api/config/:nodeId/device-name` | 設定裝置名稱（透過 MQTT `config/cluster` 轉發，等 MCU ack 後回傳 completed） |
 | POST | `/api/config/:nodeId/relay` | 設定單路 relay |
 
 ### 5.7 感測器 Auto Hold API ★
@@ -389,6 +480,7 @@ POST /api/sensor/recover { channel:3 }
 | GET | `/api/config/cluster` | - | ✅ | 叢集+cloud 設定 |
 | POST | `/api/config/cluster` | 多欄位 | ✅ | 更新設定 |
 | GET | `/api/config/relays` | - | ✅ | 全部 relay 設定 |
+| GET | `/api/config/relays-compact` | - | ✅ | compact relay 設定，供 Master 轉發 Member 查詢 |
 | POST | `/api/config/relay` | `channel=N&name=X...` | ✅ | 單路 relay |
 
 ### 6.5 安全保護
@@ -396,6 +488,7 @@ POST /api/sensor/recover { channel:3 }
 | Method | Path | Body | Auth | 說明 |
 |------|------|------|:---:|------|
 | GET | `/api/protection` | - | ✅ | 16 路保護狀態 |
+| GET | `/api/protection-compact` | - | ✅ | compact 保護狀態，供 Master 轉發 Member 查詢 |
 | GET | `/api/config/protection` | - | ✅ | 全域保護參數 |
 | POST | `/api/config/protection` | 多欄位 | ✅ | 更新全域保護 |
 | POST | `/api/protection/strategy` | `channel=N&strategy=0\|1` | ✅ | 設定策略 |

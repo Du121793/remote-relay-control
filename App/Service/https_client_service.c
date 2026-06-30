@@ -1,4 +1,4 @@
-#include "https_client_service.h"
+﻿#include "https_client_service.h"
 
 #include "cluster_service.h"
 #include "mqtt_link_service.h"
@@ -43,6 +43,7 @@ typedef enum
 typedef struct
 {
   struct altcp_pcb *pcb;
+  struct altcp_tls_config *tls_config;
   ip_addr_t server_addr;
   uint8_t state;
   volatile uint8_t callback_pending;
@@ -78,6 +79,15 @@ static uint8_t https_client_is_master_online(void)
          : 0U;
 }
 
+static void https_client_release_tls_config(void)
+{
+  if (g_https_client_context.tls_config != NULL)
+  {
+    altcp_tls_free_config(g_https_client_context.tls_config);
+    g_https_client_context.tls_config = NULL;
+  }
+}
+
 static void https_client_close(void)
 {
   if (g_https_client_context.pcb != NULL)
@@ -85,6 +95,7 @@ static void https_client_close(void)
     altcp_abort(g_https_client_context.pcb);
     g_https_client_context.pcb = NULL;
   }
+  https_client_release_tls_config();
   g_https_client_context.state = HTTPS_STATE_IDLE;
 }
 
@@ -168,6 +179,28 @@ static void https_client_send_request(void)
 
   (void)altcp_output(g_https_client_context.pcb);
   g_https_client_context.state = HTTPS_STATE_SENDING;
+}
+
+static struct altcp_tls_config *https_client_create_tls_config(void)
+{
+  const device_config_t *config = device_config_get();
+  size_t ca_cert_len;
+
+  if (config == NULL)
+  {
+    return NULL;
+  }
+
+  ca_cert_len = (config->cloud_cluster_ca_cert[0] != '\0')
+                ? strlen(config->cloud_cluster_ca_cert)
+                : 0U;
+  if (ca_cert_len > 0U)
+  {
+    return altcp_tls_create_config_client((const u8_t *)config->cloud_cluster_ca_cert,
+                                          ca_cert_len);
+  }
+
+  return altcp_tls_create_config_client(NULL, 0U);
 }
 
 static void https_client_parse_and_apply(const char *body, size_t body_len)
@@ -359,42 +392,31 @@ static void https_client_err(void *arg, err_t err)
   /* lwIP error callback fires AFTER the PCB is already freed.
      Do NOT call altcp_abort() — just clear our reference. */
   g_https_client_context.pcb = NULL;
+  https_client_release_tls_config();
   g_https_client_context.state = HTTPS_STATE_IDLE;
 }
 
 static void https_client_connect_to(const ip_addr_t *address)
 {
   err_t err;
-  const device_config_t *config = device_config_get();
 
-  if ((address == NULL) || (config == NULL))
+  if (address == NULL)
   {
     return;
   }
 
+  https_client_release_tls_config();
+  g_https_client_context.tls_config = https_client_create_tls_config();
+  if (g_https_client_context.tls_config == NULL)
   {
-    const u8_t *ca_cert = (const u8_t *)config->cloud_cluster_ca_cert;
-    size_t ca_cert_len = (config->cloud_cluster_ca_cert[0] != '\0')
-                         ? strlen(config->cloud_cluster_ca_cert)
-                         : 0U;
-
-    if (ca_cert_len > 0U)
-    {
-      g_https_client_context.pcb =
-        altcp_tls_new(altcp_tls_create_config_client(ca_cert, ca_cert_len),
-                      IPADDR_TYPE_V4);
-    }
-    else
-    {
-      /* No CA cert configured — TLS without server verification.
-         The connection is still encrypted but vulnerable to MITM. */
-      g_https_client_context.pcb =
-        altcp_tls_new(altcp_tls_create_config_client(NULL, 0U),
-                      IPADDR_TYPE_V4);
-    }
+    return;
   }
+
+  g_https_client_context.pcb =
+    altcp_tls_new(g_https_client_context.tls_config, IPADDR_TYPE_V4);
   if (g_https_client_context.pcb == NULL)
   {
+    https_client_release_tls_config();
     return;
   }
 
@@ -408,8 +430,7 @@ static void https_client_connect_to(const ip_addr_t *address)
                       https_client_connected);
   if (err != ERR_OK)
   {
-    altcp_abort(g_https_client_context.pcb);
-    g_https_client_context.pcb = NULL;
+    https_client_close();
     return;
   }
 

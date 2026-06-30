@@ -50,6 +50,16 @@ typedef struct
   uint32_t term;
   uint32_t relay_mask;
   uint32_t enabled_mask;
+  uint32_t scheduler_enabled_mask;
+  uint32_t scheduler_pause_mask;
+  uint32_t scheduler_pause_blocks_mask;
+  uint32_t protection_enabled_mask;
+  uint32_t protection_tripped_mask;
+  uint32_t protection_fault_lock_mask;
+  uint32_t protection_ct_valid_mask;
+  uint32_t protection_learning_mask;
+  uint32_t protection_strategy_lsb_mask;
+  uint32_t protection_strategy_msb_mask;
   uint32_t auth_tag;
   uint32_t unix_time;
   uint8_t time_valid;

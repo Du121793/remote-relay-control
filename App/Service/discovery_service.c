@@ -6,6 +6,8 @@
 #include "adc_service.h"
 #include "cluster_service.h"
 #include "control_service.h"
+#include "relay_protection.h"
+#include "scheduler.h"
 #include "../Config/device_config.h"
 #include "discovery_proto.h"
 #include "mbedtls/md.h"
@@ -60,9 +62,21 @@ static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t por
   uint32_t load_score;
   uint32_t auth_tag;
   uint32_t enabled_mask = 0U;
+  uint32_t scheduler_enabled_mask = 0U;
+  uint32_t scheduler_pause_mask = 0U;
+  uint32_t scheduler_pause_blocks_mask = 0U;
+  uint32_t protection_enabled_mask = 0U;
+  uint32_t protection_tripped_mask = 0U;
+  uint32_t protection_fault_lock_mask = 0U;
+  uint32_t protection_ct_valid_mask = 0U;
+  uint32_t protection_learning_mask = 0U;
+  uint32_t protection_strategy_lsb_mask = 0U;
+  uint32_t protection_strategy_msb_mask = 0U;
   adc_service_state_t adc_state;
   const device_config_t *config = device_config_get();
   uint32_t relay_index;
+  uint8_t time_valid = 0U;
+  uint32_t now_unix = 0U;
 
   if ((g_discovery_pcb == NULL) || !netif_is_link_up(&gnetif) || !dhcp_supplied_address(&gnetif))
   {
@@ -83,11 +97,43 @@ static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t por
                                             cluster_state.cluster_name);
   for (relay_index = 0U; relay_index < DEVICE_CONFIG_RELAY_COUNT; ++relay_index)
   {
+    channel_scheduler_state_t sched_state;
+    relay_protection_summary_t prot_state;
+
     if (config->relay[relay_index].enabled != 0U)
     {
       enabled_mask |= (1UL << relay_index);
     }
+    if (scheduler_get_state_copy((uint8_t)(relay_index + 1U), &sched_state) != 0U)
+    {
+      if (sched_state.schedule_enabled != 0U)
+      {
+        scheduler_enabled_mask |= (1UL << relay_index);
+      }
+      now_unix = cluster_service_get_unix_time(&time_valid);
+      if ((sched_state.schedule_pause_until != 0U) &&
+          ((sched_state.schedule_pause_until == SCHEDULER_PAUSE_FOREVER) ||
+           ((time_valid != 0U) && (now_unix < sched_state.schedule_pause_until))))
+      {
+        scheduler_pause_mask |= (1UL << relay_index);
+      }
+      if (sched_state.pause_blocks_auto_trigger != 0U)
+      {
+        scheduler_pause_blocks_mask |= (1UL << relay_index);
+      }
+    }
+    if (relay_protection_get_summary((uint8_t)(relay_index + 1U), &prot_state) != 0U)
+    {
+      if (prot_state.protection_enabled != 0U) protection_enabled_mask |= (1UL << relay_index);
+      if (prot_state.tripped != 0U) protection_tripped_mask |= (1UL << relay_index);
+      if (prot_state.fault_locked != 0U) protection_fault_lock_mask |= (1UL << relay_index);
+      if (prot_state.ct_valid != 0U) protection_ct_valid_mask |= (1UL << relay_index);
+      if (prot_state.learning_complete != 0U) protection_learning_mask |= (1UL << relay_index);
+      if ((prot_state.device_strategy & 0x01U) != 0U) protection_strategy_lsb_mask |= (1UL << relay_index);
+      if ((prot_state.device_strategy & 0x02U) != 0U) protection_strategy_msb_mask |= (1UL << relay_index);
+    }
   }
+  protection_fault_lock_mask |= relay_protection_fault_lock_mask();
   ip4addr_ntoa_r(netif_ip4_addr(&gnetif), ip_text, sizeof(ip_text));
   payload_len = discovery_proto_build_announce(payload,
                                                sizeof(payload),
@@ -104,6 +150,16 @@ static void discovery_service_udp_send_announce(const ip_addr_t *addr, u16_t por
                                                auth_tag,
                                                board_relay_snapshot(),
                                                enabled_mask,
+                                               scheduler_enabled_mask,
+                                               scheduler_pause_mask,
+                                               scheduler_pause_blocks_mask,
+                                               protection_enabled_mask,
+                                               protection_tripped_mask,
+                                               protection_fault_lock_mask,
+                                               protection_ct_valid_mask,
+                                               protection_learning_mask,
+                                               protection_strategy_lsb_mask,
+                                               protection_strategy_msb_mask,
                                                config->auto_join_cluster,
                                                cluster_state.unix_time,
                                                cluster_state.time_valid,
@@ -238,6 +294,16 @@ static void discovery_service_udp_recv(void *arg, struct udp_pcb *pcb, struct pb
       node->term = announce->term;
       node->relay_mask = announce->relay_mask;
       node->enabled_mask = announce->enabled_mask;
+      node->scheduler_enabled_mask = announce->scheduler_enabled_mask;
+      node->scheduler_pause_mask = announce->scheduler_pause_mask;
+      node->scheduler_pause_blocks_mask = announce->scheduler_pause_blocks_mask;
+      node->protection_enabled_mask = announce->protection_enabled_mask;
+      node->protection_tripped_mask = announce->protection_tripped_mask;
+      node->protection_fault_lock_mask = announce->protection_fault_lock_mask;
+      node->protection_ct_valid_mask = announce->protection_ct_valid_mask;
+      node->protection_learning_mask = announce->protection_learning_mask;
+      node->protection_strategy_lsb_mask = announce->protection_strategy_lsb_mask;
+      node->protection_strategy_msb_mask = announce->protection_strategy_msb_mask;
       node->auth_tag = announce->auth_tag;
       node->unix_time = announce->unix_time;
       node->time_valid = announce->time_valid;

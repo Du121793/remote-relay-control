@@ -127,6 +127,8 @@ static void http_service_format_cluster_config_json(char *buffer, size_t buffer_
 static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_size);
 static void http_service_format_dashboard_live_json(char *buffer, size_t buffer_size);
 static void http_service_format_relay_config_json(char *buffer, size_t buffer_size);
+static void http_service_format_relay_config_compact_json(char *buffer, size_t buffer_size);
+static void http_service_format_protection_compact_json(char *buffer, size_t buffer_size);
 static err_t http_service_handle_status_request(http_service_connection_t *connection);
 static uint8_t http_service_get_master_ip_text(char *buffer, size_t buffer_size, uint8_t *is_local_master);
 static uint8_t http_service_is_master_control_allowed(char *master_ip_text, size_t buffer_size);
@@ -1681,7 +1683,12 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
     (void)ip4addr_ntoa_r(&ip_addr, ip_text, sizeof(ip_text));
     written = snprintf(buffer + used,
                        buffer_size - used,
-                       "%s{\"node_id\":%lu,\"ip\":%lu,\"ip_text\":\"%s\",\"role\":%u,\"term\":%lu,\"load\":%lu,\"relay_mask\":%lu,\"enabled_mask\":%lu,\"adc_valid\":%u,\"adc_ct_valid\":%u,\"adc_signal_present\":%u,\"adc_raw\":%lu,\"adc_millivolts\":%lu,\"adc_min\":%lu,\"adc_max\":%lu,\"adc_average\":%lu,\"adc_raw_rms\":%lu,\"adc_rms_millivolts\":%lu,\"adc_current_milliamps\":%lu,\"adc_sample_rate_hz\":%lu,\"adc_window_samples\":%lu,\"adc_sample_count\":%lu,\"adc_dma_overruns\":%lu,\"adc_saturation_count\":%lu,\"auto\":%u,\"online\":%u,\"device_state\":%u,\"same_cluster\":%u,\"controllable\":%u,\"auth_match\":%u,\"cluster_name\":\"%s\",\"name\":\"%s\",\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
+                       "%s{\"node_id\":%lu,\"ip\":%lu,\"ip_text\":\"%s\",\"role\":%u,\"term\":%lu,\"load\":%lu,\"relay_mask\":%lu,\"enabled_mask\":%lu,"
+                       "\"scheduler_enabled_mask\":%lu,\"scheduler_pause_mask\":%lu,\"scheduler_pause_blocks_mask\":%lu,"
+                       "\"protection_enabled_mask\":%lu,\"protection_tripped_mask\":%lu,\"protection_fault_lock_mask\":%lu,"
+                       "\"protection_ct_valid_mask\":%lu,\"protection_learning_mask\":%lu,"
+                       "\"protection_strategy_lsb_mask\":%lu,\"protection_strategy_msb_mask\":%lu,"
+                       "\"adc_valid\":%u,\"adc_ct_valid\":%u,\"adc_signal_present\":%u,\"adc_raw\":%lu,\"adc_millivolts\":%lu,\"adc_min\":%lu,\"adc_max\":%lu,\"adc_average\":%lu,\"adc_raw_rms\":%lu,\"adc_rms_millivolts\":%lu,\"adc_current_milliamps\":%lu,\"adc_sample_rate_hz\":%lu,\"adc_window_samples\":%lu,\"adc_sample_count\":%lu,\"adc_dma_overruns\":%lu,\"adc_saturation_count\":%lu,\"auto\":%u,\"online\":%u,\"device_state\":%u,\"same_cluster\":%u,\"controllable\":%u,\"auth_match\":%u,\"cluster_name\":\"%s\",\"name\":\"%s\",\"cloud_cluster_id\":\"%s\",\"cloud_device_id\":\"%s\",\"cloud_key_id\":\"%s\"}",
                        (used > (size_t)20U) ? "," : "",
                        (unsigned long)nodes[index].node_id,
                        (unsigned long)nodes[index].ip_addr,
@@ -1691,6 +1698,16 @@ static void http_service_format_cluster_nodes_json(char *buffer, size_t buffer_s
                        (unsigned long)nodes[index].load_score,
                        (unsigned long)nodes[index].relay_mask,
                        (unsigned long)nodes[index].enabled_mask,
+                       (unsigned long)nodes[index].scheduler_enabled_mask,
+                       (unsigned long)nodes[index].scheduler_pause_mask,
+                       (unsigned long)nodes[index].scheduler_pause_blocks_mask,
+                       (unsigned long)nodes[index].protection_enabled_mask,
+                       (unsigned long)nodes[index].protection_tripped_mask,
+                       (unsigned long)nodes[index].protection_fault_lock_mask,
+                       (unsigned long)nodes[index].protection_ct_valid_mask,
+                       (unsigned long)nodes[index].protection_learning_mask,
+                       (unsigned long)nodes[index].protection_strategy_lsb_mask,
+                       (unsigned long)nodes[index].protection_strategy_msb_mask,
                        (unsigned int)nodes[index].adc_valid,
                        (unsigned int)nodes[index].adc_ct_valid,
                        (unsigned int)nodes[index].adc_signal_present,
@@ -1878,6 +1895,126 @@ static void http_service_format_relay_config_json(char *buffer, size_t buffer_si
   http_service_uart_write(log_message);
 }
 
+static void http_service_format_relay_config_compact_json(char *buffer, size_t buffer_size)
+{
+  const device_config_t *config = device_config_get();
+  size_t used;
+  uint32_t index;
+  char relay_name_json[(DEVICE_CONFIG_NAME_MAX_LEN * 2U) + 8U];
+
+  used = (size_t)snprintf(buffer, buffer_size,
+                          "{\"ok\":true,\"compact\":\"relays-v1\",\"relays\":[");
+  if (used >= buffer_size)
+  {
+    return;
+  }
+
+  for (index = 0U; index < DEVICE_CONFIG_RELAY_COUNT; ++index)
+  {
+    int written;
+    http_service_json_escape_copy(relay_name_json,
+                                  sizeof(relay_name_json),
+                                  config->relay[index].name,
+                                  sizeof(config->relay[index].name));
+    written = snprintf(buffer + used,
+                       buffer_size - used,
+                       "%s[%lu,\"%s\",%u,%u,%u,%u,%u,%u,%lu,%lu,%lu]",
+                       (index > 0U) ? "," : "",
+                       (unsigned long)(index + 1U),
+                       relay_name_json,
+                       (unsigned int)config->relay[index].enabled,
+                       (unsigned int)config->relay[index].remember_state,
+                       (unsigned int)config->relay[index].boot_default_on,
+                       (unsigned int)config->current[index].adc_channel,
+                       (unsigned int)config->current[index].protection_enabled,
+                       (unsigned int)config->current[index].device_strategy,
+                       (unsigned long)config->current[index].overcurrent_milliamps,
+                       (unsigned long)config->current[index].trip_delay_ms,
+                       (unsigned long)config->current[index].reset_hysteresis_milliamps);
+    if ((written < 0) || ((size_t)written >= (buffer_size - used)))
+    {
+      break;
+    }
+    used += (size_t)written;
+  }
+
+  if (used < buffer_size)
+  {
+    (void)snprintf(buffer + used, buffer_size - used, "]}");
+  }
+}
+
+static void http_service_format_protection_compact_json(char *buffer, size_t buffer_size)
+{
+  relay_protection_global_summary_t gs;
+  size_t pos;
+  uint8_t ch;
+
+  relay_protection_get_global_summary(&gs);
+  pos = (size_t)snprintf(buffer,
+                         buffer_size,
+                         "{\"ok\":true,\"compact\":\"protection-v1\","
+                         "\"boot_safety_active\":%u,\"boot_delay_until_ms\":%lu,"
+                         "\"restart_count\":%lu,\"fault_locked_any\":%u,"
+                         "\"fault_lock_mask\":%lu,\"channels\":[",
+                         (unsigned int)gs.boot_safety_active,
+                         (unsigned long)gs.boot_delay_until_ms,
+                         (unsigned long)gs.restart_count,
+                         (unsigned int)gs.fault_locked_any,
+                         (unsigned long)relay_protection_fault_lock_mask());
+  if (pos >= buffer_size)
+  {
+    return;
+  }
+
+  for (ch = 0U; ch < RELAY_PROTECTION_CHANNEL_COUNT; ++ch)
+  {
+    relay_protection_summary_t ps;
+    int written;
+
+    (void)relay_protection_get_summary((uint8_t)(ch + 1U), &ps);
+    written = snprintf(buffer + pos,
+                       buffer_size - pos,
+                       "%s[%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%lu,%u]",
+                       (ch == 0U) ? "" : ",",
+                       (unsigned int)(ch + 1U),
+                       (unsigned int)ps.phase,
+                       (unsigned int)ps.fault_level,
+                       (unsigned int)ps.fault_reason,
+                       (unsigned int)ps.learning_complete,
+                       (unsigned int)ps.protection_enabled,
+                       (unsigned int)ps.tripped,
+                       (unsigned int)ps.fault_locked,
+                       (unsigned long)ps.current_milliamps,
+                       (unsigned long)ps.current_reference_ma,
+                       (unsigned long)ps.initial_health_baseline_ma,
+                       (unsigned long)ps.aging_offset_ma,
+                       (unsigned long)ps.normal_low_ma,
+                       (unsigned long)ps.normal_high_ma,
+                       (unsigned long)ps.startup_peak_ma,
+                       (unsigned long)ps.startup_duration_ms,
+                       (unsigned long)ps.trip_count,
+                       (unsigned long)ps.cooldown_until_ms,
+                       (unsigned int)ps.learning_samples_collected,
+                       (unsigned int)ps.ct_valid,
+                       (unsigned int)ps.ct_degraded,
+                       (unsigned int)ps.adc_saturated,
+                       (unsigned int)ps.device_strategy,
+                       (unsigned long)ps.off_since_ms,
+                       (unsigned int)ps.stuck_check_pending);
+    if ((written < 0) || ((size_t)written >= (buffer_size - pos)))
+    {
+      break;
+    }
+    pos += (size_t)written;
+  }
+
+  if (pos < buffer_size)
+  {
+    (void)snprintf(buffer + pos, buffer_size - pos, "]}");
+  }
+}
+
 static void http_service_apply_command(control_proto_command_t *command, char *buffer, size_t buffer_size)
 {
   if ((command == NULL) || (buffer == NULL))
@@ -1933,7 +2070,7 @@ static uint8_t http_service_build_cluster_node_proxy_path(const char *suffix,
 
   if (strcmp(suffix, "/config/relays") == 0)
   {
-    (void)snprintf(remote_path, remote_path_size, "/api/config/relays");
+    (void)snprintf(remote_path, remote_path_size, "/api/config/relays-compact");
     return (strcmp(method, "GET") == 0) ? 1U : 0U;
   }
   if (strcmp(suffix, "/config/relay") == 0)
@@ -1943,7 +2080,7 @@ static uint8_t http_service_build_cluster_node_proxy_path(const char *suffix,
   }
   if (strcmp(suffix, "/protection") == 0)
   {
-    (void)snprintf(remote_path, remote_path_size, "/api/protection");
+    (void)snprintf(remote_path, remote_path_size, "/api/protection-compact");
     return (strcmp(method, "GET") == 0) ? 1U : 0U;
   }
   if (strcmp(suffix, "/config/protection") == 0)
@@ -2202,6 +2339,17 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
       strlen(response_body));
   }
 
+  if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/config/relays-compact") == 0))
+  {
+    if (!authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    http_service_format_relay_config_compact_json(response_body, response_body_size);
+    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
+  }
+
   if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/scheduler/summary") == 0))
   {
     size_t pos;
@@ -2417,6 +2565,17 @@ __attribute__((noinline)) static err_t http_service_handle_request(http_service_
     (void)snprintf(response_body + pos, response_body_size - pos, "]}");
     return http_service_send_payload_streaming(connection, "200 OK", "application/json",
       (const unsigned char *)response_body, strlen(response_body));
+  }
+
+  if ((strcmp(method, "GET") == 0) && (strcmp(path, "/api/protection-compact") == 0))
+  {
+    if (!authenticated)
+    {
+      http_service_format_error_json(response_body, response_body_size, "unauthorized");
+      return http_service_send_payload(connection, "401 Unauthorized", "application/json", response_body);
+    }
+    http_service_format_protection_compact_json(response_body, response_body_size);
+    return http_service_send_payload(connection, "200 OK", "application/json", response_body);
   }
 
   if ((strcmp(method, "POST") == 0) && (strcmp(path, "/api/protection/force-stop") == 0))

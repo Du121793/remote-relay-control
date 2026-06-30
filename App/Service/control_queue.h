@@ -34,6 +34,7 @@ typedef struct
 #define CONTROL_QUEUE_RELAY_CONFIG_THRESHOLD_PRESENT  0x40U
 #define CONTROL_QUEUE_RELAY_CONFIG_DELAY_PRESENT      0x80U
 #define CONTROL_QUEUE_RELAY_CONFIG_HYSTERESIS_PRESENT 0x100U
+#define CONTROL_QUEUE_RELAY_CONFIG_STRATEGY_PRESENT   0x200U
 #define CONTROL_QUEUE_REQUEST_ID_MAX_LEN               64U
 #define CONTROL_QUEUE_REMOTE_HTTP_METHOD_MAX_LEN        8U
 #define CONTROL_QUEUE_REMOTE_HTTP_PATH_MAX_LEN          160U
@@ -47,6 +48,7 @@ typedef struct
   uint8_t boot_default_on;
   uint8_t adc_channel;
   uint8_t protection_enabled;
+  uint8_t device_strategy;
   uint16_t fields;
   uint32_t overcurrent_milliamps;
   uint32_t trip_delay_ms;

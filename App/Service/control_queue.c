@@ -27,10 +27,8 @@ extern RNG_HandleTypeDef hrng;
 
 typedef struct
 {
-  char backend_host[DEVICE_CONFIG_BACKEND_HOST_MAX_LEN];
-  uint16_t backend_port;
   uint8_t cloud_enabled;
-  uint8_t cloud_transport;
+  uint8_t reserved0;
   char cloud_broker_host[DEVICE_CONFIG_CLOUD_HOST_MAX_LEN];
   uint16_t cloud_broker_port;
   uint16_t reserved;
@@ -67,6 +65,8 @@ typedef struct
   volatile uint8_t state;
   volatile uint8_t ok;
   uint32_t request_id;
+  uint32_t started_ms;
+  uint32_t done_ms;
 } control_queue_remote_http_slot_t;
 
 typedef struct
@@ -75,7 +75,6 @@ typedef struct
   char login_response[512];
   char config_request[1792];
   char config_response[13312];
-  char encoded_host[(DEVICE_CONFIG_BACKEND_HOST_MAX_LEN * 3U) + 1U];
   char encoded_cloud_host[(DEVICE_CONFIG_CLOUD_HOST_MAX_LEN * 3U) + 1U];
   char encoded_cloud_cluster_id[(DEVICE_CONFIG_CLOUD_ID_MAX_LEN * 3U) + 1U];
   char encoded_cloud_cluster_ca_fingerprint[(DEVICE_CONFIG_CLOUD_FINGERPRINT_MAX_LEN * 3U) + 1U];
@@ -103,6 +102,8 @@ typedef struct
 #define CONTROL_QUEUE_REMOTE_HTTP_RUNNING   3U
 #define CONTROL_QUEUE_REMOTE_HTTP_DONE      4U
 #define CONTROL_QUEUE_REMOTE_HTTP_SLOTS     4U
+#define CONTROL_QUEUE_REMOTE_HTTP_DONE_TTL_MS 5000UL
+#define CONTROL_QUEUE_REMOTE_HTTP_PENDING_TTL_MS 5000UL
 #define CONTROL_QUEUE_REMOTE_COALESCE_SLOTS 16U
 
 static control_queue_stats_t g_control_queue_stats;
@@ -152,10 +153,52 @@ static int32_t control_queue_remote_http_find_slot_by_id(uint32_t request_id)
   return -1;
 }
 
+static void control_queue_remote_http_clear_slot(control_queue_remote_http_slot_t *slot)
+{
+  if (slot == NULL)
+  {
+    return;
+  }
+  memset(&slot->request, 0, sizeof(slot->request));
+  slot->request_id = 0U;
+  slot->started_ms = 0U;
+  slot->done_ms = 0U;
+  slot->ok = 0U;
+  slot->state = CONTROL_QUEUE_REMOTE_HTTP_IDLE;
+}
+
+static void control_queue_remote_http_collect_stale_locked(uint32_t now_ms)
+{
+  uint32_t index;
+
+  for (index = 0U; index < CONTROL_QUEUE_REMOTE_HTTP_SLOTS; ++index)
+  {
+    control_queue_remote_http_slot_t *slot =
+      &g_control_queue_remote_http_slots[index];
+
+    if ((slot->state == CONTROL_QUEUE_REMOTE_HTTP_DONE) &&
+        (slot->done_ms != 0U) &&
+        ((int32_t)(now_ms - slot->done_ms) >=
+         (int32_t)CONTROL_QUEUE_REMOTE_HTTP_DONE_TTL_MS))
+    {
+      control_queue_remote_http_clear_slot(slot);
+    }
+    else if (((slot->state == CONTROL_QUEUE_REMOTE_HTTP_PREPARING) ||
+              (slot->state == CONTROL_QUEUE_REMOTE_HTTP_PENDING)) &&
+             (slot->started_ms != 0U) &&
+             ((int32_t)(now_ms - slot->started_ms) >=
+              (int32_t)CONTROL_QUEUE_REMOTE_HTTP_PENDING_TTL_MS))
+    {
+      control_queue_remote_http_clear_slot(slot);
+    }
+  }
+}
+
 static int32_t control_queue_remote_http_find_free_slot(void)
 {
   uint32_t index;
 
+  control_queue_remote_http_collect_stale_locked(HAL_GetTick());
   for (index = 0U; index < CONTROL_QUEUE_REMOTE_HTTP_SLOTS; ++index)
   {
     if (g_control_queue_remote_http_slots[index].state == CONTROL_QUEUE_REMOTE_HTTP_IDLE)
@@ -171,6 +214,7 @@ static int32_t control_queue_remote_http_select_pending_slot(void)
 {
   uint32_t index;
 
+  control_queue_remote_http_collect_stale_locked(HAL_GetTick());
   for (index = 0U; index < CONTROL_QUEUE_REMOTE_HTTP_SLOTS; ++index)
   {
     if ((g_control_queue_remote_http_slots[index].state == CONTROL_QUEUE_REMOTE_HTTP_RUNNING) ||
@@ -724,9 +768,6 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_sync_remote_bac
     return HAL_ERROR;
   }
 
-  control_queue_url_encode(config->backend_host,
-                           workspace->encoded_host,
-                           sizeof(workspace->encoded_host));
   control_queue_url_encode(config->cloud_broker_host,
                            workspace->encoded_cloud_host,
                            sizeof(workspace->encoded_cloud_host));
@@ -740,15 +781,11 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_sync_remote_bac
                            workspace->encoded_cloud_cluster_binding_secret,
                            sizeof(workspace->encoded_cloud_cluster_binding_secret));
   (void)snprintf(workspace->body, sizeof(workspace->body),
-                 "backend_host=%s&backend_port=%u"
-                 "&cloud_enabled=%u&cloud_transport=%u"
+                 "cloud_enabled=%u"
                  "&cloud_broker_host=%s&cloud_broker_port=%u"
                  "&cloud_cluster_id=%s&cloud_cluster_ca_fingerprint=%s"
                  "&cloud_cluster_binding_secret=%s&cloud_cluster_sync_only=1",
-                 workspace->encoded_host,
-                 (unsigned int)config->backend_port,
                  (unsigned int)config->cloud_enabled,
-                 (unsigned int)config->cloud_transport,
                  workspace->encoded_cloud_host,
                  (unsigned int)config->cloud_broker_port,
                  workspace->encoded_cloud_cluster_id,
@@ -872,6 +909,14 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_local_rel
       return HAL_ERROR;
     }
     current->protection_enabled = relay_config->protection_enabled;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_STRATEGY_PRESENT) != 0U)
+  {
+    if (relay_config->device_strategy > RELAY_PROTECTION_STRATEGY_MANUAL)
+    {
+      return HAL_ERROR;
+    }
+    current->device_strategy = relay_config->device_strategy;
   }
   if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_THRESHOLD_PRESENT) != 0U)
   {
@@ -1031,6 +1076,17 @@ __attribute__((noinline)) static HAL_StatusTypeDef control_queue_apply_remote_re
     written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
                        "&protection_enabled=%u",
                        (unsigned int)relay_config->protection_enabled);
+    if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
+    {
+      return HAL_ERROR;
+    }
+    used += (size_t)written;
+  }
+  if ((relay_config->fields & CONTROL_QUEUE_RELAY_CONFIG_STRATEGY_PRESENT) != 0U)
+  {
+    written = snprintf(workspace->body + used, sizeof(workspace->body) - used,
+                       "&device_strategy=%u",
+                       (unsigned int)relay_config->device_strategy);
     if ((written <= 0) || ((size_t)written >= (sizeof(workspace->body) - used)))
     {
       return HAL_ERROR;
@@ -1806,6 +1862,7 @@ static void control_queue_worker_task(void const *argument)
 
         taskENTER_CRITICAL();
         slot->ok = (remote_http_status == HAL_OK) ? 1U : 0U;
+        slot->done_ms = HAL_GetTick();
         slot->state = CONTROL_QUEUE_REMOTE_HTTP_DONE;
         taskEXIT_CRITICAL();
 
@@ -2224,6 +2281,8 @@ HAL_StatusTypeDef control_queue_submit_remote_http_async(
     new_request_id = g_control_queue_remote_http_next_request_id++;
   }
   g_control_queue_remote_http_slots[(uint32_t)slot_index].request_id = new_request_id;
+  g_control_queue_remote_http_slots[(uint32_t)slot_index].started_ms = HAL_GetTick();
+  g_control_queue_remote_http_slots[(uint32_t)slot_index].done_ms = 0U;
   taskEXIT_CRITICAL();
 
   slot = &g_control_queue_remote_http_slots[(uint32_t)slot_index];
@@ -2246,6 +2305,7 @@ HAL_StatusTypeDef control_queue_submit_remote_http_async(
   taskENTER_CRITICAL();
   slot->ok = 0U;
   slot->state = CONTROL_QUEUE_REMOTE_HTTP_PENDING;
+  slot->done_ms = 0U;
   taskEXIT_CRITICAL();
 
   control_queue_remote_http_kick_worker();
@@ -2272,6 +2332,7 @@ HAL_StatusTypeDef control_queue_get_remote_http_result(
   }
 
   taskENTER_CRITICAL();
+  control_queue_remote_http_collect_stale_locked(HAL_GetTick());
   slot_index = control_queue_remote_http_find_slot_by_id(request_id);
   if (slot_index < 0)
   {
@@ -2297,10 +2358,7 @@ HAL_StatusTypeDef control_queue_get_remote_http_result(
   *remote_ok = ok;
 
   taskENTER_CRITICAL();
-  memset(&slot->request, 0, sizeof(slot->request));
-  slot->request_id = 0U;
-  slot->ok = 0U;
-  slot->state = CONTROL_QUEUE_REMOTE_HTTP_IDLE;
+  control_queue_remote_http_clear_slot(slot);
   taskEXIT_CRITICAL();
   control_queue_remote_http_kick_worker();
   return HAL_OK;
@@ -2392,12 +2450,7 @@ HAL_StatusTypeDef control_queue_submit_backend_sync_async(uint32_t ip_addr,
   request.kind = CONTROL_QUEUE_REQ_BACKEND_SYNC;
   request.remote_ip_addr = ip_addr;
   memset(&g_control_queue_backend_sync_request, 0, sizeof(g_control_queue_backend_sync_request));
-  strncpy(g_control_queue_backend_sync_request.backend_host,
-          config->backend_host,
-          sizeof(g_control_queue_backend_sync_request.backend_host) - 1U);
-  g_control_queue_backend_sync_request.backend_port = config->backend_port;
   g_control_queue_backend_sync_request.cloud_enabled = config->cloud_enabled;
-  g_control_queue_backend_sync_request.cloud_transport = config->cloud_transport;
   strncpy(g_control_queue_backend_sync_request.cloud_broker_host,
           config->cloud_broker_host,
           sizeof(g_control_queue_backend_sync_request.cloud_broker_host) - 1U);

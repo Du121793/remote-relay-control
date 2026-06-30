@@ -1,65 +1,137 @@
-# 後端管理頁設計
+# 後端管理台版面說明
 
-## 1. 目標
+`tools/backend-test/dashboard.html` 是後端管理台的參考版面。它不是最終 React 版，但必須保留完整的管理流程與可讀性。
 
-`tools/backend-test/dashboard.html` 是之後搬到 React 的功能基準，不追求最終 UI，但必須具備可用的核心流程。
+## 設計目標
 
-## 2. 必要功能
+- 讓管理者能直接操作多群組、多節點。
+- Relay、保護、排程器的功能分區要和 MCU Web 一致。
+- 後端獨有功能可以保留，但不要把 MCU 不需要的資訊硬塞到一般使用者視角。
+- 所有寫入操作要有等待狀態，不要只顯示「已送出」。
+- 手機版要能用，不能讓按鈕、卡片或表格互相覆蓋。
 
-- 後端登入：測試版固定 `admin123 / admin123`。
-- 多叢集選擇：可以篩選 cloud cluster。
-- 裝置認領：輸入 Cloud Device ID / Node ID 建立或認領 device。
-- 叢集總覽：顯示每個 cluster 的線上狀態與裝置數。
-- 節點平鋪：進入 cluster 後應平鋪每台 MCU，不使用單一下拉選單隱藏 Member。
-- Relay 控制：每台 MCU 顯示 16 路 relay card。
-- 設定能力：能設定 relay、排程、保護；MCU 本機登入密碼不應由後端修改。
+## 頁面結構
 
-## 3. 後端 API 原則
+### 1. 總覽
 
-- 管理頁 API 必須經過後端 session。
-- `/api/provision` 必須保持公開給 MCU 使用，但 device 必須已認領。
-- dashboard 使用的 API 必須全部存在；目前已補 `/api/events` 作為 `/events` 的相容路由。
-- 後端不直接連 Member MCU；應透過 Master 或 broker 轉發。
+顯示：
 
-## 4. Relay UI 原則
+- 線上節點數
+- Broker client 數量
+- 雲端設備數
+- 雲端群組數
+- API 金鑰數量
+- 最近事件
 
-- relay card 按下控制後立即進入 pending 灰色狀態。
-- 等待 ack / 狀態刷新後再解除 pending。
-- 強制停止不應被一般控制 pending 凍結。
-- Member 不應在 UI 中消失；即使只有 Master 連後端，也必須顯示 Master 上報的 known nodes。
+總覽頁只顯示摘要，不顯示原始 JSON。
 
-## 5. API 與資料來源
+### 2. 繼電器
 
-主要資料來源：
+主要內容：
 
-- `/api/summary`
-- `/api/known-nodes`
-- `/api/clients`
-- `/api/cloud/devices`
-- `/api/cloud/clusters`
-- `/api/events`
-- `/api/stream`
+- 節點與群組選擇
+- 16 路 Relay 卡片
+- 單路開 / 關
+- 全部開 / 全部關
+- 強制停止
+- 單路設定
 
-裝置認領：
+Relay 卡片上應保留：
 
-- `POST /api/cloud/claim-node`
+- 名稱
+- 開啟 / 關閉狀態
+- 排程狀態
+- 處理中狀態
 
-Provisioning：
+### 3. 排程器
 
-- `POST /api/provision`
-- `GET /api/cloud/devices/:clusterId/:deviceId/provision`
+主要內容：
 
-## 6. 目前已知限制
+- 節點與通道選擇
+- 排程啟用 / 停用
+- 暫停 / 恢復
+- 7 天排程卡片
+- 單日新增 / 刪除 / 清空
+- 單日複製
+- 整週複製到其他通道
 
-- 測試版 claim 流程仍是輸入式信任，不是正式安全認領。
-- 正式版應改成後端 challenge + MCU signature。
-- 後端頁面仍是單檔 HTML/JS，之後應搬到 React。
+排程器頁面的顯示方式要接近 MCU Web，而不是只用很大的下拉選單。
 
-## 7. 本輪同步規則
+### 4. 保護
 
-- 後端測試版登入預設為 `admin123 / admin123`；若部署端登入失敗，優先檢查部署環境變數 `DASHBOARD_USER`、`DASHBOARD_PASSWORD` 是否覆蓋預設值。
-- `/api/cloud/devices` 與 `/api/cloud/clusters` 回傳前會先從 MQTT broker 的 `/api/clients` 同步線上狀態。
-- 這可避免出現「broker 已連線，但後端裝置列表仍顯示離線」。
-- Broker 只負責轉發命令與回報連線狀態；Dashboard 仍必須平鋪顯示 Master 與 Member，不能只顯示直接連線到後端的 Master。
-- 節點清單只顯示節點、狀態、角色、叢集、IP、Relay、最後上報與操作；ADC/CT 不放在總欄，避免混淆成全域資訊。
-- Member 由 Master 的 MQTT status `nodes` 陣列同步到 broker，再由後端 `/api/known-nodes` 展開。
+主要內容：
+
+- 全域保護參數
+- 每路保護狀態
+- CT 是否就緒
+- 學習狀態
+- 策略狀態
+- 強制停止 / 清除學習 / 切換策略
+
+保護頁面要避免把「CT 未就緒」顯示成 0 mA。
+
+### 5. 節點
+
+主要內容：
+
+- 節點清單
+- 群組
+- 線上狀態
+- Relay mask
+- 最後上報時間
+
+### 6. 雲端
+
+主要內容：
+
+- 認領節點
+- 雲端群組列表
+- 雲端設備列表
+- 指紋重設
+- CA 旋轉
+- 套用線上節點
+
+### 7. 金鑰
+
+主要內容：
+
+- 建立 API 金鑰
+- 啟用 / 停用
+- 刪除
+
+### 8. 事件
+
+主要內容：
+
+- 事件名稱
+- 時間
+- 摘要
+
+不要直接顯示整包 JSON。
+
+## 寫入流程原則
+
+所有會改變 MCU 狀態的動作，都應遵守：
+
+1. UI 先進入處理中狀態。
+2. 後端送出 MQTT command。
+3. 等待 ack 或完成回應。
+4. 成功後再恢復顏色與可操作狀態。
+5. 失敗時顯示明確錯誤，不要假裝成功。
+
+## 低頻快取原則
+
+後端管理台不應該在每次 render 時都重新打同一批 API。
+
+建議策略：
+
+- 總覽資料：SSE 為主，輪詢為輔。
+- Relay / 保護 / 排程器：只查目前選中的節點與通道。
+- 同一份資料使用短 TTL 快取，避免重複送出。
+
+## 版面規範
+
+- 同一排按鈕必須對齊。
+- 卡片要能換行，不可因為字多就爆版。
+- 行動版要改成單欄或雙欄排列。
+- 所有 i icon 都要附上說明文字或 title。

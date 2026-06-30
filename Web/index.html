@@ -244,7 +244,39 @@ function normalizeStatus(s){
 }
 function normalizeProtection(prot){
   const map={};
-  const list=Array.isArray(prot&&prot.channels)?prot.channels:[];
+  const rawList=Array.isArray(prot&&prot.channels)?prot.channels:[];
+  const list=rawList.map(item=>{
+    if(Array.isArray(item)){
+      return{
+        ch:item[0],
+        phase:item[1],
+        fault_level:item[2],
+        fault_reason:item[3],
+        learning_complete:item[4],
+        protection_enabled:item[5],
+        tripped:item[6],
+        fault_locked:item[7],
+        current_ma:item[8],
+        reference_ma:item[9],
+        baseline_ma:item[10],
+        aging_offset_ma:item[11],
+        normal_low_ma:item[12],
+        normal_high_ma:item[13],
+        startup_peak_ma:item[14],
+        startup_duration_ms:item[15],
+        trip_count:item[16],
+        cooldown_until_ms:item[17],
+        learning_samples:item[18],
+        ct_valid:item[19],
+        ct_degraded:item[20],
+        adc_saturated:item[21],
+        device_strategy:item[22],
+        off_since_ms:item[23],
+        stuck_pending:item[24]
+      };
+    }
+    return item;
+  });
   for(const item of list){
     const ch=Number(item.ch||item.channel);
     map[ch]={
@@ -255,7 +287,7 @@ function normalizeProtection(prot){
       faultReason:item.fault_reason||item.fault_type||0,
       faultLevel:Number(item.fault_level||0),
       retryCount:Number(item.retry_count||item.trip_count||0),
-      currentMa:Number(item.current_ma||item.adc_current_ma||0),
+      currentMa:Number(item.current_ma||item.current_milliamps||item.adc_current_ma||item.adc_current_milliamps||0),
       strategy:Number(item.device_strategy||item.strategy||0),
       protectionEnabled:!!item.protection_enabled,
       referenceMa:Number(item.reference_ma||0),
@@ -342,8 +374,24 @@ function cacheRelayConfig(nodeId,cfg){
   const arr=new Array(17);
   const relays=cfg&&cfg.ok&&Array.isArray(cfg.relays)?cfg.relays:[];
   for(const r of relays){
-    const ch=Number(r.channel||0);
-    if(ch>=1&&ch<=16)arr[ch]=r;
+    let item=r;
+    if(Array.isArray(r)){
+      item={
+        channel:r[0],
+        name:r[1],
+        enabled:r[2],
+        remember_state:r[3],
+        boot_default_on:r[4],
+        adc_channel:r[5],
+        protection_enabled:r[6],
+        device_strategy:r[7],
+        overcurrent_milliamps:r[8],
+        trip_delay_ms:r[9],
+        reset_hysteresis_milliamps:r[10]
+      };
+    }
+    const ch=Number(item.channel||item.ch||0);
+    if(ch>=1&&ch<=16)arr[ch]=item;
   }
   RELAY_CFG_BY_NODE[String(nodeId||0)]=arr;
   return arr;
@@ -358,6 +406,21 @@ function relayName(nodeId,ch){
 function relayOptionLabel(nodeId,ch){
   const name=relayName(nodeId,ch);
   return name?(name+' — CH'+ch):('CH'+ch);
+}
+function validNum(v,d,min){
+  const n=Number(v);
+  if(!Number.isFinite(n))return d;
+  if(min!==undefined&&n<min)return d;
+  return n;
+}
+function relayCfgLimit(v){return validNum(v,4500,100);}
+function relayCfgDelay(v){return validNum(v,1000,0);}
+function relayCfgHyst(v,limit){
+  const n=Number(v);
+  return(Number.isFinite(n)&&n>=0&&n<limit)?n:500;
+}
+function protCfgVal(cfg,key,d,min){
+  return validNum(cfg&&cfg[key],d,min);
 }
 
 // ?? IP conversion ??
@@ -413,6 +476,13 @@ function fmtUnix(ts){
   return new Date(n*1000).toLocaleString();
 }
 function closeModal(id){document.getElementById(id).classList.add('hidden');}
+function modalOpen(id){
+  const el=document.getElementById(id);
+  return !!(el&&!el.classList.contains('hidden'));
+}
+function interactionModalOpen(){
+  return modalOpen('relayCfgModal')||modalOpen('pauseModal')||modalOpen('schedulerStatusModal');
+}
 
 // ?? Login ??
 async function doLogin(){
@@ -513,6 +583,7 @@ function updateDeviceClock(){
 
 // ?????? DASHBOARD ??????
 async function loadDashboard(seq){
+  if(interactionModalOpen())return;
   const viewSeq=seq||++VIEW_SEQ;
   const main=document.getElementById('main');
   if(curTab==='dashboard'){
@@ -565,12 +636,13 @@ async function loadDashboard(seq){
     const cfg=relayCfg(myNodeId,ch);
     const name=relayName(myNodeId,ch);
     const locked=!!(protStatus[ch]&&protStatus[ch].locked);
+    const tripped=!!(protStatus[ch]&&protStatus[ch].tripped);
     const forced=!!(protStatus[ch]&&protStatus[ch].forceStop);
     const hasAdc=(cfg.adc_channel!==undefined&&cfg.adc_channel!==255&&cfg.adc_channel>=0)||
       !!(protStatus[ch]&&(protStatus[ch].protectionEnabled||protStatus[ch].currentMa>0));
     const adcMa=hasAdc&&protStatus[ch]?protStatus[ch].currentMa:
       ((liveCfg.adc_current_ma!==undefined&&liveCfg.adc_current_ma!==null)?liveCfg.adc_current_ma:null);
-    h+=relayCardHtml(ch,localMask,name,locked||forced,adcMa,hasAdc,myNodeId,protStatus[ch]||{},localSched[ch]||null);
+    h+=relayCardHtml(ch,localMask,name,locked||tripped||forced,adcMa,hasAdc,myNodeId,protStatus[ch]||{},localSched[ch]||null);
   }
   h+='</div></div></div>';
 
@@ -673,7 +745,8 @@ function setRelayPending(nid,ch,on){
   }
   document.querySelectorAll('[data-relay-key="'+cssEsc(key)+'"]').forEach(b=>{b.disabled=!!on;});
 }
-function relayAdcDisplay(adcMa,hasAdc){
+function relayAdcDisplay(adcMa,hasAdc,prot){
+  if(prot&&prot.ctValid===false)return 'CT 未就緒';
   return(adcMa!==null&&adcMa!==undefined&&!Number.isNaN(Number(adcMa)))?(Number(adcMa)+' mA'):(hasAdc?'讀取中...':'無 ADC');
 }
 function updateRelayCardLive(nodeId,ch,mask,locked,adcMa,prot){
@@ -705,12 +778,13 @@ function updateRelayCardLive(nodeId,ch,mask,locked,adcMa,prot){
     btn.setAttribute('onclick','setRelay('+nodeId+','+ch+','+(on?0:1)+')');
   }
   const hasAdc=card.dataset.hasAdc==='1';
-  const adcDisplay=relayAdcDisplay(adcMa,hasAdc);
+  const adcDisplay=relayAdcDisplay(adcMa,hasAdc,prot);
   const adc=card.querySelector('.radc');
   if(adc)adc.textContent=locked?'鎖定原因：'+protectionReasonText(prot&&prot.faultReason)+'，'+adcDisplay:adcDisplay;
   return false;
 }
 async function refreshDashboardLive(){
+  if(interactionModalOpen())return;
   if(!TOKEN||document.hidden||curTab!=='dashboard'||LIVE_REFRESH_BUSY)return;
   LIVE_REFRESH_BUSY=true;
   try{
@@ -735,7 +809,9 @@ async function refreshDashboardLive(){
         !!(protStatus[ch]&&(protStatus[ch].protectionEnabled||protStatus[ch].currentMa>0));
       const adcMa=hasAdc&&protStatus[ch]?protStatus[ch].currentMa:null;
       const locked=!!(protStatus[ch]&&protStatus[ch].locked);
-      needFull=updateRelayCardLive(_myNodeId,ch,localMask,locked,adcMa,protStatus[ch]||{})||needFull;
+      const tripped=!!(protStatus[ch]&&protStatus[ch].tripped);
+      const forced=!!(protStatus[ch]&&protStatus[ch].forceStop);
+      needFull=updateRelayCardLive(_myNodeId,ch,localMask,locked||tripped||forced,adcMa,protStatus[ch]||{})||needFull;
     }
     const nodes=(clusterNodes&&clusterNodes.nodes)||[];
     const remoteNodes=nodes.filter(node=>Number(node.node_id)!==Number(_myNodeId)&&node.online);
@@ -747,7 +823,7 @@ async function refreshDashboardLive(){
       for(let ch=1;ch<=16;ch++){
         const cfg=relayCfg(node.node_id,ch);
         const rprot=remoteProtStatus[ch]||{};
-        const locked=!!(rprot.locked||rprot.forceStop);
+        const locked=!!(rprot.locked||rprot.tripped||rprot.forceStop);
         const hasAdc=(cfg.adc_channel!==undefined&&cfg.adc_channel!==255&&cfg.adc_channel>=0)||
           !!(rprot.protectionEnabled||rprot.currentMa>0);
         const adcMa=(hasAdc&&rprot.currentMa!==undefined&&rprot.currentMa!==null)?Number(rprot.currentMa):null;
@@ -962,6 +1038,9 @@ async function openRelayCfg(ch,nodeId){
   const ps=pmap[ch]||{};
   const strategy=Number((cfg.device_strategy!==undefined)?cfg.device_strategy:(ps.strategy||0));
   const ctReady=!(ps&&ps.ctValid===false);
+  const cfgLimit=relayCfgLimit(cfg.overcurrent_milliamps);
+  const cfgDelay=relayCfgDelay(cfg.trip_delay_ms);
+  const cfgHyst=relayCfgHyst(cfg.reset_hysteresis_milliamps,cfgLimit);
   document.getElementById('relayCfgTitle').textContent=relayOptionLabel(targetNode,ch)+' 設定';
   document.getElementById('relayCfgBody').innerHTML=
     '<div class="field-label">名稱 '+infoTip('顯示在儀表板與排程器的通道名稱。')+'</div><input id="cfgName" value="'+esc(cfg.name||'')+'">'+
@@ -971,9 +1050,9 @@ async function openRelayCfg(ch,nodeId){
     '<label style="flex:1"><input type="checkbox" id="cfgBoot"'+(cfg.boot_default_on?' checked':'')+'> 開機預設開 '+infoTip('未啟用記憶狀態時，開機預設為 ON。')+'</label></div>'+
     '<label style="margin-top:8px"><input type="checkbox" id="cfgProt" onchange="toggleRelayProtectionFields()"'+(cfg.protection_enabled?' checked':'')+'> 啟用電流保護策略 '+infoTip('開啟後才會使用下方手動門檻、跳脫延遲、回差與保護策略。關閉時只保留設定值，不參與跳脫判斷。')+'</label>'+
     '<div id="cfgProtFields" class="mini-grid" style="margin-top:10px">'+
-    '<div><div class="field-label">過流門檻 (mA) '+infoTip('手動保護門檻；電流高於此值且超過跳脫延遲後，保護會鎖定。')+'</div><input id="cfgLimit" type="number" value="'+(cfg.overcurrent_milliamps||0)+'"></div>'+
-    '<div><div class="field-label">跳脫延遲 (ms) '+infoTip('超過門檻後必須持續多久才判定故障。')+'</div><input id="cfgDelay" type="number" value="'+(cfg.trip_delay_ms||0)+'"></div>'+
-    '<div><div class="field-label">回差 (mA) '+infoTip('解除或判斷恢復時使用的電流回差，必須低於過流門檻。')+'</div><input id="cfgHyst" type="number" value="'+(cfg.reset_hysteresis_milliamps||0)+'"></div>'+
+    '<div><div class="field-label">過流門檻 (mA) '+infoTip('手動保護門檻；電流高於此值且超過跳脫延遲後，保護會鎖定。')+'</div><input id="cfgLimit" type="number" value="'+cfgLimit+'"></div>'+
+    '<div><div class="field-label">跳脫延遲 (ms) '+infoTip('超過門檻後必須持續多久才判定故障。')+'</div><input id="cfgDelay" type="number" value="'+cfgDelay+'"></div>'+
+    '<div><div class="field-label">回差 (mA) '+infoTip('解除或判斷恢復時使用的電流回差，必須低於過流門檻。')+'</div><input id="cfgHyst" type="number" value="'+cfgHyst+'"></div>'+
     '<div><div class="field-label">保護策略 '+infoTip('安全優先與連續優先會使用自動學習模型；手動門檻不做學習，只依照手動門檻、延遲與回差跳脫。')+'</div><select id="cfgStrategy"><option value="0" '+(strategy===0?'selected':'')+'>安全優先</option><option value="1" '+(strategy===1?'selected':'')+'>連續優先</option><option value="2" '+(strategy===2?'selected':'')+'>手動門檻</option></select></div>'+
     '</div>'+
     '<div class="hint" style="margin-top:6px">'+
@@ -992,15 +1071,20 @@ function toggleRelayProtectionFields(){
 }
 
 async function saveRelayCfg(){
+  const protectionEnabled=document.getElementById('cfgProt').checked?1:0;
+  const limit=Number(document.getElementById('cfgLimit').value);
+  const delay=Number(document.getElementById('cfgDelay').value);
+  const hyst=Number(document.getElementById('cfgHyst').value);
   const b={channel:_cfgCh,name:document.getElementById('cfgName').value,
     enabled:document.getElementById('cfgEn').checked?1:0,
     remember_state:document.getElementById('cfgRem').checked?1:0,
     boot_default_on:document.getElementById('cfgBoot').checked?1:0,
-    protection_enabled:document.getElementById('cfgProt').checked?1:0,
-    device_strategy:Number(document.getElementById('cfgStrategy').value)||0,
-    overcurrent_milliamps:Number(document.getElementById('cfgLimit').value)||0,
-    trip_delay_ms:Number(document.getElementById('cfgDelay').value)||0,
-    reset_hysteresis_milliamps:Number(document.getElementById('cfgHyst').value)||0};
+    protection_enabled:protectionEnabled,
+    device_strategy:Number(document.getElementById('cfgStrategy').value)||0};
+  const safeLimit=(Number.isFinite(limit)&&limit>=100)?limit:4500;
+  b.overcurrent_milliamps=safeLimit;
+  b.trip_delay_ms=(Number.isFinite(delay)&&delay>=0)?delay:1000;
+  b.reset_hysteresis_milliamps=(Number.isFinite(hyst)&&hyst>=0&&hyst<safeLimit)?hyst:500;
   const strategy=b.device_strategy;
   let r,sr;
   if(_cfgNodeId&&!sameNodeId(_cfgNodeId,_myNodeId)){
@@ -1399,6 +1483,7 @@ async function loadProtection(){
     else cacheRelayConfig(_myNodeId,await api('/api/config/relays'));
   }catch(e){}
   PROT.status=normalizeProtection(pstatus);PROT.config=pcfg||{};
+  const pc=PROT.config;
 
   let h='<div class="card"><h2>保護</h2>'+
     '<div class="row"><div class="grow"><div class="field-label">節點</div><select id="protNodeSel" onchange="_selNodeId=Number(this.value);loadProtection()">'+
@@ -1406,16 +1491,16 @@ async function loadProtection(){
   for(const n of CLUSTER_NODES){if(!sameNodeId(n.node_id,_myNodeId))h+='<option value="'+n.node_id+'"'+(sameNodeId(_selNodeId,n.node_id)?' selected':'')+'>'+esc(n.name||'Node '+n.node_id)+' ('+fmtIp(n.ip)+')</option>';}
   h+='</select></div></div>'+
     '<div class="mini-grid" style="margin-top:12px">'+
-    '<div><div class="field-label">冷卻時間 '+infoTip('保護觸發後，允許下一次動作前的等待秒數。')+'</div><input id="protCooldown" type="number" value="'+esc(PROT.config.cooldown_seconds??3)+'"></div>'+
-    '<div><div class="field-label">重試延遲 '+infoTip('自動重試前等待秒數。')+'</div><input id="protRetryDelay" type="number" value="'+esc(PROT.config.retry_delay_seconds??30)+'"></div>'+
-    '<div><div class="field-label">最大重試 '+infoTip('超過次數後維持鎖定。')+'</div><input id="protMaxRetry" type="number" value="'+esc(PROT.config.max_retry_count??1)+'"></div>'+
-    '<div><div class="field-label">開機延遲 '+infoTip('開機後延遲進入保護判斷。')+'</div><input id="protBootDelay" type="number" value="'+esc(PROT.config.boot_delay_seconds??5)+'"></div>'+
-    '<div><div class="field-label">學習樣本 '+infoTip('建立正常電流模型所需樣本數；韌體目前保留 1 到 5 筆樣本。')+'</div><input id="protLearningSamples" type="number" min="1" max="5" value="'+esc(PROT.config.learning_samples??5)+'"></div>'+
-    '<div><div class="field-label">老化更新週期 '+infoTip('更新老化模型的間隔，小時。')+'</div><input id="protAgingHours" type="number" value="'+esc(PROT.config.aging_update_hours??24)+'"></div>'+
-    '<div><div class="field-label">老化上限 % '+infoTip('老化補償允許增加的最大百分比。')+'</div><input id="protAgingCap" type="number" value="'+esc(PROT.config.aging_cap_percent??50)+'"></div>'+
-    '<div><div class="field-label">不同路 ON 間隔 ms '+infoTip('不同 relay 由 OFF 變 ON 時，實際輸出至少間隔這個時間，避免多路同時吸合。')+'</div><input id="protRelayOnSpacing" type="number" min="0" value="'+esc(PROT.config.relay_on_spacing_ms??500)+'"></div>'+
-    '<div><div class="field-label">同一路 ON→ON 間隔 ms '+infoTip('同一 relay 重複 ON 指令之間的最小間隔；預設 3000 ms。')+'</div><input id="protSameRelayOnSpacing" type="number" min="0" value="'+esc(PROT.config.same_relay_on_spacing_ms??3000)+'"></div>'+
-    '<div><div class="field-label">卡滯倍率 x10 '+infoTip('卡滯判斷延遲倍率，10 表示 1.0 倍。')+'</div><input id="protStallMul" type="number" value="'+esc(PROT.config.stall_multiplier_x10??20)+'"></div>'+
+    '<div><div class="field-label">冷卻時間 '+infoTip('保護觸發後，允許下一次動作前的等待秒數。')+'</div><input id="protCooldown" type="number" value="'+esc(protCfgVal(pc,'cooldown_seconds',3,0))+'"></div>'+
+    '<div><div class="field-label">重試延遲 '+infoTip('自動重試前等待秒數。')+'</div><input id="protRetryDelay" type="number" value="'+esc(protCfgVal(pc,'retry_delay_seconds',30,0))+'"></div>'+
+    '<div><div class="field-label">最大重試 '+infoTip('超過次數後維持鎖定。')+'</div><input id="protMaxRetry" type="number" value="'+esc(protCfgVal(pc,'max_retry_count',1,0))+'"></div>'+
+    '<div><div class="field-label">開機延遲 '+infoTip('開機後延遲進入保護判斷。')+'</div><input id="protBootDelay" type="number" value="'+esc(protCfgVal(pc,'boot_delay_seconds',5,0))+'"></div>'+
+    '<div><div class="field-label">學習樣本 '+infoTip('建立正常電流模型所需樣本數；韌體目前保留 1 到 5 筆樣本。')+'</div><input id="protLearningSamples" type="number" min="1" max="5" value="'+esc(protCfgVal(pc,'learning_samples',5,1))+'"></div>'+
+    '<div><div class="field-label">老化更新週期 '+infoTip('更新老化模型的間隔，小時。')+'</div><input id="protAgingHours" type="number" value="'+esc(protCfgVal(pc,'aging_update_hours',24,1))+'"></div>'+
+    '<div><div class="field-label">老化上限 % '+infoTip('老化補償允許增加的最大百分比。')+'</div><input id="protAgingCap" type="number" value="'+esc(protCfgVal(pc,'aging_cap_percent',50,0))+'"></div>'+
+    '<div><div class="field-label">不同路 ON 間隔 ms '+infoTip('不同 relay 由 OFF 變 ON 時，實際輸出至少間隔這個時間，避免多路同時吸合。')+'</div><input id="protRelayOnSpacing" type="number" min="0" value="'+esc(protCfgVal(pc,'relay_on_spacing_ms',500,0))+'"></div>'+
+    '<div><div class="field-label">同一路 ON→ON 間隔 ms '+infoTip('同一 relay 重複 ON 指令之間的最小間隔；預設 3000 ms。')+'</div><input id="protSameRelayOnSpacing" type="number" min="0" value="'+esc(protCfgVal(pc,'same_relay_on_spacing_ms',3000,0))+'"></div>'+
+    '<div><div class="field-label">卡滯倍率 x10 '+infoTip('卡滯判斷延遲倍率，10 表示 1.0 倍。')+'</div><input id="protStallMul" type="number" value="'+esc(protCfgVal(pc,'stall_multiplier_x10',20,1))+'"></div>'+
     '</div><div class="row" style="margin-top:12px"><button class="btn btn-pri" onclick="saveProtectionConfig()">保存全域保護設定</button></div></div>';
 
   h+='<div class="card"><h2>16 路保護狀態</h2>'+strategyHintHtml()+'<div class="mobile-card-table" style="overflow-x:auto"><table>'+

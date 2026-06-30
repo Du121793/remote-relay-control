@@ -9,10 +9,8 @@ const MQTT_CONTROL_PORT = Number(process.env.MQTT_CONTROL_PORT || 4301);
 const CLOUD_BROKER_HOST = String(process.env.CLOUD_BROKER_HOST || "mqtt.autocontrol.du1217.club");
 const CLOUD_BROKER_PORT = Number(process.env.CLOUD_BROKER_PORT || 8883);
 const CLOUD_TRANSPORT = 1; /* MQTT only */
-const DUPLICATE_MASTER_GRACE_MS = Number(process.env.DUPLICATE_MASTER_GRACE_MS || 15000);
-const DUPLICATE_MASTER_SCAN_MS = Number(process.env.DUPLICATE_MASTER_SCAN_MS || 2000);
+const KNOWN_NODE_SCAN_MS = Number(process.env.KNOWN_NODE_SCAN_MS || 2000);
 const CLIENT_STALE_MS = Number(process.env.CLIENT_STALE_MS || 12000);
-const PROVISIONING_RESEND_COOLDOWN_MS = Number(process.env.PROVISIONING_RESEND_COOLDOWN_MS || 30000);
 const ALLOW_PRIVATE_KEY_EXPORT = process.env.ALLOW_PRIVATE_KEY_EXPORT === "1";
 const REMOTE_CLUSTER_PASSWORD = process.env.REMOTE_CLUSTER_PASSWORD || "autoControl-cluster";
 const REMOTE_SESSION_CACHE_TTL_MS = 14 * 60 * 1000;
@@ -24,6 +22,14 @@ const LEGACY_BOOTSTRAP_KEY = process.env.BACKEND_KEY || "dev-key";
 const DASHBOARD_USER = process.env.DASHBOARD_USER || "admin123";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "admin123";
 const DASHBOARD_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const REMOTE_DIRECT_HTTP_ENABLED = process.env.REMOTE_DIRECT_HTTP_ENABLED === "1";
+const REMOTE_DIRECT_HTTP_TIMEOUT_MS = Number(process.env.REMOTE_DIRECT_HTTP_TIMEOUT_MS || 1500);
+const REMOTE_QUERY_CACHE_TTL_MS = Number(process.env.REMOTE_QUERY_CACHE_TTL_MS || 3000);
+const REMOTE_QUERY_CACHE_STALE_MS = Number(process.env.REMOTE_QUERY_CACHE_STALE_MS || 15000);
+const REMOTE_QUERY_SCHEDULER_STATUS_TTL_MS = Number(process.env.REMOTE_QUERY_SCHEDULER_STATUS_TTL_MS || 1000);
+const REMOTE_QUERY_SCHEDULER_STATUS_STALE_MS = Number(process.env.REMOTE_QUERY_SCHEDULER_STATUS_STALE_MS || 5000);
+const LIVE_STATE_FRESH_MS = Number(process.env.LIVE_STATE_FRESH_MS || 5000);
+const LIVE_STATE_STALE_MS = Number(process.env.LIVE_STATE_STALE_MS || 15000);
 
 const DEVICE_STATE_TEXT = {
   0: "線上",
@@ -33,6 +39,7 @@ const DEVICE_STATE_TEXT = {
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 app.use((error, _req, res, next) => {
   if (error instanceof SyntaxError && error.status === 400 && "body" in error) {
     pushEvent("http-bad-json", { error: error.message });
@@ -41,9 +48,7 @@ app.use((error, _req, res, next) => {
   return next(error);
 });
 
-const clients = new Map();
 const events = [];
-const duplicateMasterState = new Map();
 const knownNodes = new Map();
 const cloudDevices = new Map();
 const cloudClusters = new Map();
@@ -55,6 +60,8 @@ const relayConfirmDirty = new Set();
 const autoProvisionTimers = new Map();
 const helloProvisionTimers = new Map();
 const dashboardSessions = new Map();
+const remoteQueryInflight = new Map();
+const remoteQueryCache = new Map();
 let keyStore = [];
 let stateBroadcastScheduled = false;
 let cloudRegistrySaveTimer = 0;
@@ -82,6 +89,56 @@ async function mqttPublishCommand(clusterName, topicSuffix, payload) {
     console.error(`[mqtt-publish] Or set MQTT_CONTROL_PORT env var to the correct port`);
   }
   return false;
+}
+
+async function mqttPublishCommandWithAck(clusterName, topicSuffix, payload, timeoutMs = 8000) {
+  const requestId = String(payload?.request_id || makeRequestId());
+  const topic = `cluster/${clusterName}/command/${topicSuffix}`;
+  const responseTopic = `cluster/${clusterName}/ack/${requestId}`;
+  const requestPayload = {
+    ...payload,
+    request_id: requestId,
+  };
+
+  try {
+    const response = await fetch(`${BROKER_CONTROL_URL}/api/request-response`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        requestTopic: topic,
+        responseTopic,
+        payload: requestPayload,
+        timeoutMs,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok || data.ok === false) {
+      return {
+        ok: false,
+        requestId,
+        delivered: Number(data.delivered || 0),
+        error: data.error || `mqtt_ack_http_${response.status}`,
+      };
+    }
+    let ack = null;
+    try {
+      ack = data.payload ? JSON.parse(data.payload) : null;
+    } catch (_error) {
+      ack = null;
+    }
+    return {
+      ok: true,
+      requestId,
+      delivered: Number(data.delivered || 0),
+      ack,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      requestId,
+      error: err.message || "mqtt_ack_failed",
+    };
+  }
 }
 
 function ensureDataDir() {
@@ -134,6 +191,160 @@ function isPublicBackendPath(req) {
     return true;
   }
   return false;
+}
+
+function makeRequestId() {
+  return crypto.randomBytes(8).toString("hex");
+}
+
+function nodeClusterName(nodeInfo) {
+  return String(nodeInfo?.cluster || nodeInfo?.clusterName || nodeInfo?.cloudClusterId || "default").trim() || "default";
+}
+
+function publishNodeCommand(nodeId, topicSuffix, body = {}) {
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) {
+    return { ok: false, status: 404, error: "node_not_found" };
+  }
+  const targetNodeId = Number(body.targetNodeId || body.node_id || nodeId);
+  const payload = {
+    ...body,
+    node_id: targetNodeId,
+    request_id: String(body.request_id || makeRequestId()),
+  };
+  delete payload.targetNodeId;
+  return {
+    ok: true,
+    cluster: nodeClusterName(nodeInfo),
+    nodeInfo,
+    targetNodeId,
+    requestId: payload.request_id,
+    payload,
+    publish: async (options = {}) => {
+      const waitForAck = Boolean(options.waitForAck);
+      if (!waitForAck) {
+        const ok = await mqttPublishCommand(nodeClusterName(nodeInfo), topicSuffix, payload);
+        if (ok) invalidateRemoteQueryCache(targetNodeId);
+        return { ok, queued: ok, completed: false, requestId: payload.request_id, ack: null };
+      }
+      const result = await mqttPublishCommandWithAck(nodeClusterName(nodeInfo), topicSuffix, payload, Number(options.timeoutMs || 8000));
+      if (result.ok) invalidateRemoteQueryCache(targetNodeId);
+      return result;
+    },
+  };
+}
+
+function relayConfigSkeleton() {
+  return Array.from({ length: 16 }, (_, index) => ({
+    channel: index + 1,
+    name: `CH${index + 1}`,
+    enabled: 1,
+    remember_state: 0,
+    boot_default_on: 0,
+    adc_channel: index,
+    protection_enabled: 0,
+    device_strategy: 0,
+    overcurrent_milliamps: 4500,
+    trip_delay_ms: 1000,
+    reset_hysteresis_milliamps: 500,
+    source: "backend-fallback",
+  }));
+}
+
+function protectionSkeleton() {
+  return {
+    ok: true,
+    fallback: true,
+    channels: Array.from({ length: 16 }, (_, index) => ({
+      ch: index + 1,
+      channel: index + 1,
+      fault_level: 0,
+      fault_reason: 0,
+      protection_enabled: 0,
+      ct_valid: 0,
+      current_ma: 0,
+      device_strategy: 0,
+      learning_complete: 0,
+    })),
+  };
+}
+
+function protectionFromLiveState(node) {
+  const enabledMask = Number(node?.protectionEnabledMask || 0) >>> 0;
+  const trippedMask = Number(node?.protectionTrippedMask || 0) >>> 0;
+  const faultMask = Number(node?.protectionFaultLockMask || 0) >>> 0;
+  const ctMask = Number(node?.protectionCtValidMask || 0) >>> 0;
+  const learningMask = Number(node?.protectionLearningMask || 0) >>> 0;
+  const strategyLsbMask = Number(node?.protectionStrategyLsbMask || 0) >>> 0;
+  const strategyMsbMask = Number(node?.protectionStrategyMsbMask || 0) >>> 0;
+  const meta = liveStateMeta(node);
+  return {
+    ok: true,
+    fallback: true,
+    state_cache: true,
+    stale: meta.stateFresh ? false : true,
+    cache_age_ms: meta.cacheAgeMs,
+    fault_lock_mask: faultMask,
+    channels: Array.from({ length: 16 }, (_, index) => {
+      const bit = 1 << index;
+      const enabled = (enabledMask & bit) ? 1 : 0;
+      const tripped = (trippedMask & bit) ? 1 : 0;
+      const locked = ((faultMask >>> index) & 1) ? 1 : 0;
+      const ctValid = (ctMask & bit) ? 1 : 0;
+      const learningComplete = (learningMask & bit) ? 1 : 0;
+      const strategy = ((strategyLsbMask & bit) ? 1 : 0) | ((strategyMsbMask & bit) ? 2 : 0);
+      return {
+        ch: index + 1,
+        channel: index + 1,
+        fault_level: locked ? 3 : (tripped ? 2 : 0),
+        fault_reason: locked ? 8 : (tripped ? 1 : 0),
+        protection_enabled: enabled,
+        tripped,
+        ct_valid: ctValid,
+        current_ma: 0,
+        device_strategy: strategy,
+        learning_complete: learningComplete,
+        fault_locked: locked,
+      };
+    }),
+  };
+}
+
+function schedulerStatusFromLiveState(node, channel) {
+  const ch = Number(channel);
+  const bit = ch >= 1 && ch <= 16 ? (1 << (ch - 1)) : 0;
+  const meta = liveStateMeta(node);
+  return {
+    ok: true,
+    fallback: true,
+    state_cache: true,
+    stale: meta.stateFresh ? false : true,
+    cache_age_ms: meta.cacheAgeMs,
+    channel: ch,
+    schedule_enabled: (Number(node?.schedulerEnabledMask || 0) & bit) ? 1 : 0,
+    pause_active: (Number(node?.schedulerPauseMask || 0) & bit) ? 1 : 0,
+    schedule_pause_until: 0,
+    pause_blocks_auto_trigger: (Number(node?.schedulerPauseBlocksMask || 0) & bit) ? 1 : 0,
+    auto_hold_active: 0,
+    time_valid: 0,
+  };
+}
+
+function protectionConfigDefaults() {
+  return {
+    ok: true,
+    fallback: true,
+    cooldown_seconds: 3,
+    retry_delay_seconds: 30,
+    max_retry_count: 1,
+    boot_delay_seconds: 30,
+    learning_samples: 5,
+    aging_update_hours: 24,
+    aging_cap_percent: 50,
+    relay_on_spacing_ms: 500,
+    same_relay_on_spacing_ms: 3000,
+    stall_multiplier_x10: 20,
+  };
 }
 
 function requireDashboardSession(req, res, next) {
@@ -578,7 +789,7 @@ function resolveProvisioningRecords(client) {
       cloudClusterId: clusterId,
       cloudDeviceId: deviceId,
       cloudKeyId: String(client?.cloudKeyId || "").trim(),
-      cloudTransport: Number(client?.cloudTransport || 0),
+      cloudTransport: Number(client?.cloudTransport || CLOUD_TRANSPORT),
       backendKey: client?.backendKey || "",
       lastSeenAt: nowIso(),
     });
@@ -586,49 +797,6 @@ function resolveProvisioningRecords(client) {
   }
 
   return { clusterRecord, deviceRecord, deviceId };
-}
-
-function provisioningSignature(clusterRecord, deviceRecord) {
-  return JSON.stringify(buildProvisioningApplyMessage(clusterRecord, deviceRecord));
-}
-
-function maybeSendProvisioningToClient(client) {
-  const { clusterRecord, deviceRecord } = resolveProvisioningRecords(client);
-  let signature;
-  let lastAppliedMs;
-  if (!clusterRecord || !deviceRecord) {
-    return false;
-  }
-  if (!needsProvisioningForClient(client, clusterRecord, deviceRecord)) {
-    client.provisioningSignature = "";
-    client.provisioningSentAt = 0;
-    return false;
-  }
-  signature = provisioningSignature(clusterRecord, deviceRecord);
-  lastAppliedMs = Number(client.provisioningSentAt || 0);
-  if ((client.provisioningSignature === signature) &&
-      ((Date.now() - lastAppliedMs) < PROVISIONING_RESEND_COOLDOWN_MS)) {
-    return false;
-  }
-  if (!sendJson(client, JSON.parse(signature))) {
-    pushEvent("cloud-device-auto-apply-send-failed", {
-      nodeId: Number(client?.nodeId || 0),
-      clusterId: clusterRecord.clusterId,
-      deviceId: deviceRecord.deviceId,
-      keyId: String(deviceRecord.keyId || ""),
-    });
-    return false;
-  }
-  client.provisioningSignature = signature;
-  client.provisioningSentAt = Date.now();
-  pushEvent("cloud-device-auto-applied", {
-    nodeId: Number(client.nodeId || 0),
-    clusterId: clusterRecord.clusterId,
-    deviceId: deviceRecord.deviceId,
-    keyId: String(deviceRecord.keyId || ""),
-    via: "backend_link",
-  });
-  return true;
 }
 
 function scheduleProvisioningForClient(client, delayMs = 6000) {
@@ -651,32 +819,14 @@ function isFingerprintCompatible(expected, reported) {
   return false;
 }
 
-function rejectHello(client, socket, error) {
-  pushEvent("hello-reject", {
-    nodeId: Number(client?.nodeId || 0),
-    device: client?.device || "",
-    cluster: client?.cluster || "",
-    cloudClusterId: client?.cloudClusterId || "",
-    cloudDeviceId: client?.cloudDeviceId || "",
-    cloudKeyId: client?.cloudKeyId || "",
-    error,
-  });
-  sendJson(client, { type: "hello_ack", ok: false, error });
-  socket.end();
-}
-
 async function applyProvisioningToNode(node, clusterRecord, deviceRecord) {
   const nodeId = Number(node.nodeId || 0);
-  const activeClient = findClientByNodeId(nodeId);
   let data;
-
-  if (activeClient && sendJson(activeClient, buildProvisioningApplyMessage(clusterRecord, deviceRecord))) {
-    return { ok: true, via: "backend_link" };
-  }
 
   data = await remoteNodeRequest(
     nodeId,
     "/api/config/cluster",
+    "POST",
     new URLSearchParams(buildProvisioningApplyPayload(clusterRecord, deviceRecord))
   );
   if (!data || data.ok === false) {
@@ -701,69 +851,195 @@ function localClusterKey(backendKey, clusterName) {
   return `${String(backendKey || "").trim()}|${String(clusterName || "").trim()}`;
 }
 
-function isClientStale(client) {
-  const lastMessageMs = Date.parse(client.lastMessageAt || client.connectedAt);
-  if (!Number.isFinite(lastMessageMs)) {
-    return false;
+function remoteQueryCachePolicy(pathText) {
+  const pathValue = String(pathText || "");
+  if (pathValue.includes("/scheduler/status")) {
+    return {
+      ttlMs: REMOTE_QUERY_SCHEDULER_STATUS_TTL_MS,
+      staleMs: REMOTE_QUERY_SCHEDULER_STATUS_STALE_MS,
+    };
   }
-  return (Date.now() - lastMessageMs) >= CLIENT_STALE_MS;
-}
-
-function clientSummary(client) {
   return {
-    id: client.id,
-    nodeId: client.nodeId,
-    device: client.device,
-    cluster: client.cluster,
-    cloudTransport: Number(client.cloudTransport || 0),
-    cloudClusterId: client.cloudClusterId || "",
-    cloudDeviceId: client.cloudDeviceId || "",
-    cloudKeyId: client.cloudKeyId || "",
-    ip: client.ip,
-    connectedAt: client.connectedAt,
-    lastMessageAt: client.lastMessageAt,
-    role: client.role,
-    term: Number(client.term || 0),
-    relayMask: client.relayMask,
-    adcValid: Number(client.adcValid || 0),
-    adcCtValid: Number(client.adcCtValid || 0),
-    adcSignalPresent: Number(client.adcSignalPresent || 0),
-    adcRaw: Number(client.adcRaw || 0),
-    adcMillivolts: Number(client.adcMillivolts || 0),
-    adcMin: Number(client.adcMin || 0),
-    adcMax: Number(client.adcMax || 0),
-    adcAverage: Number(client.adcAverage || 0),
-    adcRawRms: Number(client.adcRawRms || 0),
-    adcRmsMillivolts: Number(client.adcRmsMillivolts || 0),
-    adcCurrentMilliamps: Number(client.adcCurrentMilliamps || 0),
-    adcSampleRateHz: Number(client.adcSampleRateHz || 0),
-    adcWindowSamples: Number(client.adcWindowSamples || 0),
-    adcSampleCount: Number(client.adcSampleCount || 0),
-    adcDmaOverruns: Number(client.adcDmaOverruns || 0),
-    adcSaturationCount: Number(client.adcSaturationCount || 0),
-    session: client.session,
-    key: client.key,
-    stale: isClientStale(client),
-    destroyed: !!client.socket.destroyed,
+    ttlMs: REMOTE_QUERY_CACHE_TTL_MS,
+    staleMs: REMOTE_QUERY_CACHE_STALE_MS,
   };
 }
 
-function sendJson(client, message) {
-  if (!client || !client.socket || client.socket.destroyed || isClientStale(client)) {
-    return false;
+function remoteQueryCacheKey(nodeId, pathText, method) {
+  return `${Number(nodeId) || 0}|${String(method || "GET").toUpperCase()}|${String(pathText || "")}`;
+}
+
+function cloneJson(value) {
+  if (value === undefined) return undefined;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function annotateRemoteQueryCache(data, cacheEntry, stale) {
+  const out = cloneJson(data) || {};
+  out.cached = true;
+  out.stale = stale ? true : false;
+  out.cache_age_ms = Math.max(0, Date.now() - Number(cacheEntry?.storedAt || Date.now()));
+  out.cached_at = cacheEntry?.storedAtIso || "";
+  return out;
+}
+
+function invalidateRemoteQueryCache(nodeId) {
+  const prefix = `${Number(nodeId) || 0}|`;
+  for (const key of Array.from(remoteQueryCache.keys())) {
+    if (key.startsWith(prefix)) remoteQueryCache.delete(key);
   }
-  return client.socket.write(`${JSON.stringify(message)}\n`);
 }
 
-function findClientByNodeId(nodeId) {
-  return Array.from(clients.values())
-    .filter((item) => Number(item.nodeId) === Number(nodeId) && !item.socket.destroyed && !isClientStale(item))
-    .sort((a, b) => Date.parse(b.lastMessageAt) - Date.parse(a.lastMessageAt))[0];
+function cacheRemoteQueryResult(cacheKey, data) {
+  if (!data || typeof data !== "object" || data.error) return;
+  remoteQueryCache.set(cacheKey, {
+    storedAt: Date.now(),
+    storedAtIso: nowIso(),
+    data: cloneJson(data),
+  });
 }
 
-function buildTargetedMessage(base, req) {
-  const targetNodeId = Number(req.body.targetNodeId || req.body.node_id || 0);
-  return targetNodeId > 0 ? { ...base, node_id: targetNodeId } : base;
+async function mqttQueryNode(nodeId, pathText, options = {}) {
+  const nodeInfo = resolveKnownNode(nodeId);
+  const clusterName = nodeClusterName(nodeInfo);
+  const requestId = String(options.requestId || makeRequestId());
+  const requestTopic = `cluster/${clusterName}/query/request`;
+  const responseTopic = `cluster/${clusterName}/query/response/${requestId}`;
+  const method = String(options.method || "GET").toUpperCase();
+  const cacheable = method === "GET" && options.noCache !== true;
+  const cacheKey = remoteQueryCacheKey(nodeId, pathText, method);
+  const cachePolicy = remoteQueryCachePolicy(pathText);
+  const cached = remoteQueryCache.get(cacheKey);
+  const cachedAgeMs = cached ? Date.now() - Number(cached.storedAt || 0) : Number.POSITIVE_INFINITY;
+  let response;
+  let data;
+
+  if (!nodeInfo || !nodeInfo.cluster) {
+    throw new Error("node_not_found");
+  }
+
+  if (cacheable && cached && cachedAgeMs <= cachePolicy.ttlMs) {
+    return annotateRemoteQueryCache(cached.data, cached, false);
+  }
+
+  if (cacheable && remoteQueryInflight.has(cacheKey)) {
+    try {
+      return cloneJson(await remoteQueryInflight.get(cacheKey));
+    } catch (error) {
+      if (cached && cachedAgeMs <= cachePolicy.staleMs) {
+        return annotateRemoteQueryCache(cached.data, cached, true);
+      }
+      throw error;
+    }
+  }
+
+  const doQuery = async () => {
+    let parsed;
+
+    response = await fetch(`${BROKER_CONTROL_URL}/api/request-response`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        requestTopic,
+        responseTopic,
+        timeoutMs: Number(options.timeoutMs || 4000),
+        payload: {
+          request_id: requestId,
+          node_id: Number(nodeId),
+          path: String(pathText || ""),
+          method,
+        },
+      }),
+    });
+    data = await response.json();
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || "broker_query_failed");
+    }
+    try {
+      parsed = expandCompactQueryResponse(JSON.parse(String(data.payload || "")));
+    } catch (_error) {
+      throw new Error("bad_broker_query_response");
+    }
+    if (parsed && parsed.error) {
+      throw new Error(String(parsed.error));
+    }
+    if (cacheable) cacheRemoteQueryResult(cacheKey, parsed);
+    return parsed;
+  };
+
+  if (!cacheable) return doQuery();
+
+  const queryPromise = doQuery();
+  remoteQueryInflight.set(cacheKey, queryPromise);
+  try {
+    return cloneJson(await queryPromise);
+  } catch (error) {
+    if (cached && cachedAgeMs <= cachePolicy.staleMs) {
+      return annotateRemoteQueryCache(cached.data, cached, true);
+    }
+    throw error;
+  } finally {
+    if (remoteQueryInflight.get(cacheKey) === queryPromise) {
+      remoteQueryInflight.delete(cacheKey);
+    }
+  }
+}
+
+function expandCompactQueryResponse(data) {
+  if (!data || typeof data !== "object") return data;
+  if (data.compact === "relays-v1" && Array.isArray(data.relays)) {
+    return {
+      ...data,
+      relays: data.relays.map((row) => ({
+        channel: Number(row[0] || 0),
+        name: String(row[1] || ""),
+        enabled: Number(row[2] || 0),
+        remember_state: Number(row[3] || 0),
+        boot_default_on: Number(row[4] || 0),
+        adc_channel: Number(row[5] || 0),
+        protection_enabled: Number(row[6] || 0),
+        device_strategy: Number(row[7] || 0),
+        overcurrent_milliamps: Number(row[8] || 0),
+        trip_delay_ms: Number(row[9] || 0),
+        reset_hysteresis_milliamps: Number(row[10] || 0),
+      })),
+    };
+  }
+  if (data.compact === "protection-v1" && Array.isArray(data.channels)) {
+    return {
+      ...data,
+      channels: data.channels.map((row) => ({
+        ch: Number(row[0] || 0),
+        channel: Number(row[0] || 0),
+        phase: Number(row[1] || 0),
+        fault_level: Number(row[2] || 0),
+        fault_reason: Number(row[3] || 0),
+        learning_complete: Number(row[4] || 0),
+        protection_enabled: Number(row[5] || 0),
+        tripped: Number(row[6] || 0),
+        fault_locked: Number(row[7] || 0),
+        current_ma: Number(row[8] || 0),
+        current_milliamps: Number(row[8] || 0),
+        reference_ma: Number(row[9] || 0),
+        baseline_ma: Number(row[10] || 0),
+        aging_offset_ma: Number(row[11] || 0),
+        normal_low_ma: Number(row[12] || 0),
+        normal_high_ma: Number(row[13] || 0),
+        startup_peak_ma: Number(row[14] || 0),
+        startup_duration_ms: Number(row[15] || 0),
+        trip_count: Number(row[16] || 0),
+        cooldown_until_ms: Number(row[17] || 0),
+        learning_samples: Number(row[18] || 0),
+        ct_valid: Number(row[19] || 0),
+        ct_degraded: Number(row[20] || 0),
+        adc_saturated: Number(row[21] || 0),
+        device_strategy: Number(row[22] || 0),
+        off_since_active: Number(row[23] || 0),
+        stuck_pending: Number(row[24] || 0),
+      })),
+    };
+  }
+  return data;
 }
 
 function resolveKnownNode(nodeId) {
@@ -788,23 +1064,6 @@ function resolveKnownNode(nodeId) {
 
 function effectiveMasterNodeIdForGroup(backendKey, clusterName) {
   const clusterKey = localClusterKey(backendKey, clusterName);
-  const activeMasters = Array.from(clients.values())
-    .filter((item) =>
-      localClusterKey(item.key, item.cluster) === clusterKey &&
-      !item.socket.destroyed &&
-      !isClientStale(item) &&
-      Number(item.role || 0) === 2)
-    .sort((a, b) => {
-      const termDiff = Number(b.term || 0) - Number(a.term || 0);
-      if (termDiff !== 0) {
-        return termDiff;
-      }
-      return Number(a.nodeId || 0) - Number(b.nodeId || 0);
-    });
-  if (activeMasters.length > 0) {
-    return Number(activeMasters[0].nodeId || 0);
-  }
-
   const knownMasters = Array.from(knownNodes.values())
     .filter((item) =>
       localClusterKey(item.backendKey, item.cluster) === clusterKey &&
@@ -829,6 +1088,8 @@ async function remoteNodeRequest(nodeId, pathText, method, form) {
   let token;
   let response;
   let data;
+  let controller;
+  let timeout;
   /* Backward compat: old calls pass (nodeId, path, form) with 3 args */
   if (typeof method !== 'string' || (method !== 'GET' && method !== 'POST' && method !== 'PUT' && method !== 'PATCH' && method !== 'DELETE')) {
     form = method;
@@ -836,19 +1097,30 @@ async function remoteNodeRequest(nodeId, pathText, method, form) {
   }
   if (!form) form = "";
 
+  if (!REMOTE_DIRECT_HTTP_ENABLED) {
+    throw new Error("direct_http_disabled");
+  }
+
   if (!node || !node.ip) {
     throw new Error("node_offline");
   }
 
   token = await remoteNodeLogin(node);
-  response = await fetch(`http://${node.ip}${pathText}`, {
-    method: method,
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "X-Auth-Token": String(token),
-    },
-    body: form.toString(),
-  });
+  controller = new AbortController();
+  timeout = setTimeout(() => controller.abort(), REMOTE_DIRECT_HTTP_TIMEOUT_MS);
+  try {
+    response = await fetch(`http://${node.ip}${pathText}`, {
+      method: method,
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Auth-Token": String(token),
+      },
+      body: form.toString(),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   data = await readRemoteJson(response);
   if (response.ok && data && data.ok !== false) {
@@ -857,14 +1129,21 @@ async function remoteNodeRequest(nodeId, pathText, method, form) {
   if (data && data.error === "unauthorized") {
     remoteSessionCache.delete(String(Number(node.nodeId || 0)));
     token = await remoteNodeLogin(node);
-    response = await fetch(`http://${node.ip}${pathText}`, {
-      method: method,
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-Auth-Token": String(token),
-      },
-      body: form.toString(),
-    });
+    controller = new AbortController();
+    timeout = setTimeout(() => controller.abort(), REMOTE_DIRECT_HTTP_TIMEOUT_MS);
+    try {
+      response = await fetch(`http://${node.ip}${pathText}`, {
+        method: method,
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "X-Auth-Token": String(token),
+        },
+        body: form.toString(),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
     return readRemoteJson(response);
   }
   return data;
@@ -924,40 +1203,6 @@ function loadCloudRegistry() {
   }
 }
 
-async function remoteNodeGetJson(nodeId, pathText) {
-  const node = resolveKnownNode(nodeId);
-  let token;
-  let response;
-  let data;
-
-  if (!node || !node.ip) {
-    throw new Error("node_offline");
-  }
-
-  token = await remoteNodeLogin(node);
-  response = await fetch(`http://${node.ip}${pathText}`, {
-    headers: {
-      "X-Auth-Token": String(token),
-    },
-  });
-
-  data = await readRemoteJson(response);
-  if (response.ok && data && data.ok !== false) {
-    return data;
-  }
-  if (data && data.error === "unauthorized") {
-    remoteSessionCache.delete(String(Number(node.nodeId || 0)));
-    token = await remoteNodeLogin(node);
-    response = await fetch(`http://${node.ip}${pathText}`, {
-      headers: {
-        "X-Auth-Token": String(token),
-      },
-    });
-    return readRemoteJson(response);
-  }
-  return data;
-}
-
 async function readRemoteJson(response) {
   const text = await response.text();
 
@@ -969,10 +1214,6 @@ async function readRemoteJson(response) {
   } catch (_error) {
     throw new Error(`remote_invalid_json_${response.status}`);
   }
-}
-
-function isMasterClient(client) {
-  return client && (client.role === "master" || Number(client.role) === 2);
 }
 
 function knownNodeKey(key, cluster, nodeId) {
@@ -1016,6 +1257,50 @@ function setKnownNodeRelayMask(nodeId, relayMask) {
   scheduleStateBroadcast();
 }
 
+function liveStateMeta(node) {
+  const lastSeenMs = Date.parse(node?.lastSeenAt || node?.lastUpdatedAt || 0);
+  const ageMs = Number.isFinite(lastSeenMs) ? Math.max(0, Date.now() - lastSeenMs) : Number.POSITIVE_INFINITY;
+  return {
+    cacheAgeMs: Number.isFinite(ageMs) ? ageMs : 0,
+    stateFresh: Number.isFinite(ageMs) && ageMs <= LIVE_STATE_FRESH_MS ? 1 : 0,
+    stateStale: Number.isFinite(ageMs) && ageMs > LIVE_STATE_FRESH_MS && ageMs <= LIVE_STATE_STALE_MS ? 1 : 0,
+    stateExpired: !Number.isFinite(ageMs) || ageMs > LIVE_STATE_STALE_MS ? 1 : 0,
+  };
+}
+
+function brokerClientLiveState(client) {
+  return {
+    relayMask: Number(client.relayMask || 0) >>> 0,
+    schedulerEnabledMask: Number(client.schedulerEnabledMask || 0) >>> 0,
+    schedulerPauseMask: Number(client.schedulerPauseMask || 0) >>> 0,
+    schedulerPauseBlocksMask: Number(client.schedulerPauseBlocksMask || 0) >>> 0,
+    protectionEnabledMask: Number(client.protectionEnabledMask || 0) >>> 0,
+    protectionTrippedMask: Number(client.protectionTrippedMask || 0) >>> 0,
+    protectionFaultLockMask: Number(client.protectionFaultLockMask || 0) >>> 0,
+    protectionCtValidMask: Number(client.protectionCtValidMask || 0) >>> 0,
+    protectionLearningMask: Number(client.protectionLearningMask || 0) >>> 0,
+    protectionStrategyLsbMask: Number(client.protectionStrategyLsbMask || 0) >>> 0,
+    protectionStrategyMsbMask: Number(client.protectionStrategyMsbMask || 0) >>> 0,
+    adcValid: Number(client.adcValid || 0),
+    adcCtValid: Number(client.adcCtValid || 0),
+    adcSignalPresent: Number(client.adcSignalPresent || 0),
+    adcRaw: Number(client.adcRaw || 0),
+    adcMillivolts: Number(client.adcMillivolts || 0),
+    adcMin: Number(client.adcMin || 0),
+    adcMax: Number(client.adcMax || 0),
+    adcAverage: Number(client.adcAverage || 0),
+    adcRawRms: Number(client.adcRawRms || 0),
+    adcRmsMillivolts: Number(client.adcRmsMillivolts || 0),
+    adcCurrentMilliamps: Number(client.adcCurrentMilliamps || 0),
+    adcSampleRateHz: Number(client.adcSampleRateHz || 0),
+    adcWindowSamples: Number(client.adcWindowSamples || 0),
+    adcSampleCount: Number(client.adcSampleCount || 0),
+    adcDmaOverruns: Number(client.adcDmaOverruns || 0),
+    adcSaturationCount: Number(client.adcSaturationCount || 0),
+    liveStateSource: "mqtt-status",
+  };
+}
+
 function syncCloudRegistryFromKnownNode(node) {
   const clusterId = cloudClusterKeyOf(node);
   const reportedDeviceId = String(node?.cloudDeviceId || "").trim();
@@ -1054,7 +1339,7 @@ function syncCloudRegistryFromKnownNode(node) {
     deviceId,
     keyId: effectiveKeyId,
     enabled: existingDevice.enabled !== false,
-    transport: Number(node.cloudTransport || 0),
+    transport: Number(node.cloudTransport || CLOUD_TRANSPORT),
     nodeId: Number(node.nodeId || 0),
     device: node.device || existingDevice.device || "",
     clusterName: node.cluster || existingDevice.clusterName || "",
@@ -1098,7 +1383,7 @@ function syncCloudRegistryFromKnownNode(node) {
     clusterId,
     keyId: String(existingCluster.keyId || "").trim() || effectiveKeyId,
     enabled: existingCluster.enabled !== false,
-    transport: Number(node.cloudTransport || 0),
+    transport: Number(node.cloudTransport || CLOUD_TRANSPORT),
     brokerHost: existingCluster.brokerHost || CLOUD_BROKER_HOST,
     brokerPort: Number(existingCluster.brokerPort || CLOUD_BROKER_PORT),
     backendKey: node.backendKey || existingCluster.backendKey || "",
@@ -1178,38 +1463,22 @@ function queueRelayStateConfirm(nodeId) {
 async function runRelayStateConfirm(nodeId) {
   const key = String(Number(nodeId));
 
-  if (relayConfirmInflight.has(key)) {
-    relayConfirmDirty.add(key);
-    return;
-  }
-
-  relayConfirmInflight.add(key);
+  if (relayConfirmInflight.has(key)) return;
   relayConfirmDirty.delete(key);
-  try {
-    const data = await remoteNodeGetJson(nodeId, "/api/relay");
-    if (data && data.ok) {
-      setKnownNodeRelayMask(nodeId, Number(data.relay_mask || 0));
-    }
-  } catch (_error) {
-  } finally {
-    relayConfirmInflight.delete(key);
-    if (relayConfirmDirty.has(key)) {
-      relayConfirmDirty.delete(key);
-      queueRelayStateConfirm(nodeId);
-    }
-  }
+  relayConfirmInflight.delete(key);
 }
 
 function knownNodeSummary(node) {
   const online = Number(node.online ? 1 : 0);
   const deviceState = online ? Number(node.deviceState || 0) : 0;
   const effectiveMasterNodeId = effectiveMasterNodeIdForGroup(node.backendKey, node.cluster);
+  const meta = liveStateMeta(node);
   return {
     backendKey: node.backendKey,
     cluster: node.cluster,
     nodeId: node.nodeId,
     device: node.device,
-    cloudTransport: Number(node.cloudTransport || 0),
+    cloudTransport: Number(node.cloudTransport || CLOUD_TRANSPORT),
     cloudClusterId: node.cloudClusterId || "",
     cloudDeviceId: node.cloudDeviceId || "",
     cloudKeyId: node.cloudKeyId || "",
@@ -1221,6 +1490,16 @@ function knownNodeSummary(node) {
     deviceState,
     deviceStateText: deviceStateText(deviceState),
     relayMask: node.relayMask >>> 0,
+    schedulerEnabledMask: Number(node.schedulerEnabledMask || 0) >>> 0,
+    schedulerPauseMask: Number(node.schedulerPauseMask || 0) >>> 0,
+    schedulerPauseBlocksMask: Number(node.schedulerPauseBlocksMask || 0) >>> 0,
+    protectionEnabledMask: Number(node.protectionEnabledMask || 0) >>> 0,
+    protectionTrippedMask: Number(node.protectionTrippedMask || 0) >>> 0,
+    protectionFaultLockMask: Number(node.protectionFaultLockMask || 0) >>> 0,
+    protectionCtValidMask: Number(node.protectionCtValidMask || 0) >>> 0,
+    protectionLearningMask: Number(node.protectionLearningMask || 0) >>> 0,
+    protectionStrategyLsbMask: Number(node.protectionStrategyLsbMask || 0) >>> 0,
+    protectionStrategyMsbMask: Number(node.protectionStrategyMsbMask || 0) >>> 0,
     adcValid: Number(node.adcValid || 0),
     adcCtValid: Number(node.adcCtValid || 0),
     adcSignalPresent: Number(node.adcSignalPresent || 0),
@@ -1239,6 +1518,11 @@ function knownNodeSummary(node) {
     adcSaturationCount: Number(node.adcSaturationCount || 0),
     ip: normalizeIp(node.ip),
     lastSeenAt: node.lastSeenAt,
+    cacheAgeMs: meta.cacheAgeMs,
+    stateFresh: meta.stateFresh,
+    stateStale: meta.stateStale,
+    stateExpired: meta.stateExpired,
+    liveStateSource: node.liveStateSource || "",
     sourceMasterNodeId: node.sourceMasterNodeId,
     effectiveMasterNodeId,
   };
@@ -1251,7 +1535,7 @@ function cloudDeviceSummary(record) {
     deviceId: record.deviceId,
     keyId: record.keyId,
     enabled: record.enabled !== false,
-    transport: Number(record.transport || 0),
+    transport: Number(record.transport || CLOUD_TRANSPORT),
     nodeId: Number(record.nodeId || 0),
     device: record.device || "",
     clusterName: record.clusterName || "",
@@ -1276,7 +1560,7 @@ function cloudClusterSummary(record) {
     clusterId: record.clusterId,
     keyId: record.keyId,
     enabled: record.enabled !== false,
-    transport: Number(record.transport || 0),
+    transport: Number(record.transport || CLOUD_TRANSPORT),
     brokerHost: record.brokerHost || "",
     brokerPort: Number(record.brokerPort || 0),
     backendKey: record.backendKey || "",
@@ -1306,10 +1590,7 @@ function buildSummarySnapshot() {
 }
 
 function buildClientsSnapshot() {
-  return {
-    ok: true,
-    clients: Array.from(clients.values()).map(clientSummary),
-  };
+  return lastBrokerClientsSnapshot;
 }
 
 function buildKnownNodesSnapshot() {
@@ -1337,11 +1618,14 @@ function buildCloudDevicesSnapshot() {
   return {
     ok: true,
     devices: Array.from(cloudDevices.values())
+      .filter((item) => item && typeof item === "object")
       .sort((a, b) => {
-        if (a.clusterId !== b.clusterId) {
-          return a.clusterId.localeCompare(b.clusterId);
+        const aClusterId = String(a.clusterId || "");
+        const bClusterId = String(b.clusterId || "");
+        if (aClusterId !== bClusterId) {
+          return aClusterId.localeCompare(bClusterId);
         }
-        return a.deviceId.localeCompare(b.deviceId);
+        return String(a.deviceId || "").localeCompare(String(b.deviceId || ""));
       })
       .map(cloudDeviceSummary),
   };
@@ -1351,6 +1635,7 @@ function buildCloudClustersSnapshot() {
   return {
     ok: true,
     clusters: Array.from(cloudClusters.values())
+      .filter((item) => item && typeof item === "object")
       .sort((a, b) => a.clusterId.localeCompare(b.clusterId))
       .map(cloudClusterSummary),
   };
@@ -1380,11 +1665,13 @@ function broadcastState() {
 
 /* ?? Sync knownNodes from MQTT broker clients ?? */
 let brokerNodesSynced = false;
+let lastBrokerClientsSnapshot = { ok: true, clients: [], source: "broker" };
 async function syncKnownNodesFromBroker() {
   try {
     const response = await fetch(`${BROKER_CONTROL_URL}/api/clients`);
     const data = await response.json();
     if (!data.ok || !Array.isArray(data.clients)) return;
+    lastBrokerClientsSnapshot = { ...data, source: "broker" };
     for (const client of data.clients) {
       if (!client.connected || !client.deviceId) continue;
       const registryKey = `${String(client.clusterId || "default")}|${String(client.deviceId)}`;
@@ -1422,7 +1709,7 @@ async function syncKnownNodesFromBroker() {
           role: Number(client.role || 0),
           deviceState: Number(client.deviceState || 1),
           deviceStateText: deviceStateText(1),
-          relayMask: Number(client.relayMask || 0) >>> 0,
+          ...brokerClientLiveState(client),
           lastSeen: new Date().toISOString(),
           lastSeenAt: new Date().toISOString(),
           lastSeenMs: Date.now(),
@@ -1444,7 +1731,7 @@ async function syncKnownNodesFromBroker() {
         if (client.device && !node.device) node.device = String(client.device);
         if (client.role) node.role = Number(client.role || 0);
         if (client.term) node.term = Number(client.term || 0);
-        if (typeof client.relayMask !== "undefined") node.relayMask = Number(client.relayMask || 0) >>> 0;
+        Object.assign(node, brokerClientLiveState(client));
         if (client.lastStatusAt) node.lastSeenAt = String(client.lastStatusAt);
         syncCloudRegistryFromKnownNode(node);
       }
@@ -1465,6 +1752,16 @@ async function syncKnownNodesFromBroker() {
             term: Number(remote.term || client.term || 0),
             deviceState: Number(remote.device_state || 0),
             relayMask: Number(remote.relay_mask || 0) >>> 0,
+            schedulerEnabledMask: Number(remote.scheduler_enabled_mask || remote.schedulerEnabledMask || 0) >>> 0,
+            schedulerPauseMask: Number(remote.scheduler_pause_mask || remote.schedulerPauseMask || 0) >>> 0,
+            schedulerPauseBlocksMask: Number(remote.scheduler_pause_blocks_mask || remote.schedulerPauseBlocksMask || 0) >>> 0,
+            protectionEnabledMask: Number(remote.protection_enabled_mask || remote.protectionEnabledMask || 0) >>> 0,
+            protectionTrippedMask: Number(remote.protection_tripped_mask || remote.protectionTrippedMask || 0) >>> 0,
+            protectionFaultLockMask: Number(remote.protection_fault_lock_mask || remote.protectionFaultLockMask || 0) >>> 0,
+            protectionCtValidMask: Number(remote.protection_ct_valid_mask || remote.protectionCtValidMask || 0) >>> 0,
+            protectionLearningMask: Number(remote.protection_learning_mask || remote.protectionLearningMask || 0) >>> 0,
+            protectionStrategyLsbMask: Number(remote.protection_strategy_lsb_mask || remote.protectionStrategyLsbMask || 0) >>> 0,
+            protectionStrategyMsbMask: Number(remote.protection_strategy_msb_mask || remote.protectionStrategyMsbMask || 0) >>> 0,
             ip: normalizeIp(remote.ip_text || remote.ip || ""),
             lastSeenAt: client.lastStatusAt || new Date().toISOString(),
             lastSeenMs: Date.now(),
@@ -1490,217 +1787,6 @@ function scheduleStateBroadcast() {
   }, 0);
 }
 
-function updateKnownNodeFromClient(client) {
-  if (!client.key || !client.cluster || !client.nodeId) {
-    return;
-  }
-  upsertKnownNode({
-      backendKey: client.key,
-      cluster: client.cluster,
-      nodeId: Number(client.nodeId),
-      device: client.device || `Node ${client.nodeId}`,
-      cloudTransport: Number(client.cloudTransport || 0),
-      cloudClusterId: client.cloudClusterId || "",
-      cloudDeviceId: client.cloudDeviceId || "",
-      cloudKeyId: client.cloudKeyId || "",
-      cloudClusterCaFingerprint: client.cloudClusterCaFingerprint || "",
-      cloudClusterBindingSecret: client.cloudClusterBindingSecret || "",
-      ip: normalizeIp(client.ip),
-    role: Number(client.role) || 0,
-    term: Number(client.term || 0),
-    online: isClientStale(client) ? 0 : 1,
-    deviceState: isClientStale(client) ? 0 : Number(client.deviceState || 1),
-    relayMask: client.relayMask >>> 0,
-    adcValid: Number(client.adcValid || 0),
-    adcCtValid: Number(client.adcCtValid || 0),
-    adcSignalPresent: Number(client.adcSignalPresent || 0),
-    adcRaw: Number(client.adcRaw || 0),
-    adcMillivolts: Number(client.adcMillivolts || 0),
-    adcMin: Number(client.adcMin || 0),
-    adcMax: Number(client.adcMax || 0),
-    adcAverage: Number(client.adcAverage || 0),
-    adcRawRms: Number(client.adcRawRms || 0),
-    adcRmsMillivolts: Number(client.adcRmsMillivolts || 0),
-    adcCurrentMilliamps: Number(client.adcCurrentMilliamps || 0),
-    adcSampleRateHz: Number(client.adcSampleRateHz || 0),
-    adcWindowSamples: Number(client.adcWindowSamples || 0),
-    adcSampleCount: Number(client.adcSampleCount || 0),
-    adcDmaOverruns: Number(client.adcDmaOverruns || 0),
-    adcSaturationCount: Number(client.adcSaturationCount || 0),
-    lastSeenAt: client.lastMessageAt,
-    sourceMasterNodeId: Number(client.nodeId) || 0,
-  });
-  scheduleStateBroadcast();
-}
-
-function markKnownNodeOfflineForClient(client) {
-  if (!client || !client.key || !client.cluster || !client.nodeId) {
-    return;
-  }
-  upsertKnownNode({
-      backendKey: client.key,
-      cluster: client.cluster,
-      nodeId: Number(client.nodeId),
-      device: client.device || `Node ${client.nodeId}`,
-      cloudTransport: Number(client.cloudTransport || 0),
-      cloudClusterId: client.cloudClusterId || "",
-      cloudDeviceId: client.cloudDeviceId || "",
-      cloudKeyId: client.cloudKeyId || "",
-      ip: normalizeIp(client.ip),
-    role: Number(client.role) || 0,
-    term: Number(client.term || 0),
-    online: 0,
-    deviceState: 0,
-    relayMask: Number(client.relayMask || 0) >>> 0,
-    lastSeenAt: client.lastMessageAt || nowIso(),
-    sourceMasterNodeId: Number(client.nodeId) || 0,
-  });
-  scheduleStateBroadcast();
-}
-
-function applyClusterStatusSnapshot(client, message) {
-  const groupKey = `${client.key}|${message.cluster || client.cluster || ""}`;
-  const seen = new Set();
-  const nodes = Array.isArray(message.nodes) ? message.nodes : [];
-
-  for (const node of nodes) {
-    const nodeId = Number(node.node_id || 0);
-    const entryKey = knownNodeKey(client.key, message.cluster || client.cluster || "", nodeId);
-    const existing = knownNodes.get(entryKey) || {};
-    const cloudClusterId = String(node.cloud_cluster_id || message.cloud_cluster_id || client.cloudClusterId || existing.cloudClusterId || "");
-    const cloudDeviceId = String(node.cloud_device_id || ((nodeId === Number(message.node_id || client.nodeId || 0)) ? (message.cloud_device_id || client.cloudDeviceId || "") : existing.cloudDeviceId || ""));
-    const cloudKeyId = String(node.cloud_key_id || ((nodeId === Number(message.node_id || client.nodeId || 0)) ? (message.cloud_key_id || client.cloudKeyId || "") : existing.cloudKeyId || ""));
-    if (nodeId === 0) {
-      continue;
-    }
-    seen.add(nodeId);
-      upsertKnownNode({
-        backendKey: client.key,
-        cluster: message.cluster || client.cluster || "",
-        nodeId,
-        device: String(node.name || `Node ${nodeId}`),
-        cloudTransport: Number(message.cloud_transport || client.cloudTransport || 0),
-        cloudClusterId,
-        cloudDeviceId,
-        cloudKeyId,
-        ip: String(node.ip || ""),
-      role: Number(node.role || 0),
-      term: Number(node.term || message.term || existing.term || 0),
-      online: Number(node.online ? 1 : 0),
-      deviceState: Number(node.device_state || 0),
-      relayMask: Number(node.relay_mask || 0) >>> 0,
-      adcValid: Number(node.adc_valid || 0),
-      adcCtValid: Number(node.adc_ct_valid || 0),
-      adcSignalPresent: Number(node.adc_signal_present || 0),
-      adcRaw: Number(node.adc_raw || 0),
-      adcMillivolts: Number(node.adc_millivolts || 0),
-      adcMin: Number(node.adc_min || 0),
-      adcMax: Number(node.adc_max || 0),
-      adcAverage: Number(node.adc_average || 0),
-      adcRawRms: Number(node.adc_raw_rms || 0),
-      adcRmsMillivolts: Number(node.adc_rms_millivolts || 0),
-      adcCurrentMilliamps: Number(node.adc_current_milliamps || 0),
-      adcSampleRateHz: Number(node.adc_sample_rate_hz || 0),
-      adcWindowSamples: Number(node.adc_window_samples || 0),
-      adcSampleCount: Number(node.adc_sample_count || 0),
-      adcDmaOverruns: Number(node.adc_dma_overruns || 0),
-      adcSaturationCount: Number(node.adc_saturation_count || 0),
-      lastSeenAt: client.lastMessageAt,
-      sourceMasterNodeId: Number(message.node_id || client.nodeId || 0),
-    });
-  }
-
-  for (const [mapKey, entry] of Array.from(knownNodes.entries())) {
-    if (`${entry.backendKey}|${entry.cluster}` !== groupKey) {
-      continue;
-    }
-    if (entry.sourceMasterNodeId !== Number(message.node_id || client.nodeId || 0)) {
-      continue;
-    }
-    if (!seen.has(entry.nodeId)) {
-      knownNodes.set(mapKey, {
-        ...entry,
-        online: 0,
-        deviceState: 0,
-        lastUpdatedAt: nowIso(),
-      });
-    }
-  }
-  scheduleStateBroadcast();
-}
-
-function scanDuplicateMasters() {
-  const groups = new Map();
-  const now = Date.now();
-
-  for (const client of clients.values()) {
-    if (!client.cluster || !client.key || !isMasterClient(client) || isClientStale(client)) {
-      continue;
-    }
-
-    const groupKey = `${client.key}|${client.cluster}`;
-    const list = groups.get(groupKey) || [];
-    list.push(client);
-    groups.set(groupKey, list);
-  }
-
-  for (const [groupKey, groupClients] of groups.entries()) {
-    if (groupClients.length <= 1) {
-      duplicateMasterState.delete(groupKey);
-      continue;
-    }
-
-    const state = duplicateMasterState.get(groupKey) || {
-      firstSeenMs: now,
-      lastWarnMs: 0,
-    };
-
-    if ((now - state.firstSeenMs) >= DUPLICATE_MASTER_GRACE_MS &&
-        (state.lastWarnMs === 0 || (now - state.lastWarnMs) >= DUPLICATE_MASTER_GRACE_MS)) {
-      pushEvent("duplicate-master-warning", {
-        groupKey,
-        cluster: groupClients[0].cluster,
-        key: groupClients[0].key,
-        nodeIds: groupClients.map((item) => item.nodeId),
-        devices: groupClients.map((item) => item.device),
-      });
-      state.lastWarnMs = now;
-    }
-
-    duplicateMasterState.set(groupKey, state);
-  }
-
-  for (const groupKey of Array.from(duplicateMasterState.keys())) {
-    if (!groups.has(groupKey)) {
-      duplicateMasterState.delete(groupKey);
-    }
-  }
-}
-
-function scanStaleClients() {
-  for (const client of clients.values()) {
-    const stale = isClientStale(client);
-    if (stale) {
-      if (!client.staleWarningIssued) {
-        pushEvent("stale-client-warning", {
-          id: client.id,
-          nodeId: client.nodeId,
-          device: client.device,
-          cluster: client.cluster,
-          key: client.key,
-        });
-        client.staleWarningIssued = true;
-      }
-      if (!client.socket.destroyed) {
-        client.socket.destroy();
-      }
-    } else {
-      client.staleWarningIssued = false;
-    }
-    updateKnownNodeFromClient(client);
-  }
-}
-
 function scanStaleKnownNodes() {
   const nowMs = Date.now();
 
@@ -1723,257 +1809,6 @@ function scanStaleKnownNodes() {
   }
 }
 
-/* Raw TCP server (:42001) has been retired ??MQTT is now the only control transport.
-   The TCP server code block below is preserved for reference but is dead code.
-const _retiredTcpServer = { listen() {} };
-if (false) { const tcpServer = net.createServer((socket) => {
-  const id = `${socket.remoteAddress}:${socket.remotePort}`;
-  const client = {
-      id,
-      socket,
-      buffer: "",
-      nodeId: null,
-      device: null,
-      cluster: null,
-      cloudTransport: 0,
-      cloudClusterId: "",
-      cloudDeviceId: "",
-      cloudKeyId: "",
-      cloudClusterCaFingerprint: "",
-      cloudClusterBindingSecret: "",
-      ip: socket.remoteAddress,
-    term: 0,
-    role: null,
-    relayMask: 0,
-    session: 0,
-    key: null,
-    staleWarningIssued: false,
-    connectedAt: nowIso(),
-    lastMessageAt: nowIso(),
-  };
-
-  clients.set(id, client);
-  pushEvent("tcp-connect", { id });
-
-  socket.on("data", (chunk) => {
-    client.buffer += chunk.toString("utf8");
-    client.lastMessageAt = nowIso();
-
-    while (true) {
-      const lineEnd = client.buffer.indexOf("\n");
-      if (lineEnd < 0) {
-        break;
-      }
-
-      const rawLine = client.buffer.slice(0, lineEnd).trim();
-      client.buffer = client.buffer.slice(lineEnd + 1);
-      if (!rawLine) {
-        continue;
-      }
-
-      let message;
-      try {
-        message = JSON.parse(rawLine);
-      } catch (_error) {
-        pushEvent("parse-error", { id, rawLine });
-        continue;
-      }
-
-      pushEvent("message", { id, message });
-
-      if (message.type === "time_request" && client.key) {
-        const unixTime = Math.floor(Date.now() / 1000);
-        sendJson(client, {
-          type: "time_sync",
-          unix_time: unixTime,
-          source: "backend",
-        });
-        pushEvent("time-sync-response", {
-          nodeId: Number(client.nodeId || 0),
-          unixTime,
-        });
-        continue;
-      }
-
-        if (message.type === "hello") {
-          const previousClient = findClientByNodeId(message.node_id);
-          const keyRecord = findKeyRecordBySecret(message.key);
-
-          client.nodeId = Number(message.node_id) || 0;
-          client.device = message.device || "";
-          client.cluster = message.cluster || "";
-          client.cloudTransport = Number(message.cloud_transport || 0);
-          client.cloudClusterId = message.cloud_cluster_id || "";
-          client.cloudDeviceId = message.cloud_device_id || "";
-          client.cloudKeyId = message.cloud_key_id || "";
-          client.cloudClusterCaFingerprint = message.cloud_cluster_ca_fingerprint || "";
-          client.cloudClusterBindingSecret = message.cloud_cluster_binding_secret || "";
-          client.term = Number(message.term || client.term || 0);
-          client.role = message.master ? 2 : 1;
-          client.session = Number(message.session || 0);
-          client.key = message.key || null;
-
-          if (!client.cloudClusterId || !client.cloudDeviceId || !client.cloudKeyId) {
-            pushEvent("cloud-identity-missing", {
-              nodeId: client.nodeId,
-              device: client.device,
-              cluster: client.cluster,
-              cloudClusterId: client.cloudClusterId || "",
-              cloudDeviceId: client.cloudDeviceId || "",
-              cloudKeyId: client.cloudKeyId || "",
-            });
-          }
-
-        if (previousClient && previousClient.id !== client.id) {
-          pushEvent("replace-client", {
-            oldId: previousClient.id,
-            newId: client.id,
-            nodeId: message.node_id,
-            device: message.device,
-          });
-          previousClient.socket.destroy();
-        }
-
-          if (!keyRecord || !keyRecord.enabled) {
-            rejectHello(client, socket, "bad_key");
-            continue;
-          }
-
-          {
-            const clusterRecord = findCloudClusterRecord(client.cloudClusterId);
-            const deviceRecord = findCloudDeviceRecord(client.cloudClusterId, client.cloudDeviceId);
-            if (client.cloudClusterId && !clusterRecord) {
-              rejectHello(client, socket, "cloud_cluster_not_found");
-              continue;
-            }
-            if (client.cloudClusterId && client.cloudDeviceId && !deviceRecord) {
-              rejectHello(client, socket, "cloud_device_not_found");
-              continue;
-            }
-            if (clusterRecord && clusterRecord.enabled === false) {
-              rejectHello(client, socket, "cluster_disabled");
-              continue;
-            }
-            if (clusterRecord && clusterRecord.caFingerprint && client.cloudClusterCaFingerprint &&
-                !isFingerprintCompatible(clusterRecord.caFingerprint, client.cloudClusterCaFingerprint)) {
-              rejectHello(client, socket, "bad_cloud_cluster_ca_fingerprint");
-              continue;
-            }
-            if (clusterRecord && clusterRecord.bindingSecret && client.cloudClusterBindingSecret && clusterRecord.bindingSecret !== client.cloudClusterBindingSecret) {
-              rejectHello(client, socket, "bad_cloud_cluster_binding_secret");
-              continue;
-            }
-            if (clusterRecord && !deviceRecord && clusterRecord.keyId && client.cloudKeyId &&
-                clusterRecord.keyId !== client.cloudKeyId) {
-              rejectHello(client, socket, "bad_cloud_cluster_key_id");
-              continue;
-            }
-            if (deviceRecord && deviceRecord.enabled === false) {
-              rejectHello(client, socket, "device_disabled");
-              continue;
-            }
-            if (deviceRecord && deviceRecord.keyId && client.cloudKeyId && deviceRecord.keyId !== client.cloudKeyId) {
-              rejectHello(client, socket, "bad_cloud_device_key_id");
-              continue;
-            }
-          }
-
-          keyRecord.lastSeenAt = nowIso();
-        keyRecord.lastNodeId = client.nodeId;
-        keyRecord.lastCluster = client.cluster;
-        keyRecord.lastDevice = client.device;
-        saveKeyStore();
-        pushEvent("hello-ok", {
-          nodeId: client.nodeId,
-          device: client.device,
-          cluster: client.cluster,
-          cloudClusterId: client.cloudClusterId || "",
-          cloudDeviceId: client.cloudDeviceId || "",
-          cloudKeyId: client.cloudKeyId || "",
-        });
-        updateKnownNodeFromClient(client);
-        scheduleProvisioningForClient(client);
-        continue;
-      }
-
-        if (message.type === "status") {
-          client.nodeId = Number(message.node_id) || client.nodeId;
-          client.device = message.device || client.device;
-          client.cluster = message.cluster || client.cluster;
-          client.cloudTransport = Number(message.cloud_transport || client.cloudTransport || 0);
-          client.cloudClusterId = message.cloud_cluster_id || client.cloudClusterId || "";
-          client.cloudDeviceId = message.cloud_device_id || client.cloudDeviceId || "";
-          client.cloudKeyId = message.cloud_key_id || client.cloudKeyId || "";
-          client.cloudClusterCaFingerprint = message.cloud_cluster_ca_fingerprint || client.cloudClusterCaFingerprint || "";
-          client.term = Number(message.term || client.term || 0);
-          client.role = Number(message.role || client.role || 0);
-        client.deviceState = Number(message.device_state || client.deviceState || 1);
-        client.relayMask = Number(message.relay_mask || 0) >>> 0;
-        client.adcValid = Number(message.adc_valid || 0);
-        client.adcCtValid = Number(message.adc_ct_valid || 0);
-        client.adcSignalPresent = Number(message.adc_signal_present || 0);
-        client.adcRaw = Number(message.adc_raw || 0);
-        client.adcMillivolts = Number(message.adc_millivolts || 0);
-        client.adcMin = Number(message.adc_min || 0);
-        client.adcMax = Number(message.adc_max || 0);
-        client.adcAverage = Number(message.adc_average || 0);
-        client.adcRawRms = Number(message.adc_raw_rms || 0);
-        client.adcRmsMillivolts = Number(message.adc_rms_millivolts || 0);
-        client.adcCurrentMilliamps = Number(message.adc_current_milliamps || 0);
-        client.adcSampleRateHz = Number(message.adc_sample_rate_hz || 0);
-        client.adcWindowSamples = Number(message.adc_window_samples || 0);
-        client.adcSampleCount = Number(message.adc_sample_count || 0);
-        client.adcDmaOverruns = Number(message.adc_dma_overruns || 0);
-        client.adcSaturationCount = Number(message.adc_saturation_count || 0);
-        updateKnownNodeFromClient(client);
-        applyClusterStatusSnapshot(client, message);
-        continue;
-      }
-
-      if (message.type === "heartbeat") {
-        client.nodeId = Number(message.node_id) || client.nodeId;
-        client.term = Number(message.term || client.term || 0);
-        client.role = Number(message.role || client.role || 0);
-        updateKnownNodeFromClient(client);
-        continue;
-      }
-
-        if (message.type === "fault_report") {
-          console.error("[backend-test] fault-report", JSON.stringify({
-            nodeId: client.nodeId,
-            device: client.device,
-            cluster: client.cluster,
-            cloudClusterId: client.cloudClusterId || "",
-            cloudDeviceId: client.cloudDeviceId || "",
-            cloudKeyId: client.cloudKeyId || "",
-            fault: message,
-          }));
-          pushEvent("fault-report", {
-            nodeId: client.nodeId,
-            device: client.device,
-            cluster: client.cluster,
-            cloudClusterId: client.cloudClusterId || "",
-            cloudDeviceId: client.cloudDeviceId || "",
-            cloudKeyId: client.cloudKeyId || "",
-            fault: message,
-          });
-        }
-    }
-  });
-
-  socket.on("close", () => {
-    helloProvisionTimers.delete(String(Number(client.nodeId || 0)));
-    markKnownNodeOfflineForClient(client);
-    clients.delete(id);
-    pushEvent("tcp-close", { id });
-  });
-
-  socket.on("error", (error) => {
-    helloProvisionTimers.delete(String(Number(client.nodeId || 0)));
-    markKnownNodeOfflineForClient(client);
-    pushEvent("tcp-error", { id, error: error.message });
-  });
-}); } /* end of retired TCP server block */
 
 const DASHBOARD_PATH = path.join(__dirname, "dashboard.html");
 let _dashboardHtml = null;
@@ -2005,6 +1840,9 @@ app.post("/api/auth/login", (req, res) => {
     `ac_backend_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(DASHBOARD_SESSION_TTL_MS / 1000)}`
   );
   pushEvent("dashboard-login", { username });
+  if (String(req.query.redirect || "") === "1") {
+    return res.redirect(303, "/");
+  }
   return res.json({ ok: true, user: username, expires_in_ms: DASHBOARD_SESSION_TTL_MS });
 });
 
@@ -2056,6 +1894,14 @@ app.get("/api/stream", (req, res) => {
 
 app.get("/api/summary", (_req, res) => {
   res.json(buildSummarySnapshot());
+});
+
+app.get("/api/dashboard/live", async (_req, res) => {
+  await syncKnownNodesFromBroker();
+  res.json({
+    ok: true,
+    ...buildStatePayload(),
+  });
 });
 
 app.get("/api/keys", (_req, res) => {
@@ -2528,17 +2374,11 @@ app.patch("/api/cloud/devices/:clusterId/:deviceId", (req, res) => {
   record.lastUpdatedAt = nowIso();
   cloudDevices.set(record.registryKey, record);
   if (record.enabled === false) {
-    for (const client of Array.from(clients.values())) {
-      if ((client.cloudClusterId || "") === record.clusterId && (client.cloudDeviceId || "") === record.deviceId) {
-        pushEvent("cloud-device-disabled-disconnect", {
-          nodeId: client.nodeId,
-          device: client.device,
-          clusterId: record.clusterId,
-          deviceId: record.deviceId,
-        });
-        client.socket.destroy();
-      }
-    }
+    pushEvent("cloud-device-disabled", {
+      clusterId: record.clusterId,
+      deviceId: record.deviceId,
+      note: "mqtt-broker will reject this device on the next credential check",
+    });
   }
   scheduleCloudRegistrySave();
   scheduleStateBroadcast();
@@ -2606,6 +2446,8 @@ app.post("/api/cloud/devices/from-node", (req, res) => {
     certificateSignature: deviceBundle.certificateSignature,
     firstSeenAt: existing.firstSeenAt || seenAt,
     lastSeenAt: node.lastSeenAt || seenAt,
+    owner: String(req.body.owner || existing.owner || DASHBOARD_USER).trim(),
+    claimedAt: existing.claimedAt || seenAt,
   };
 
   cloudDevices.set(registryKey, record);
@@ -2657,16 +2499,10 @@ app.patch("/api/cloud/clusters/:clusterId", (req, res) => {
   record.lastUpdatedAt = nowIso();
   cloudClusters.set(record.clusterId, record);
   if (record.enabled === false) {
-    for (const client of Array.from(clients.values())) {
-      if ((client.cloudClusterId || "") === record.clusterId) {
-        pushEvent("cloud-cluster-disabled-disconnect", {
-          nodeId: client.nodeId,
-          device: client.device,
-          clusterId: record.clusterId,
-        });
-        client.socket.destroy();
-      }
-    }
+    pushEvent("cloud-cluster-disabled", {
+      clusterId: record.clusterId,
+      note: "mqtt-broker will reject devices in this cluster on the next credential check",
+    });
   }
   scheduleCloudRegistrySave();
   scheduleStateBroadcast();
@@ -2712,20 +2548,23 @@ app.get("/api/config/:nodeId/relays", async (req, res) => {
   const node = resolveKnownNode(nodeId);
   let data;
 
-  if (!node || !node.ip || !node.online) {
-    return res.json({ ok: true, relays: [] });
+  if (!node || !node.online) {
+    return res.json({ ok: true, relays: relayConfigSkeleton(), fallback: true });
   }
 
   try {
-    data = await remoteNodeGetJson(nodeId, "/api/config/relays");
+    data = await mqttQueryNode(nodeId, "/api/config/relays");
     if (!data || !data.ok) {
       return res.status(502).json({ ok: false, error: (data && data.error) || "remote_fetch_failed" });
     }
     return res.json(data);
   } catch (_error) {
-    return res.status(502).json({
-      ok: false,
-      error: _error.message || "remote_fetch_failed",
+    return res.json({
+      ok: true,
+      relays: relayConfigSkeleton(),
+      fallback: true,
+      broker_only: true,
+      error: _error.message || "broker_query_unavailable",
     });
   }
 });
@@ -2733,8 +2572,8 @@ app.get("/api/config/:nodeId/relays", async (req, res) => {
 app.post("/api/config/:nodeId/device-name", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const node = resolveKnownNode(nodeId);
-  const form = new URLSearchParams();
-  let data;
+  const payload = {};
+  const command = publishNodeCommand(nodeId, "config/cluster", payload);
 
   if (!node || !node.ip || !node.online) {
     return res.status(404).json({ ok: false, error: "node_offline" });
@@ -2743,44 +2582,51 @@ app.post("/api/config/:nodeId/device-name", async (req, res) => {
     return res.status(400).json({ ok: false, error: "bad_device_name" });
   }
 
-  form.set("device_name", req.body.device_name.trim());
-  try {
-    data = await remoteNodeRequest(nodeId, "/api/config/cluster", form);
-    if (!data.ok) {
-      return res.status(502).json({ ok: false, error: data.error || "remote_config_failed" });
-    }
-    upsertKnownNode({
-      ...node,
-      device: req.body.device_name.trim(),
-    });
-    return res.json({ ok: true, nodeId, device_name: req.body.device_name.trim() });
-  } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "remote_config_failed" });
+  payload.device_name = req.body.device_name.trim();
+  if (!command.ok) {
+    return res.status(command.status || 400).json({ ok: false, error: command.error || "remote_config_failed" });
   }
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
+  }
+  upsertKnownNode({
+    ...node,
+    device: req.body.device_name.trim(),
+  });
+  return res.json({
+    ok: true,
+    queued: true,
+    completed: true,
+    request_id: command.requestId,
+    nodeId,
+    device_name: req.body.device_name.trim(),
+    ack: publishResult.ack || null,
+  });
 });
 
 app.post("/api/config/:nodeId/relay", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const channel = Number(req.body.channel);
-  const form = new URLSearchParams();
-  let data;
+  const payload = {};
+  let command;
 
   if (!Number.isInteger(channel) || channel < 1 || channel > 16) {
     return res.status(400).json({ ok: false, error: "bad_channel" });
   }
 
-  form.set("channel", String(channel));
+  payload.channel = channel;
   if (typeof req.body.name === "string") {
-    form.set("name", req.body.name);
+    payload.name = req.body.name;
   }
   if (typeof req.body.enabled !== "undefined") {
-    form.set("enabled", Number(req.body.enabled) ? "1" : "0");
+    payload.enabled = Number(req.body.enabled) ? 1 : 0;
   }
   if (typeof req.body.remember_state !== "undefined") {
-    form.set("remember_state", Number(req.body.remember_state) ? "1" : "0");
+    payload.remember_state = Number(req.body.remember_state) ? 1 : 0;
   }
   if (typeof req.body.boot_default_on !== "undefined") {
-    form.set("boot_default_on", Number(req.body.boot_default_on) ? "1" : "0");
+    payload.boot_default_on = Number(req.body.boot_default_on) ? 1 : 0;
   }
   if (typeof req.body.adc_channel !== "undefined") {
     /* Backward compatibility only.  MCU firmware now uses fixed CHn -> ADCn
@@ -2788,14 +2634,14 @@ app.post("/api/config/:nodeId/relay", async (req, res) => {
        bindings from older UI/API clients. */
     void req.body.adc_channel;
   }
-  form.set("adc_channel", String(channel - 1));
+  payload.adc_channel = channel - 1;
   if (typeof req.body.protection_enabled !== "undefined") {
-    form.set("protection_enabled", Number(req.body.protection_enabled) ? "1" : "0");
+    payload.protection_enabled = Number(req.body.protection_enabled) ? 1 : 0;
   }
   if (typeof req.body.device_strategy !== "undefined") {
     const strategy = Number(req.body.device_strategy);
     if (![0, 1, 2].includes(strategy)) return res.status(400).json({ ok: false, error: "bad_strategy" });
-    form.set("device_strategy", String(strategy));
+    payload.device_strategy = strategy;
   }
   for (const field of [
     "overcurrent_milliamps",
@@ -2809,26 +2655,24 @@ app.post("/api/config/:nodeId/relay", async (req, res) => {
       if (!Number.isInteger(fieldValue) || fieldValue < minimum || fieldValue > maximum) {
         return res.status(400).json({ ok: false, error: `bad_${field}` });
       }
-      form.set(field, String(fieldValue));
+      payload[field] = fieldValue;
     }
   }
 
-  try {
-    data = await remoteNodeRequest(nodeId, "/api/config/relay", form);
-    if (!data.ok) {
-      return res.status(502).json({ ok: false, error: data.error || "remote_config_failed" });
-    }
-    return res.json(data);
-  } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "remote_config_failed" });
+  command = publishNodeCommand(nodeId, "config/relay", payload);
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  return res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, nodeId, targetNodeId: command.targetNodeId, ack: publishResult.ack || null });
 });
 
 function validateRemoteNodeId(nodeId) {
   const nid = Number(nodeId);
   const node = resolveKnownNode(nid);
   if (!Number.isFinite(nid) || nid <= 0) return { error: "bad_node_id" };
-  if (!node || !node.ip || !node.online) return { error: "node_offline", status: 404 };
+  if (!node || !node.online) return { error: "node_offline", status: 404 };
   return { nid, node };
 }
 
@@ -2856,46 +2700,40 @@ app.get("/api/cluster/node/:nodeId/config/relays", async (req, res) => {
   const v = validateRemoteNodeId(req.params.nodeId);
   if (v.error) return res.status(v.status || 400).json({ ok: false, error: v.error });
   try {
-    const data = await remoteNodeGetJson(v.nid, "/api/config/relays");
+    const data = await mqttQueryNode(v.nid, "/api/config/relays");
     return res.json(data);
   } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+    return res.json({ ok: true, relays: relayConfigSkeleton(), fallback: true, broker_only: true, error: error.message || "broker_query_unavailable" });
   }
 });
 
 app.post("/api/cluster/node/:nodeId/config/relay", async (req, res) => {
-  req.params.nodeId = String(req.params.nodeId);
-  req.url = `/api/config/${encodeURIComponent(req.params.nodeId)}/relay`;
   const nodeId = Number(req.params.nodeId);
   const channel = Number(req.body.channel);
-  const form = new URLSearchParams();
-  let data;
+  const payload = {};
+  let command;
 
   if (!Number.isInteger(channel) || channel < 1 || channel > 16) {
     return res.status(400).json({ ok: false, error: "bad_channel" });
   }
-  if (validateRemoteNodeId(nodeId).error) {
-    const v = validateRemoteNodeId(nodeId);
-    return res.status(v.status || 400).json({ ok: false, error: v.error });
-  }
 
-  form.set("channel", String(channel));
+  payload.channel = channel;
   for (const field of ["name"]) {
-    if (typeof req.body[field] === "string") form.set(field, req.body[field]);
+    if (typeof req.body[field] === "string") payload[field] = req.body[field];
   }
   for (const field of ["enabled", "remember_state", "boot_default_on", "protection_enabled"]) {
-    if (typeof req.body[field] !== "undefined") form.set(field, Number(req.body[field]) ? "1" : "0");
+    if (typeof req.body[field] !== "undefined") payload[field] = Number(req.body[field]) ? 1 : 0;
   }
   if (typeof req.body.device_strategy !== "undefined") {
     const strategy = Number(req.body.device_strategy);
     if (![0, 1, 2].includes(strategy)) return res.status(400).json({ ok: false, error: "bad_strategy" });
-    form.set("device_strategy", String(strategy));
+    payload.device_strategy = strategy;
   }
   if (typeof req.body.adc_channel !== "undefined") {
     /* Backward compatibility only; see /api/config/:nodeId/relay above. */
     void req.body.adc_channel;
   }
-  form.set("adc_channel", String(channel - 1));
+  payload.adc_channel = channel - 1;
   for (const field of ["overcurrent_milliamps", "trip_delay_ms", "reset_hysteresis_milliamps"]) {
     if (typeof req.body[field] !== "undefined") {
       const value = Number(req.body[field]);
@@ -2904,28 +2742,27 @@ app.post("/api/cluster/node/:nodeId/config/relay", async (req, res) => {
       if (!Number.isInteger(value) || value < minimum || value > maximum) {
         return res.status(400).json({ ok: false, error: `bad_${field}` });
       }
-      form.set(field, String(value));
+      payload[field] = value;
     }
   }
 
-  try {
-    data = await remoteNodeRequest(nodeId, "/api/config/relay", "POST", form);
-    if (!data || data.ok === false) {
-      return res.status(502).json({ ok: false, error: (data && data.error) || "remote_config_failed" });
-    }
-    return res.json(data);
-  } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  command = publishNodeCommand(nodeId, "config/relay", payload);
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  return res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, nodeId, targetNodeId: command.targetNodeId, ack: publishResult.ack || null });
 });
 
 app.get("/api/cluster/node/:nodeId/protection", async (req, res) => {
   const v = validateRemoteNodeId(req.params.nodeId);
+  const node = resolveKnownNode(v.nid);
   if (v.error) return res.status(v.status || 400).json({ ok: false, error: v.error });
   try {
-    return res.json(await remoteNodeGetJson(v.nid, "/api/protection"));
+    return res.json(await mqttQueryNode(v.nid, "/api/protection"));
   } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+    return res.json({ ...(node ? protectionFromLiveState(node) : protectionSkeleton()), broker_only: true, error: error.message || "broker_query_unavailable" });
   }
 });
 
@@ -2933,49 +2770,56 @@ app.get("/api/cluster/node/:nodeId/config/protection", async (req, res) => {
   const v = validateRemoteNodeId(req.params.nodeId);
   if (v.error) return res.status(v.status || 400).json({ ok: false, error: v.error });
   try {
-    return res.json(await remoteNodeGetJson(v.nid, "/api/config/protection"));
+    return res.json(await mqttQueryNode(v.nid, "/api/config/protection"));
   } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+    return res.json({ ...protectionConfigDefaults(), broker_only: true, error: error.message || "broker_query_unavailable" });
   }
 });
 
 app.post("/api/cluster/node/:nodeId/config/protection", async (req, res) => {
-  const v = validateRemoteNodeId(req.params.nodeId);
-  const form = new URLSearchParams();
+  const nodeId = Number(req.params.nodeId);
+  const payload = {};
   let formError;
-  if (v.error) return res.status(v.status || 400).json({ ok: false, error: v.error });
-  formError = appendProtectionConfigForm(form, req.body || {});
+  let command;
+  formError = appendProtectionConfigForm({
+    set(key, value) { payload[key] = Number(value); },
+  }, req.body || {});
   if (formError) return res.status(400).json({ ok: false, error: formError });
-  try {
-    return res.json(await remoteNodeRequest(v.nid, "/api/config/protection", "POST", form));
-  } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  command = publishNodeCommand(nodeId, "config/protection", payload);
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  return res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, nodeId, targetNodeId: command.targetNodeId, ack: publishResult.ack || null });
 });
 
 app.post("/api/cluster/node/:nodeId/protection/:action", async (req, res) => {
-  const v = validateRemoteNodeId(req.params.nodeId);
+  const nodeId = Number(req.params.nodeId);
   const action = String(req.params.action || "");
-  const form = new URLSearchParams();
+  const suffix = action === "strategy" ? "protection/strategy" : `protection/${action}`;
+  const payload = {};
   const channel = Number(req.body.channel);
-  if (v.error) return res.status(v.status || 400).json({ ok: false, error: v.error });
+  let command;
   if (!["unlock", "force-stop", "clear-learning", "strategy"].includes(action)) {
     return res.status(404).json({ ok: false, error: "bad_action" });
   }
   if (!Number.isInteger(channel) || channel < 1 || channel > 16) {
     return res.status(400).json({ ok: false, error: "bad_channel" });
   }
-  form.set("channel", String(channel));
+  payload.channel = channel;
   if (action === "strategy") {
     const strategy = Number(req.body.strategy);
     if (![0, 1, 2].includes(strategy)) return res.status(400).json({ ok: false, error: "bad_strategy" });
-    form.set("strategy", String(strategy));
+    payload.strategy = strategy;
   }
-  try {
-    return res.json(await remoteNodeRequest(v.nid, `/api/protection/${action}`, "POST", form));
-  } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  command = publishNodeCommand(nodeId, suffix, payload);
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  return res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, nodeId, targetNodeId: command.targetNodeId, ack: publishResult.ack || null });
 });
 
 /* ?? Scheduler proxy APIs (dashboard ??backend ??MCU HTTP) ?? */
@@ -2992,14 +2836,66 @@ function validateWeekday(wd) {
   return w;
 }
 
+function parseTargetWeekdays(value) {
+  const out = [];
+  const seen = new Set();
+  for (const part of String(value || "").split(/[,\s]+/)) {
+    if (!part) continue;
+    const wd = validateWeekday(part);
+    if (wd === null || seen.has(wd)) continue;
+    seen.add(wd);
+    out.push(wd);
+  }
+  return out;
+}
+
+function intervalsToSchedulerPayload(channel, weekday, intervals) {
+  const safeIntervals = Array.isArray(intervals) ? intervals.slice(0, 8) : [];
+  const payload = { channel, weekday, count: safeIntervals.length };
+  safeIntervals.forEach((item, index) => {
+    payload[`s${index}`] = Number(item.start_minute || item.start || 0);
+    payload[`e${index}`] = Number(item.end_minute || item.end || 0);
+  });
+  return payload;
+}
+
+async function publishSchedulerDayCopy(nodeId, channel, sourceWeekday, targetWeekdaysValue) {
+  const targetWeekdays = parseTargetWeekdays(targetWeekdaysValue);
+  const week = await mqttQueryNode(nodeId, `/api/relay/channels/${channel}/schedule-week`);
+  const sourceDay = (week.days || week.weekdays || []).find((item) => Number(item.weekday) === Number(sourceWeekday));
+  const intervals = sourceDay && Array.isArray(sourceDay.intervals) ? sourceDay.intervals : [];
+  const published = [];
+
+  if (targetWeekdays.length === 0) {
+    throw new Error("bad_target_weekdays");
+  }
+  for (const weekday of targetWeekdays) {
+    const command = publishNodeCommand(
+      nodeId,
+      "scheduler/set",
+      intervalsToSchedulerPayload(channel, weekday, intervals),
+    );
+    if (!command.ok) {
+      throw new Error(command.error || "publish_command_failed");
+    }
+    const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+    if (!publishResult.ok) {
+      throw new Error(publishResult.error || "mqtt_ack_timeout");
+    }
+    published.push({ weekday, request_id: command.requestId, completed: true });
+  }
+  return { ok: true, queued: true, completed: true, source_weekday: sourceWeekday, copied: published };
+}
+
 app.get("/api/scheduler/:nodeId/:channel/status", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  const node = resolveKnownNode(v.nid);
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
   try {
-    const data = await remoteNodeGetJson(v.nid, `/api/relay/channels/${v.ch}/scheduler/status`);
+    const data = await mqttQueryNode(v.nid, `/api/relay/channels/${v.ch}/scheduler/status`);
     res.json(data);
   } catch (error) {
-    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+    res.json({ ...(node ? schedulerStatusFromLiveState(node, v.ch) : { ok: true, fallback: true, channel: v.ch, schedule_enabled: 0, pause_active: 0 }), broker_only: true, error: error.message || "broker_query_unavailable" });
   }
 });
 
@@ -3007,51 +2903,59 @@ app.get("/api/scheduler/:nodeId/:channel/week", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
   try {
-    const data = await remoteNodeGetJson(v.nid, `/api/relay/channels/${v.ch}/schedule-week`);
+    const data = await mqttQueryNode(v.nid, `/api/relay/channels/${v.ch}/schedule-week`);
     res.json(data);
   } catch (error) {
-    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+    res.json({ ok: true, fallback: true, broker_only: true, channel: v.ch, weekdays: [], error: error.message || "broker_query_unavailable" });
   }
 });
 
 app.post("/api/scheduler/:nodeId/:channel/enabled", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  let command;
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
-  try {
-    const form = new URLSearchParams();
-    form.set("enabled", Number(req.body.enabled) ? "1" : "0");
-    const data = await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/enabled`, "PATCH", form);
-    res.json(data);
-  } catch (error) {
-    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  command = publishNodeCommand(v.nid, "scheduler/enabled", {
+    channel: v.ch,
+    enabled: Number(req.body.enabled) ? 1 : 0,
+  });
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, ack: publishResult.ack || null });
 });
 
 app.post("/api/scheduler/:nodeId/:channel/pause", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  let command;
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
-  try {
-    const form = new URLSearchParams();
-    form.set("mode", String(req.body.mode || 0));
-    if (req.body.duration_seconds) form.set("duration_seconds", String(req.body.duration_seconds));
-    if (req.body.until) form.set("until", String(req.body.until));
-    form.set("pause_blocks_auto_trigger", req.body.pause_blocks_auto_trigger ? "1" : "0");
-    const data = await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/pause`, "POST", form);
-    res.json(data);
-  } catch (error) {
-    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  command = publishNodeCommand(v.nid, "scheduler/pause", {
+    channel: v.ch,
+    mode: Number(req.body.mode || 0),
+    duration_seconds: Number(req.body.duration_seconds || 0),
+    until: Number(req.body.until || 0),
+    pause_blocks_auto_trigger: req.body.pause_blocks_auto_trigger ? 1 : 0,
+  });
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, ack: publishResult.ack || null });
 });
 
 app.post("/api/scheduler/:nodeId/:channel/resume", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  let command;
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
-  try {
-    const data = await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/resume`, "POST", new URLSearchParams());
-    res.json(data);
-  } catch (error) {
-    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  command = publishNodeCommand(v.nid, "scheduler/resume", { channel: v.ch });
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, ack: publishResult.ack || null });
 });
 
 app.post("/api/scheduler/:nodeId/:channel/copy", async (req, res) => {
@@ -3060,42 +2964,40 @@ app.post("/api/scheduler/:nodeId/:channel/copy", async (req, res) => {
   const srcWd = validateWeekday(req.body.source_weekday);
   if (srcWd === null) return res.status(400).json({ ok: false, error: "bad_source_weekday" });
   try {
-    const form = new URLSearchParams();
-    form.set("target_weekdays", String(req.body.target_weekdays || ""));
-    form.set("mode", "overwrite");
-    const data = await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/schedule-week/${srcWd}/copy`, "POST", form);
-    res.json(data);
+    res.json(await publishSchedulerDayCopy(v.nid, v.ch, srcWd, req.body.target_weekdays));
   } catch (error) {
-    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+    res.status(502).json({ ok: false, error: error.message || "broker_copy_failed" });
   }
 });
 
 app.put("/api/scheduler/:nodeId/:channel/week/:weekday", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
   const wd = validateWeekday(req.params.weekday);
-  const form = new URLSearchParams();
+  const payload = { channel: v.ch, weekday: wd, count: Number(req.body.count || 0) };
+  let command;
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
   if (wd === null) return res.status(400).json({ ok: false, error: "bad_weekday" });
-  form.set("count", String(Number(req.body.count || 0)));
   for (let i = 0; i < 8; i++) {
-    if (typeof req.body[`s${i}`] !== "undefined") form.set(`s${i}`, String(Number(req.body[`s${i}`])));
-    if (typeof req.body[`e${i}`] !== "undefined") form.set(`e${i}`, String(Number(req.body[`e${i}`])));
+    if (typeof req.body[`s${i}`] !== "undefined") payload[`s${i}`] = Number(req.body[`s${i}`]);
+    if (typeof req.body[`e${i}`] !== "undefined") payload[`e${i}`] = Number(req.body[`e${i}`]);
   }
-  try {
-    const data = await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/schedule-week/${wd}`, "PUT", form);
-    res.json(data);
-  } catch (error) {
-    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  command = publishNodeCommand(v.nid, "scheduler/set", payload);
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, ack: publishResult.ack || null });
 });
 
 app.get("/api/cluster/node/:nodeId/relay/channels/:channel/scheduler/status", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  const node = resolveKnownNode(v.nid);
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
   try {
-    return res.json(await remoteNodeGetJson(v.nid, `/api/relay/channels/${v.ch}/scheduler/status`));
+    return res.json(await mqttQueryNode(v.nid, `/api/relay/channels/${v.ch}/scheduler/status`));
   } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+    return res.json({ ...(node ? schedulerStatusFromLiveState(node, v.ch) : { ok: true, fallback: true, channel: v.ch, schedule_enabled: 0, pause_active: 0 }), broker_only: true, error: error.message || "broker_query_unavailable" });
   }
 });
 
@@ -3103,83 +3005,93 @@ app.get("/api/cluster/node/:nodeId/relay/channels/:channel/schedule-week", async
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
   try {
-    return res.json(await remoteNodeGetJson(v.nid, `/api/relay/channels/${v.ch}/schedule-week`));
+    return res.json(await mqttQueryNode(v.nid, `/api/relay/channels/${v.ch}/schedule-week`));
   } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+    return res.json({ ok: true, fallback: true, broker_only: true, channel: v.ch, weekdays: [], error: error.message || "broker_query_unavailable" });
   }
 });
 
 app.put("/api/cluster/node/:nodeId/relay/channels/:channel/schedule-week/:weekday", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
   const wd = validateWeekday(req.params.weekday);
-  const form = new URLSearchParams();
+  const payload = { channel: v.ch, weekday: wd, count: Number(req.body.count || 0) };
+  let command;
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
   if (wd === null) return res.status(400).json({ ok: false, error: "bad_weekday" });
-  form.set("count", String(Number(req.body.count || 0)));
   for (let i = 0; i < 8; i++) {
-    if (typeof req.body[`s${i}`] !== "undefined") form.set(`s${i}`, String(Number(req.body[`s${i}`])));
-    if (typeof req.body[`e${i}`] !== "undefined") form.set(`e${i}`, String(Number(req.body[`e${i}`])));
+    if (typeof req.body[`s${i}`] !== "undefined") payload[`s${i}`] = Number(req.body[`s${i}`]);
+    if (typeof req.body[`e${i}`] !== "undefined") payload[`e${i}`] = Number(req.body[`e${i}`]);
   }
-  try {
-    return res.json(await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/schedule-week/${wd}`, "PUT", form));
-  } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  command = publishNodeCommand(v.nid, "scheduler/set", payload);
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  return res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, ack: publishResult.ack || null });
 });
 
 app.post("/api/cluster/node/:nodeId/relay/channels/:channel/schedule-week/:weekday/copy", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
   const srcWd = validateWeekday(req.params.weekday);
-  const form = new URLSearchParams();
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
   if (srcWd === null) return res.status(400).json({ ok: false, error: "bad_source_weekday" });
-  form.set("target_weekdays", String(req.body.target_weekdays || ""));
-  form.set("mode", String(req.body.mode || "overwrite"));
   try {
-    return res.json(await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/schedule-week/${srcWd}/copy`, "POST", form));
+    return res.json(await publishSchedulerDayCopy(v.nid, v.ch, srcWd, req.body.target_weekdays));
   } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+    return res.status(502).json({ ok: false, error: error.message || "broker_copy_failed" });
   }
 });
 
 app.post("/api/cluster/node/:nodeId/relay/channels/:channel/scheduler/enabled", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
-  const form = new URLSearchParams();
+  let command;
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
-  form.set("enabled", Number(req.body.enabled) ? "1" : "0");
-  try {
-    return res.json(await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/enabled`, "PATCH", form));
-  } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  command = publishNodeCommand(v.nid, "scheduler/enabled", {
+    channel: v.ch,
+    enabled: Number(req.body.enabled) ? 1 : 0,
+  });
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  return res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, ack: publishResult.ack || null });
 });
 
 app.post("/api/cluster/node/:nodeId/relay/channels/:channel/scheduler/pause", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
-  const form = new URLSearchParams();
+  let command;
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
-  form.set("mode", String(req.body.mode || 0));
-  if (req.body.duration_seconds) form.set("duration_seconds", String(req.body.duration_seconds));
-  if (req.body.until) form.set("until", String(req.body.until));
-  form.set("pause_blocks_auto_trigger", req.body.pause_blocks_auto_trigger ? "1" : "0");
-  try {
-    return res.json(await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/pause`, "POST", form));
-  } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  command = publishNodeCommand(v.nid, "scheduler/pause", {
+    channel: v.ch,
+    mode: Number(req.body.mode || 0),
+    duration_seconds: Number(req.body.duration_seconds || 0),
+    until: Number(req.body.until || 0),
+    pause_blocks_auto_trigger: req.body.pause_blocks_auto_trigger ? 1 : 0,
+  });
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  return res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, ack: publishResult.ack || null });
 });
 
 app.post("/api/cluster/node/:nodeId/relay/channels/:channel/scheduler/resume", async (req, res) => {
   const v = validateSchedulerParams(req.params.nodeId, req.params.channel);
+  let command;
   if (v.error) return res.status(400).json({ ok: false, error: v.error });
-  try {
-    return res.json(await remoteNodeRequest(v.nid, `/api/relay/channels/${v.ch}/scheduler/resume`, "POST", new URLSearchParams()));
-  } catch (error) {
-    return res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  command = publishNodeCommand(v.nid, "scheduler/resume", { channel: v.ch });
+  if (!command.ok) return res.status(command.status || 400).json({ ok: false, error: command.error });
+  const publishResult = await command.publish({ waitForAck: true, timeoutMs: 8000 });
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  return res.json({ ok: true, queued: true, completed: true, request_id: command.requestId, ack: publishResult.ack || null });
 });
 
-app.post("/send/:nodeId/relay", (req, res) => {
+app.post("/send/:nodeId/relay", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const channel = Number(req.body.channel);
   const value = Number(req.body.value);
@@ -3197,9 +3109,11 @@ app.post("/send/:nodeId/relay", (req, res) => {
     node_id: Number(req.body.targetNodeId || nodeId),
     request_id: crypto.randomBytes(8).toString("hex"),
   };
-  if (!mqttPublishCommand(nodeInfo.cluster, "relay", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "relay", payload, 6000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  invalidateRemoteQueryCache(Number(payload.node_id));
   {
     const bit = 1 << (channel - 1);
     const oldMask = Number(nodeInfo.relayMask || 0) >>> 0;
@@ -3208,10 +3122,10 @@ app.post("/send/:nodeId/relay", (req, res) => {
   }
   queueRelayStateConfirm(Number(payload.node_id));
   pushEvent("send-relay", { nodeId, channel, value, targetNodeId: payload.node_id });
-  return res.json({ ok: true });
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
-app.post("/send/:nodeId/mask", (req, res) => {
+app.post("/send/:nodeId/mask", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const mask = Number(req.body.mask);
   if (!Number.isInteger(mask) || mask < 0 || mask > 0xffff) {
@@ -3226,16 +3140,18 @@ app.post("/send/:nodeId/mask", (req, res) => {
     node_id: Number(req.body.targetNodeId || nodeId),
     request_id: crypto.randomBytes(8).toString("hex"),
   };
-  if (!mqttPublishCommand(nodeInfo.cluster, "mask", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "mask", payload, 6000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  invalidateRemoteQueryCache(Number(payload.node_id));
   setKnownNodeRelayMask(Number(payload.node_id), mask);
   queueRelayStateConfirm(Number(payload.node_id));
   pushEvent("send-mask", { nodeId, mask, targetNodeId: payload.node_id });
-  return res.json({ ok: true });
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
-app.post("/send/:nodeId/all", (req, res) => {
+app.post("/send/:nodeId/all", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const value = Number(req.body.value);
   if (![0, 1].includes(value)) {
@@ -3250,17 +3166,19 @@ app.post("/send/:nodeId/all", (req, res) => {
     node_id: Number(req.body.targetNodeId || nodeId),
     request_id: crypto.randomBytes(8).toString("hex"),
   };
-  if (!mqttPublishCommand(nodeInfo.cluster, "mask", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "mask", payload, 6000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  invalidateRemoteQueryCache(Number(payload.node_id));
   setKnownNodeRelayMask(Number(payload.node_id), payload.mask);
   queueRelayStateConfirm(Number(payload.node_id));
   pushEvent("send-all", { nodeId, value, targetNodeId: payload.node_id });
-  return res.json({ ok: true });
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
 /* ?? New MQTT-based command routes ?? */
-app.post("/send/:nodeId/auto-hold", (req, res) => {
+app.post("/send/:nodeId/auto-hold", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const nodeInfo = resolveKnownNode(nodeId);
   if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
@@ -3274,13 +3192,15 @@ app.post("/send/:nodeId/auto-hold", (req, res) => {
     node_id: Number(req.body.targetNodeId || nodeId),
     request_id: crypto.randomBytes(8).toString("hex"),
   };
-  if (!mqttPublishCommand(nodeInfo.cluster, "auto-hold", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "auto-hold", payload, 6000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
-  return res.json({ ok: true });
+  invalidateRemoteQueryCache(Number(payload.node_id));
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
-app.post("/send/:nodeId/control", (req, res) => {
+app.post("/send/:nodeId/control", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const nodeInfo = resolveKnownNode(nodeId);
   if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
@@ -3294,13 +3214,15 @@ app.post("/send/:nodeId/control", (req, res) => {
     node_id: Number(req.body.targetNodeId || nodeId),
     request_id: crypto.randomBytes(8).toString("hex"),
   };
-  if (!mqttPublishCommand(nodeInfo.cluster, "control", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "control", payload, 6000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
-  return res.json({ ok: true });
+  invalidateRemoteQueryCache(Number(payload.node_id));
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
-app.post("/send/:nodeId/scheduler/set", (req, res) => {
+app.post("/send/:nodeId/scheduler/set", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const nodeInfo = resolveKnownNode(nodeId);
   if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
@@ -3315,13 +3237,15 @@ app.post("/send/:nodeId/scheduler/set", (req, res) => {
     payload[`s${i}`] = Number(req.body[`s${i}`] || 0);
     payload[`e${i}`] = Number(req.body[`e${i}`] || 0);
   }
-  if (!mqttPublishCommand(nodeInfo.cluster, "scheduler/set", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "scheduler/set", payload, 8000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
-  return res.json({ ok: true });
+  invalidateRemoteQueryCache(Number(payload.node_id));
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
-app.post("/send/:nodeId/scheduler/enabled", (req, res) => {
+app.post("/send/:nodeId/scheduler/enabled", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const nodeInfo = resolveKnownNode(nodeId);
   if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
@@ -3331,13 +3255,15 @@ app.post("/send/:nodeId/scheduler/enabled", (req, res) => {
     node_id: Number(req.body.targetNodeId || nodeId),
     request_id: crypto.randomBytes(8).toString("hex"),
   };
-  if (!mqttPublishCommand(nodeInfo.cluster, "scheduler/enabled", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "scheduler/enabled", payload, 8000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
-  return res.json({ ok: true });
+  invalidateRemoteQueryCache(Number(payload.node_id));
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
-app.post("/send/:nodeId/scheduler/pause", (req, res) => {
+app.post("/send/:nodeId/scheduler/pause", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const nodeInfo = resolveKnownNode(nodeId);
   if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
@@ -3350,28 +3276,32 @@ app.post("/send/:nodeId/scheduler/pause", (req, res) => {
     node_id: Number(req.body.targetNodeId || nodeId),
     request_id: crypto.randomBytes(8).toString("hex"),
   };
-  if (!mqttPublishCommand(nodeInfo.cluster, "scheduler/pause", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "scheduler/pause", payload, 8000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
-  return res.json({ ok: true });
+  invalidateRemoteQueryCache(Number(payload.node_id));
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
 app.post("/send/:nodeId/scheduler/resume", async (req, res) => {
-  // Firmware has no MQTT scheduler/resume handler. Proxy via MCU HTTP instead.
-  try {
-    const data = await remoteNodeRequest(
-      Number(req.params.nodeId),
-      `/api/relay/channels/${Number(req.body.channel || 1)}/scheduler/resume`,
-      "POST",
-      new URLSearchParams()
-    );
-    res.json(data);
-  } catch (error) {
-    res.status(502).json({ ok: false, error: error.message || "proxy_failed" });
+  const nodeId = Number(req.params.nodeId);
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  const payload = {
+    channel: Number(req.body.channel || 1),
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: makeRequestId(),
+  };
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "scheduler/resume", payload, 8000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  invalidateRemoteQueryCache(Number(payload.node_id));
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
-app.post("/send/:nodeId/protection/force-stop", (req, res) => {
+app.post("/send/:nodeId/protection/force-stop", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const channel = Number(req.body.channel || 1);
   const nodeInfo = resolveKnownNode(nodeId);
@@ -3384,14 +3314,16 @@ app.post("/send/:nodeId/protection/force-stop", (req, res) => {
     node_id: Number(req.body.targetNodeId || nodeId),
     request_id: crypto.randomBytes(8).toString("hex"),
   };
-  if (!mqttPublishCommand(nodeInfo.cluster, "protection/force-stop", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "protection/force-stop", payload, 6000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
+  invalidateRemoteQueryCache(Number(payload.node_id));
   setKnownNodeRelayMask(Number(payload.node_id), (Number(nodeInfo.relayMask || 0) >>> 0) & ~(1 << (channel - 1)));
-  return res.json({ ok: true });
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
-app.post("/send/:nodeId/protection/unlock", (req, res) => {
+app.post("/send/:nodeId/protection/unlock", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const nodeInfo = resolveKnownNode(nodeId);
   if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
@@ -3400,13 +3332,15 @@ app.post("/send/:nodeId/protection/unlock", (req, res) => {
     node_id: Number(req.body.targetNodeId || nodeId),
     request_id: crypto.randomBytes(8).toString("hex"),
   };
-  if (!mqttPublishCommand(nodeInfo.cluster, "protection/unlock", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "protection/unlock", payload, 6000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
-  return res.json({ ok: true });
+  invalidateRemoteQueryCache(Number(payload.node_id));
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
-app.post("/send/:nodeId/protection/clear-learning", (req, res) => {
+app.post("/send/:nodeId/protection/clear-learning", async (req, res) => {
   const nodeId = Number(req.params.nodeId);
   const nodeInfo = resolveKnownNode(nodeId);
   if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
@@ -3415,10 +3349,55 @@ app.post("/send/:nodeId/protection/clear-learning", (req, res) => {
     node_id: Number(req.body.targetNodeId || nodeId),
     request_id: crypto.randomBytes(8).toString("hex"),
   };
-  if (!mqttPublishCommand(nodeInfo.cluster, "protection/clear-learning", payload)) {
-    return res.status(502).json({ ok: false, error: "mqtt_unavailable" });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "protection/clear-learning", payload, 6000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
   }
-  return res.json({ ok: true });
+  invalidateRemoteQueryCache(Number(payload.node_id));
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
+});
+
+app.post("/send/:nodeId/protection/strategy", async (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const channel = Number(req.body.channel || 1);
+  const strategy = Number(req.body.strategy);
+  const nodeInfo = resolveKnownNode(nodeId);
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  if (!Number.isInteger(channel) || channel < 1 || channel > 16) return res.status(400).json({ ok: false, error: "bad_channel" });
+  if (![0, 1, 2].includes(strategy)) return res.status(400).json({ ok: false, error: "bad_strategy" });
+  const payload = {
+    channel,
+    strategy,
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: makeRequestId(),
+  };
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "protection/strategy", payload, 6000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
+  }
+  invalidateRemoteQueryCache(Number(payload.node_id));
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
+});
+
+app.post("/send/:nodeId/config/protection", async (req, res) => {
+  const nodeId = Number(req.params.nodeId);
+  const nodeInfo = resolveKnownNode(nodeId);
+  const payload = {
+    node_id: Number(req.body.targetNodeId || nodeId),
+    request_id: makeRequestId(),
+  };
+  let formError;
+  if (!nodeInfo || !nodeInfo.cluster) return res.status(404).json({ ok: false, error: "node_not_found" });
+  formError = appendProtectionConfigForm({
+    set(key, value) { payload[key] = Number(value); },
+  }, req.body || {});
+  if (formError) return res.status(400).json({ ok: false, error: formError });
+  const publishResult = await mqttPublishCommandWithAck(nodeInfo.cluster, "config/protection", payload, 8000);
+  if (!publishResult.ok) {
+    return res.status(502).json({ ok: false, error: publishResult.error || "mqtt_ack_timeout" });
+  }
+  invalidateRemoteQueryCache(Number(payload.node_id));
+  return res.json({ ok: true, queued: true, completed: true, request_id: payload.request_id, ack: publishResult.ack || null });
 });
 
 // ?? MCU Provisioning API ??????????????????????????????????????????
@@ -3648,7 +3627,7 @@ function makeSensorKey(clusterId, deviceId, channel) {
 // Body: { cluster_id?, device_id?, channel, target, duration_seconds, reason }
 // Creates or renews an Auto Hold session.  Only sends MQTT if this is
 // a new session OR ?? minutes have passed since the last MQTT renew.
-app.post("/api/sensor/alert", (req, res) => {
+app.post("/api/sensor/alert", async (req, res) => {
   const channel        = Number(req.body.channel);
   const target         = Number(req.body.target ?? 1);
   const durationSec    = Number(req.body.duration_seconds ?? 600);
@@ -3753,9 +3732,10 @@ app.post("/api/sensor/alert", (req, res) => {
       node_id: targetNodeId,
       request_id: crypto.randomBytes(8).toString("hex"),
     };
-    const mqttOk = mqttPublishCommand(clusterName, "auto-hold", payload);
+    const mqttOk = await mqttPublishCommand(clusterName, "auto-hold", payload);
     mqttResult = mqttOk ? "sent" : "mqtt_unavailable";
     if (mqttOk) {
+      invalidateRemoteQueryCache(targetNodeId);
       sensor.lastMqttRenewMs = nowMs;
       sensor.targetNodeId = targetNodeId;
     }
@@ -3776,7 +3756,7 @@ app.post("/api/sensor/alert", (req, res) => {
 // POST /api/sensor/recover
 // Body: { cluster_id?, device_id?, channel }
 // Ends the active sensor Auto Hold for this channel.
-app.post("/api/sensor/recover", (req, res) => {
+app.post("/api/sensor/recover", async (req, res) => {
   const channel   = Number(req.body.channel);
   const clusterId = String(req.body.cluster_id || "default");
   const deviceId  = String(req.body.device_id || "");
@@ -3801,7 +3781,8 @@ app.post("/api/sensor/recover", (req, res) => {
     request_id: crypto.randomBytes(8).toString("hex"),
   };
 
-  const mqttOk = mqttPublishCommand(clusterName, "auto-hold", payload);
+  const mqttOk = await mqttPublishCommand(clusterName, "auto-hold", payload);
+  if (mqttOk) invalidateRemoteQueryCache(sensor.targetNodeId);
   activeSensors.delete(key);
 
   return res.json({
@@ -3839,5 +3820,4 @@ app.listen(HTTP_PORT, HTTP_HOST, () => {
 setInterval(syncKnownNodesFromBroker, 5000);
 syncKnownNodesFromBroker();
 
-setInterval(scanDuplicateMasters, DUPLICATE_MASTER_SCAN_MS);
-setInterval(scanStaleKnownNodes, DUPLICATE_MASTER_SCAN_MS);
+setInterval(scanStaleKnownNodes, KNOWN_NODE_SCAN_MS);

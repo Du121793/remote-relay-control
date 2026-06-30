@@ -86,6 +86,16 @@ int discovery_proto_build_announce(char *buffer,
                                    uint32_t auth_tag,
                                    uint32_t relay_mask,
                                    uint32_t enabled_mask,
+                                   uint32_t scheduler_enabled_mask,
+                                   uint32_t scheduler_pause_mask,
+                                   uint32_t scheduler_pause_blocks_mask,
+                                   uint32_t protection_enabled_mask,
+                                   uint32_t protection_tripped_mask,
+                                   uint32_t protection_fault_lock_mask,
+                                   uint32_t protection_ct_valid_mask,
+                                   uint32_t protection_learning_mask,
+                                   uint32_t protection_strategy_lsb_mask,
+                                   uint32_t protection_strategy_msb_mask,
                                    uint8_t auto_join,
                                    uint32_t unix_time,
                                    uint8_t time_valid,
@@ -116,7 +126,7 @@ int discovery_proto_build_announce(char *buffer,
                                    const uint8_t mac[6])
 {
   return snprintf(buffer, buffer_size,
-                  "type=announce ver=7 service=%s cluster=%s device=%s cloud_cluster=%s cloud_device=%s cloud_key=%s node=%lu role=%u term=%lu load=%lu auth=%lu relay=%lu enabled=%lu auto=%u time=%lu time_valid=%u rtc_lse=%u time_source=%u time_quality=%u time_seq=%lu gateway_epoch=%lu gateway_node=%lu adc_valid=%u adc_ct=%u adc_signal=%u adc_raw=%lu adc_mv=%lu adc_min=%lu adc_max=%lu adc_avg=%lu adc_raw_rms=%lu adc_rms_mv=%lu adc_current_ma=%lu adc_rate=%lu adc_window=%lu adc_samples=%lu adc_overruns=%lu adc_saturation=%lu ip=%s port=%u mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                  "type=announce ver=8 service=%s cluster=%s device=%s cloud_cluster=%s cloud_device=%s cloud_key=%s node=%lu role=%u term=%lu load=%lu auth=%lu relay=%lu enabled=%lu sched_en=%lu sched_pause=%lu sched_blocks=%lu prot_en=%lu prot_trip=%lu prot_lock=%lu prot_ct=%lu prot_learn=%lu prot_s0=%lu prot_s1=%lu auto=%u time=%lu time_valid=%u rtc_lse=%u time_source=%u time_quality=%u time_seq=%lu gateway_epoch=%lu gateway_node=%lu adc_valid=%u adc_ct=%u adc_signal=%u adc_raw=%lu adc_mv=%lu adc_min=%lu adc_max=%lu adc_avg=%lu adc_raw_rms=%lu adc_rms_mv=%lu adc_current_ma=%lu adc_rate=%lu adc_window=%lu adc_samples=%lu adc_overruns=%lu adc_saturation=%lu ip=%s port=%u mac=%02X:%02X:%02X:%02X:%02X:%02X",
                   service,
                   cluster,
                   device,
@@ -130,6 +140,16 @@ int discovery_proto_build_announce(char *buffer,
                   (unsigned long)auth_tag,
                   (unsigned long)relay_mask,
                   (unsigned long)enabled_mask,
+                  (unsigned long)scheduler_enabled_mask,
+                  (unsigned long)scheduler_pause_mask,
+                  (unsigned long)scheduler_pause_blocks_mask,
+                  (unsigned long)protection_enabled_mask,
+                  (unsigned long)protection_tripped_mask,
+                  (unsigned long)protection_fault_lock_mask,
+                  (unsigned long)protection_ct_valid_mask,
+                  (unsigned long)protection_learning_mask,
+                  (unsigned long)protection_strategy_lsb_mask,
+                  (unsigned long)protection_strategy_msb_mask,
                   (unsigned int)auto_join,
                   (unsigned long)unix_time,
                   (unsigned int)time_valid,
@@ -205,7 +225,7 @@ uint8_t discovery_proto_parse_announce(const void *payload,
   if (!discovery_proto_extract_value(text, "ver=", value, sizeof(value)) ||
       !discovery_proto_parse_u32(value, &parsed_u32) ||
       (parsed_u32 < 2U) ||
-      (parsed_u32 > 7U))
+      (parsed_u32 > 8U))
   {
     return 0U;
   }
@@ -273,6 +293,49 @@ uint8_t discovery_proto_parse_announce(const void *payload,
     return 0U;
   }
   announce->auto_join = (uint8_t)parsed_u32;
+  if (version >= 8U)
+  {
+    if (discovery_proto_extract_optional_value(text, "sched_en=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->scheduler_enabled_mask);
+    }
+    if (discovery_proto_extract_optional_value(text, "sched_pause=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->scheduler_pause_mask);
+    }
+    if (discovery_proto_extract_optional_value(text, "sched_blocks=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->scheduler_pause_blocks_mask);
+    }
+    if (discovery_proto_extract_optional_value(text, "prot_en=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->protection_enabled_mask);
+    }
+    if (discovery_proto_extract_optional_value(text, "prot_trip=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->protection_tripped_mask);
+    }
+    if (discovery_proto_extract_optional_value(text, "prot_lock=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->protection_fault_lock_mask);
+    }
+    if (discovery_proto_extract_optional_value(text, "prot_ct=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->protection_ct_valid_mask);
+    }
+    if (discovery_proto_extract_optional_value(text, "prot_learn=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->protection_learning_mask);
+    }
+    if (discovery_proto_extract_optional_value(text, "prot_s0=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->protection_strategy_lsb_mask);
+    }
+    if (discovery_proto_extract_optional_value(text, "prot_s1=", value, sizeof(value)) != 0U)
+    {
+      (void)discovery_proto_parse_u32(value, &announce->protection_strategy_msb_mask);
+    }
+  }
   if (version >= 4U)
   {
     if (discovery_proto_extract_optional_value(text, "time=", value, sizeof(value)) != 0U)
