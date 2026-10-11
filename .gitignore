@@ -58,3 +58,22 @@ tools/backend-test/data/cloud-devices.json
 tools/backend-test/server copy.js
 tools/codex-session-import.md
 tools/export_codex_session.py
+
+# 本機設定與私密檔案
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+credentials.json
+secrets.json
+# 依賴與快取
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+tools/backend-test/data/
