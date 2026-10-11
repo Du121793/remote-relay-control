@@ -77,3 +77,7 @@ __pycache__/
 *.pyc
 .venv/
 tools/backend-test/data/
+
+# 本機代理指引不發布
+[Aa][Gg][Ee][Nn][Tt].[Mm][Dd]
+[Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
