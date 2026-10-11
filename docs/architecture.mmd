@@ -1,0 +1,11 @@
+%% 根據此版本程式的責任與相依繪製，不代表已完成外部服務或硬體驗收
+flowchart TB
+  ADMIN["後端管理台<br/>登入 / 裝置 / 排程 / 保護"] --> BACKEND["Node.js 後端<br/>命令 / ACK / Live Cache / SSE"]
+  BACKEND --> BROKER["測試 MQTT Broker<br/>Control HTTP API / TLS-PSK"]
+  BROKER <-->|"命令 / ACK / 狀態"| MASTER["STM32 Master<br/>FreeRTOS / lwIP / mbedTLS"]
+  MASTER <-->|"區域 discovery / 查詢與控制"| MEMBER["STM32 Member<br/>區域叢集節點"]
+  LOCAL["本機瀏覽器 / GUI<br/>LAN HTTP 操作"] --> HTTP["MCU HTTP / 控制佇列"]
+  HTTP --> MASTER
+  MASTER --> SERVICE["MCU 服務層<br/>控制 / 排程 / 保護 / ADC"]
+  SERVICE --> RELAY["16 路繼電器<br/>GPIO 與負載"]
+  CT["CT / ADC<br/>電流量測"] --> SERVICE
